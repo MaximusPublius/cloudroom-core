@@ -1,0 +1,24 @@
+[Unit]
+Description=Cloudroom core with protected agent storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cloudroom
+Group=cloudroom
+ExecStart=/usr/local/lib/cloudroom/cloudroom
+EnvironmentFile=/etc/cloudroom/core.env
+Environment=CLOUDROOM_STORAGE_POLICY=/etc/cloudroom/storage.json
+Delegate=yes
+# The trusted core attaches children to cgroups, then drops all their capabilities.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
+NoNewPrivileges=yes
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

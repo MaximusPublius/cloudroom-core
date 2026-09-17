@@ -1,0 +1,7 @@
+private/
+/tmp/
+/target/
+.env
+.env.*
+!.env.example
+__pycache__/
