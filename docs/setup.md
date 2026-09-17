@@ -24,7 +24,7 @@ cargo build --locked --release --jobs 2
 sudo npm install --global --prefix /usr/local @openai/codex@0.154.0
 ```
 
-Before the public repository is available, use a prepared source export instead of the clone command. The remaining commands assume you are in its root directory. Codex 0.154.0 is the previously tested version; newer harness versions may change their protocols.
+Run the remaining commands from the repository root. Codex 0.154.0 is the previously tested version; newer harness versions may change their protocols.
 
 ## 2. Create the service and agent accounts
 
