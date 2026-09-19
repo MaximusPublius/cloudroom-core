@@ -6,6 +6,12 @@ No Cloudroom account or managed-hosting service is required.
 
 Start with the [Ubuntu 24.04 setup guide](docs/setup.md) to build from source and run your first agent through the API.
 
+## macOS GUI beta
+
+[Download the Cloudroom GUI](https://github.com/davidondrej/cloudroom-installer/releases/tag/gui-v0.43.1-beta) for Apple Silicon Macs (M1 or newer) running macOS 13+.
+This beta is not notarized by Apple; see the release page for installation instructions.
+Downloads are public, but hosted cloud access remains invite-only. The core does not require the GUI.
+
 ## Build and test
 
 Requires Rust 1.89+, Git, and the supported harness runtimes.
