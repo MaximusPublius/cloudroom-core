@@ -4,6 +4,10 @@ A pre-release Rust service for running coding harnesses and preserving their ses
 One Cargo package; one service per Linux VM. Harnesses make their own inference calls.
 No Cloudroom account or managed-hosting service is required.
 
+![Cloudroom core architecture: session management, agent runtime, workspace management, storage, and app integrations](docs/architecture.png)
+
+*Architecture design. Some components and integrations shown are planned, not yet implemented.*
+
 Start with the [Ubuntu 24.04 setup guide](docs/setup.md) to build from source and run your first agent through the API.
 
 ## macOS GUI beta
