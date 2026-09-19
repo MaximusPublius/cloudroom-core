@@ -142,7 +142,7 @@ api --json '{"request_id":"close-quickstart"}' http://127.0.0.1:9840/v1/sessions
 
 ## Use your repository and connect an app
 
-- Clone your repository as `cloudroom-agent`, update `CLOUDROOM_REPOSITORY` to its absolute Git root, and restart the service **after closing existing sessions**. This release uses one configured repository per service; it does not clone or sync repositories for you.
+- To change the default repository, clone it as `cloudroom-agent`, update `CLOUDROOM_REPOSITORY` to its absolute Git root, and restart the service **after closing existing sessions**. Add other projects through [workspace imports](#import-additional-projects) without changing that default.
 - The API listens on the VM's loopback address. For remote apps, put it behind an HTTPS reverse proxy on the VM that supports SSE without buffering. Forward the `Authorization` header. Keep port 9840 private; do not expose plain HTTP to the internet.
 - Restarting the core interrupts running work. [Session lifecycle](session-lifecycle.md) explains recovery and uncertain outcomes. History saved externally survives VM loss; files in your workspace and pending history uploads do not have that guarantee.
 
@@ -161,5 +161,7 @@ A failed readiness check usually means the database, TLS certificate, migrations
 Use `python3 src/workspace/transfer.py pack LOCAL_FOLDER SNAPSHOT.tar.gz` on the source machine. Upload the archive with authenticated `POST /v1/workspaces/WORKSPACE_ID?name=FOLDER_NAME` (`Content-Type: application/gzip`). A 201 response contains the stable workspace ID and `/code/` path. GET the same route to check readiness. Send `"workspace":"WORKSPACE_ID"` with a session start; starts and recovery retain that folder. Requests without it retain the legacy configured repository behavior.
 
 Imports require `/code` to belong to the unprivileged agent on its quota-protected filesystem. The managed installer prepares this directory. Existing installations need this directory permission update before using imports; do not move running sessions. No new environment variable or SQL migration is required.
+
+Snapshots preserve Git remote URLs and project files, including any embedded credentials. Prefer Git URLs without tokens or passwords, and keep snapshot archives private; credentials are not stripped.
 
 The first copy includes unpublished Git state, working files, and project configuration. Dependency/cache directories are excluded; external symlinks and special files are rejected. Limits are 4 GiB compressed/unpacked and 200,000 archive entries. Retries reuse the same workspace and preserve cloud edits. This is first-copy preparation; later edits are not continuously synchronized.

@@ -50,7 +50,7 @@ def configure(data, directory=Path('/etc/cloudroom')):
     else:
         settings = {
             'CLOUDROOM_STORE': owner, 'CLOUDROOM_TOKEN': token, 'CLOUDROOM_DATABASE_URL': database,
-            'CLOUDROOM_LISTEN': '0.0.0.0:9840', 'CLOUDROOM_ACCOUNT_HOME': agent.pw_dir,
+            'CLOUDROOM_LISTEN': os.environ.get('CLOUDROOM_LISTEN', '127.0.0.1:9840'), 'CLOUDROOM_ACCOUNT_HOME': agent.pw_dir,
             'CLOUDROOM_STATE_DIR': str(Path(service.pw_dir) / 'history'),
             'CLOUDROOM_STORAGE_POLICY': str(directory / 'storage.json'),
         }

@@ -25,6 +25,9 @@ class InstallerTests(unittest.TestCase):
         self.data = dict(userId='self-hosted-é', coreToken='safe-token-' * 4,
                          databaseUrl='postgresql://ordinary_user:ordinary%40password@localhost/history', release='test')
         self.calls = []
+        environment = patch.dict(os.environ)
+        environment.start(); self.addCleanup(environment.stop)
+        os.environ.pop('CLOUDROOM_LISTEN', None)
         workspaces = patch.object(installer, 'CODE_ROOT', self.root / 'code')
         workspaces.start(); self.addCleanup(workspaces.stop)
         read_text = Path.read_text
@@ -52,6 +55,7 @@ class InstallerTests(unittest.TestCase):
         values = dict(line.split('=', 1) for line in path.read_text().splitlines())
         self.assertEqual(json.loads(values['CLOUDROOM_STORE']), self.data['userId'])
         self.assertEqual(json.loads(values['CLOUDROOM_DATABASE_URL']), self.data['databaseUrl'])
+        self.assertEqual(json.loads(values['CLOUDROOM_LISTEN']), '127.0.0.1:9840')
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.directory.stat().st_mode & 0o777, 0o750)
         self.assertEqual((self.root / 'code').stat().st_mode & 0o777, 0o700)
@@ -62,6 +66,22 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'differs'):
             installer.configure({**self.data, 'databaseUrl': self.data['databaseUrl'] + '2'}, self.directory)
         self.assertEqual(path.read_bytes(), original)
+
+    def test_explicit_listener_and_existing_bindings_survive_retries(self):
+        with patch.dict(os.environ, CLOUDROOM_LISTEN='0.0.0.0:9840'):
+            installer.configure(self.data, self.directory)
+        path = self.directory / 'core.env'
+        original = path.read_bytes()
+        values = dict(line.split('=', 1) for line in path.read_text().splitlines())
+        self.assertEqual(json.loads(values['CLOUDROOM_LISTEN']), '0.0.0.0:9840')
+        for listen in [None, '127.0.0.1:9840']:
+            with patch.dict(os.environ):
+                if listen is not None:
+                    os.environ['CLOUDROOM_LISTEN'] = listen
+                installer.configure(self.data, self.directory)
+            self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(sum(call[0] == 'bash' for call in self.calls), 1)
+        self.assertTrue(all(call == ['systemctl', 'enable', '--now', 'cloudroom.service'] for call in self.calls if call[0] == 'systemctl'))
 
     def test_invalid_input_never_writes_configuration(self):
         for field, value in [('userId', ''), ('coreToken', 'weak'), ('coreToken', 'x' * 32 + ' '),
