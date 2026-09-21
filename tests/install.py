@@ -4,8 +4,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -28,23 +26,22 @@ class InstallerTests(unittest.TestCase):
         environment = patch.dict(os.environ)
         environment.start(); self.addCleanup(environment.stop)
         os.environ.pop('CLOUDROOM_LISTEN', None)
-        workspaces = patch.object(installer, 'CODE_ROOT', self.root / 'code')
-        workspaces.start(); self.addCleanup(workspaces.stop)
+        os.environ.pop('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP', None)
+        for name, path in [('CODE_ROOT', self.root / 'code'), ('CACHE_ROOT', self.root / 'cache')]:
+            setting = patch.object(installer, name, path)
+            setting.start(); self.addCleanup(setting.stop)
         read_text = Path.read_text
 
         def read(path, *args, **kwargs):
             return 'test' if str(path) == '/usr/local/lib/cloudroom/version' else read_text(path, *args, **kwargs)
 
-        def run(args, **kwargs):
-            self.calls.append(args)
-            if args[0] == 'bash':
-                Path(args[-1]).write_text('{}')
-
         for target, value in [
-            ('os.geteuid', lambda: 0), ('os.chown', lambda *args: None),
+            ('os.geteuid', lambda: 0), ('os.chown', lambda *args: None), ('os.fchown', lambda *args: None),
+            ('os.getgrouplist', lambda name, gid: [gid]),
             ('pwd.getpwnam', lambda name: SimpleNamespace(pw_uid=1001 if name == 'cloudroom-agent' else 1000,
-                                                        pw_gid=1000, pw_dir=str(self.root / name))),
-            ('subprocess.run', run), ('pathlib.Path.read_text', read),
+                                                        pw_gid=1001 if name == 'cloudroom-agent' else 1000,
+                                                        pw_dir=str(self.root / name))),
+            ('subprocess.run', lambda args, **kwargs: self.calls.append(args)), ('pathlib.Path.read_text', read),
         ]:
             p = patch(target, value); p.start(); self.addCleanup(p.stop)
 
@@ -56,13 +53,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(json.loads(values['CLOUDROOM_STORE']), self.data['userId'])
         self.assertEqual(json.loads(values['CLOUDROOM_DATABASE_URL']), self.data['databaseUrl'])
         self.assertEqual(json.loads(values['CLOUDROOM_LISTEN']), '127.0.0.1:9840')
+        self.assertNotIn('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP', values)
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.directory.stat().st_mode & 0o777, 0o750)
         self.assertEqual((self.root / 'code').stat().st_mode & 0o777, 0o700)
+        policy = self.directory / 'storage.json'
+        saved = policy.read_bytes()
         installer.configure(self.data, self.directory)
         self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(sum(call[0] == 'bash' for call in self.calls), 1)
-        self.assertTrue(all(call == ['systemctl', 'enable', '--now', 'cloudroom.service'] for call in self.calls if call[0] == 'systemctl'))
+        self.assertEqual(policy.read_bytes(), saved)
+        self.assertEqual(self.calls, [['systemctl', 'enable', '--now', 'cloudroom.service']] * 2)
         with self.assertRaisesRegex(ValueError, 'differs'):
             installer.configure({**self.data, 'databaseUrl': self.data['databaseUrl'] + '2'}, self.directory)
         self.assertEqual(path.read_bytes(), original)
@@ -74,14 +74,29 @@ class InstallerTests(unittest.TestCase):
         original = path.read_bytes()
         values = dict(line.split('=', 1) for line in path.read_text().splitlines())
         self.assertEqual(json.loads(values['CLOUDROOM_LISTEN']), '0.0.0.0:9840')
+        self.assertNotIn('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP', values)
         for listen in [None, '127.0.0.1:9840']:
-            with patch.dict(os.environ):
+            with patch.dict(os.environ, CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP='1'):
                 if listen is not None:
                     os.environ['CLOUDROOM_LISTEN'] = listen
                 installer.configure(self.data, self.directory)
             self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(sum(call[0] == 'bash' for call in self.calls), 1)
-        self.assertTrue(all(call == ['systemctl', 'enable', '--now', 'cloudroom.service'] for call in self.calls if call[0] == 'systemctl'))
+        self.assertEqual(self.calls, [['systemctl', 'enable', '--now', 'cloudroom.service']] * 3)
+
+    def test_http_permission_is_saved_only_when_explicit_and_survives_retries(self):
+        for index, permission in enumerate(['', '0', 'true', '01', ' 1 ', '1']):
+            directory = self.root / f'permission-{index}'
+            with self.subTest(permission=permission):
+                with patch.dict(os.environ, CLOUDROOM_LISTEN='0.0.0.0:9840',
+                                CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP=permission):
+                    installer.configure(self.data, directory)
+                path = directory / 'core.env'
+                original = path.read_bytes()
+                values = dict(line.split('=', 1) for line in path.read_text().splitlines())
+                self.assertEqual(values.get('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP'),
+                                 json.dumps('1') if permission == '1' else None)
+                installer.configure(self.data, directory)
+                self.assertEqual(path.read_bytes(), original)
 
     def test_invalid_input_never_writes_configuration(self):
         for field, value in [('userId', ''), ('coreToken', 'weak'), ('coreToken', 'x' * 32 + ' '),
@@ -100,43 +115,48 @@ class InstallerTests(unittest.TestCase):
             installer.configure(self.data, self.directory)
         self.assertEqual(list(target.iterdir()), [])
 
+    def test_unsafe_accounts_are_rejected_before_writing(self):
+        lookup = installer.pwd.getpwnam
+        for name, field, value in [('cloudroom-agent', 'pw_uid', 0), ('cloudroom', 'pw_uid', 0),
+                                   ('cloudroom-agent', 'pw_uid', 1000), ('cloudroom-agent', 'pw_gid', 0),
+                                   ('cloudroom-agent', 'pw_gid', 1000)]:
+            def account(requested):
+                result = lookup(requested)
+                if requested == name:
+                    setattr(result, field, value)
+                return result
+            with self.subTest(name=name, field=field, value=value), patch('pwd.getpwnam', account):
+                with self.assertRaisesRegex(ValueError, 'Separate unprivileged'):
+                    installer.configure(self.data, self.directory)
+            self.assertFalse(self.directory.exists())
+        with patch('os.geteuid', return_value=1001), self.assertRaisesRegex(ValueError, 'administrator'):
+            installer.configure(self.data, self.directory)
+        with patch('os.getgrouplist', return_value=[1001, 0]), self.assertRaisesRegex(ValueError, 'primary group'):
+            installer.configure(self.data, self.directory)
+        self.assertFalse(self.directory.exists())
+        self.assertEqual(self.calls, [])
 
-class RestoreTests(unittest.TestCase):
-    def test_restore_reuses_policy_without_measuring_free_space(self):
-        with tempfile.TemporaryDirectory(prefix='cloudroom-restore-') as temporary:
-            root = Path(temporary).resolve(); root.chmod(0o700)
-            policy = root / 'policy.json'; calls = root / 'quota.json'
-            uid = os.getuid() + 1000
-            policy.write_text(json.dumps(dict(agent_uid=uid, agent_gid=uid, quota_mount='/',
-                                             quota_limit_bytes=123456 * 1024, cache_dir='/var/cache/cloudroom-agent')))
-            policy.chmod(0o600); original = policy.read_bytes()
-            # Only fake kernel commands run. Python may read this policy, never /etc/fstab.
-            shim = root / 'shim'
-            shim.write_text(f'''#!{sys.executable}
-import json,sys
-from pathlib import Path
-name=Path(sys.argv[0]).name
-if name=='id': print(0 if len(sys.argv)==2 else {uid})
-elif name=='findmnt': print('ext4')
-elif name=='quotaon': print('user quota on / is on')
-elif name=='setquota': Path({str(calls)!r}).write_text(json.dumps(sys.argv[1:]))
-elif name=='python3':
-    assert sys.argv[1:]==['-', {str(policy)!r}, '{uid}', '{uid}', '/var/cache/cloudroom-agent']
-    sys.argv=sys.argv[1:]
-    exec(compile(sys.stdin.read(), '<restore-policy>', 'exec'))
-elif name not in ['install','quota']: raise SystemExit('Unexpected command: '+name)
-''')
-            shim.chmod(0o755)
-            for name in ['id', 'findmnt', 'quotaon', 'setquota', 'python3', 'install', 'quota', 'df', 'repquota', 'mount', 'quotacheck', 'chown', 'chmod']:
-                (root / name).symlink_to(shim)
-            command = ['bash', str(Path(__file__).resolve().parents[1] / 'install/storage.sh'), 'agent', 'service', str(policy)]
-            env = {**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH']}
-            result = subprocess.run([*command, 'restore'], env=env, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(calls.read_text()), ['-u', 'agent', '0', '123456', '0', '1000000', '/'])
-            self.assertEqual(policy.read_bytes(), original)
-            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
-            self.assertEqual(policy.read_bytes(), original)
+    def test_disk_policy_without_quotas_and_retries_preserve_settings(self):
+        service, agent = installer.accounts()
+        installer.setup_storage(self.directory, service, agent)
+        policy = self.directory / 'storage.json'
+        self.assertEqual(json.loads(policy.read_text()), {
+            'agent_uid': 1001, 'agent_gid': 1001, 'cache_dir': str(self.root / 'cache'),
+            'cgroup_root': '/sys/fs/cgroup/system.slice/cloudroom.service/agents',
+        })
+        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / 'cache').stat().st_mode & 0o777, 0o700)
+        saved = {**json.loads(policy.read_text()), 'warning_bytes': 6_000_000_000}
+        policy.write_text(json.dumps(saved))
+        before = policy.read_bytes()
+        installer.setup_storage(self.directory, service, agent)
+        self.assertEqual(policy.read_bytes(), before)
+        self.assertEqual(self.calls, [])
+        outside = self.root / 'outside'; outside.write_text('keep')
+        policy.unlink(); policy.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'symlinks'):
+            installer.setup_storage(self.directory, service, agent)
+        self.assertEqual(outside.read_text(), 'keep')
 
 
 if __name__ == '__main__':

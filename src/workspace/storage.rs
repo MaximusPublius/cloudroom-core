@@ -5,7 +5,7 @@ use std::{
     fs, io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 use tokio::process::Command;
@@ -15,12 +15,8 @@ use tokio::process::Command;
 pub struct Policy {
     pub agent_uid: u32,
     pub agent_gid: u32,
-    pub quota_mount: PathBuf,
-    pub quota_limit_bytes: u64,
     pub cache_dir: PathBuf,
     pub cgroup_root: PathBuf,
-    #[serde(default = "reserve")]
-    pub reserve_bytes: u64,
     #[serde(default = "warning")]
     pub warning_bytes: u64,
     #[serde(default = "pause")]
@@ -28,17 +24,14 @@ pub struct Policy {
     #[serde(default = "resume")]
     pub resume_bytes: u64,
 }
-fn reserve() -> u64 {
-    10_000_000_000
-}
 fn warning() -> u64 {
-    2_000_000_000
+    5_000_000_000
 }
 fn pause() -> u64 {
-    512_000_000
+    2_000_000_000
 }
 fn resume() -> u64 {
-    3_000_000_000
+    2_500_000_000
 }
 
 impl Policy {
@@ -46,12 +39,9 @@ impl Policy {
         let policy: Self = serde_json::from_slice(&fs::read(path)?)?;
         if policy.agent_uid == 0
             || policy.agent_gid == 0
-            || policy.quota_mount != Path::new("/")
-            || policy.quota_limit_bytes == 0
-            || !policy.quota_limit_bytes.is_multiple_of(1024)
-            || !(policy.pause_bytes < policy.warning_bytes
-                && policy.warning_bytes < policy.resume_bytes)
-            || policy.reserve_bytes == 0
+            || !(0 < policy.pause_bytes
+                && policy.pause_bytes < policy.resume_bytes
+                && policy.resume_bytes < policy.warning_bytes)
         {
             return Err(io::Error::other("invalid disk protection policy"));
         }
@@ -67,11 +57,8 @@ impl Policy {
         Ok(policy)
     }
 
-    pub fn prepare(&self, config: &Config) -> io::Result<()> {
-        if !cfg!(target_os = "linux") {
-            return Err(io::Error::other("disk protection requires Linux"));
-        }
-        let mount = fs::metadata(&self.quota_mount)?;
+    fn check_filesystems(&self, config: &Config) -> io::Result<()> {
+        let mount = fs::metadata(&config.repository)?;
         for path in [
             &config.repository,
             &config.state_dir,
@@ -79,6 +66,7 @@ impl Policy {
             &self.cache_dir,
             Path::new("/tmp"),
             Path::new("/var/tmp"),
+            Path::new("/code"),
         ]
         .into_iter()
         .chain(
@@ -89,10 +77,18 @@ impl Policy {
         ) {
             if fs::metadata(path)?.dev() != mount.dev() {
                 return Err(io::Error::other(
-                    "agent paths require the quota-protected root filesystem",
+                    "agent paths must share the monitored filesystem",
                 ));
             }
         }
+        Ok(())
+    }
+
+    pub fn prepare(&self, config: &Config) -> io::Result<()> {
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::other("disk protection requires Linux"));
+        }
+        self.check_filesystems(config)?;
         if fs::metadata(&config.state_dir)?.uid() == self.agent_uid {
             return Err(io::Error::other(
                 "history must belong to the protected service account",
@@ -132,52 +128,17 @@ impl Policy {
         Ok(())
     }
 
-    async fn quota(&self) -> io::Result<(u64, u64)> {
-        let mut command = Command::new("/usr/bin/quota");
-        command
-            .env_clear()
-            .env("LC_ALL", "C")
-            .args([
-                "--user",
-                &self.agent_uid.to_string(),
-                "--no-wrap",
-                "--verbose",
-                "--raw-grace",
-                "--show-mntpoint",
-                "--hide-device",
-                "--filesystem=/",
-            ])
-            .kill_on_drop(true);
-        linux::as_agent(&mut command, self.agent_uid, self.agent_gid, None)?;
-        let output = tokio::time::timeout(Duration::from_secs(2), command.output())
-            .await
-            .map_err(|_| io::Error::other("quota measurement timed out"))??;
-        // quota exits nonzero when a limit is exceeded. The complete row remains authoritative.
-        let text = String::from_utf8(output.stdout).map_err(io::Error::other)?;
-        let fields: Vec<&str> = text
-            .lines()
-            .find(|l| l.split_whitespace().next() == Some("/"))
-            .ok_or_else(|| io::Error::other("quota is disabled or unavailable"))?
-            .split_whitespace()
-            .collect();
-        quota_row(&fields, self.quota_limit_bytes)
+    fn level(&self, available: u64, previous: Level) -> Level {
+        if available < self.pause_bytes
+            || (previous == Level::Blocked && available <= self.resume_bytes)
+        {
+            Level::Blocked
+        } else if available <= self.warning_bytes {
+            Level::LowSpace
+        } else {
+            Level::Normal
+        }
     }
-}
-
-fn quota_row(fields: &[&str], expected: u64) -> io::Result<(u64, u64)> {
-    let n = |i: usize| {
-        fields
-            .get(i)
-            .and_then(|v| v.trim_end_matches('*').parse::<u64>().ok())
-            .ok_or_else(|| io::Error::other("invalid quota measurement"))
-    };
-    if fields.len() != 9 || n(2)? != 0 || n(3)?.checked_mul(1024) != Some(expected) || n(7)? == 0 {
-        return Err(io::Error::other("configured hard quota is not enforced"));
-    }
-    Ok((
-        expected.saturating_sub(n(1)?.saturating_mul(1024)),
-        n(7)?.saturating_sub(n(5)?),
-    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -193,7 +154,6 @@ pub struct Snapshot {
     pub level: Level,
     pub workspace_available_bytes: Option<u64>,
     pub history_available_bytes: Option<u64>,
-    pub agent_remaining_bytes: Option<u64>,
     pub reason: &'static str,
 }
 impl Snapshot {
@@ -207,7 +167,6 @@ impl Snapshot {
             },
             workspace_available_bytes: None,
             history_available_bytes: None,
-            agent_remaining_bytes: None,
             reason: if enabled {
                 "measurement_unavailable"
             } else {
@@ -220,6 +179,7 @@ impl Snapshot {
 pub struct Guard {
     policy: Option<Policy>,
     value: Mutex<(Snapshot, Instant)>,
+    writers: Mutex<Vec<Weak<linux::Workload>>>,
 }
 impl Guard {
     pub fn new(config: &Config) -> io::Result<Self> {
@@ -228,6 +188,7 @@ impl Guard {
         }
         Ok(Self {
             policy: config.storage.clone(),
+            writers: Mutex::new(Vec::new()),
             value: Mutex::new((
                 Snapshot::unavailable(config.storage.is_some()),
                 Instant::now(),
@@ -243,41 +204,75 @@ impl Guard {
         }
     }
     pub fn blocks(&self) -> bool {
-        self.snapshot().level != Level::Normal
+        self.snapshot().level == Level::Blocked
     }
-    pub async fn refresh(&self, config: &Config) -> Snapshot {
+    pub(crate) fn spawn_writer(
+        &self,
+        command: &mut Command,
+    ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
+        // Serialize admission with pause snapshots so a just-started writer is never missed.
+        let mut writers = self.writers.lock().unwrap();
+        if self.blocks() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "storage unsafe; file writes are blocked",
+            ));
+        }
+        let workload = self
+            .policy
+            .as_ref()
+            .map(|policy| {
+                let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
+                group.attach(command, policy.agent_uid, policy.agent_gid)?;
+                Ok::<_, io::Error>(group)
+            })
+            .transpose()?;
+        let child = command.spawn()?;
+        writers.retain(|writer| writer.strong_count() > 0);
+        if let Some(group) = &workload {
+            writers.push(Arc::downgrade(group));
+        }
+        Ok((child, workload))
+    }
+
+    pub(crate) async fn pause_writers(&self, paused: bool) -> io::Result<()> {
+        let writers: Vec<_> = self
+            .writers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let mut result = Ok(());
+        for writer in writers {
+            if let Err(error) = writer.freeze(paused).await {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    pub async fn refresh(&self, config: &Config, workspaces: &super::Workspaces) -> Snapshot {
         let Some(p) = &self.policy else {
             return self.snapshot();
         };
         let previous = self.value.lock().unwrap().0.level;
         let measured = async {
-            let (workspace, history, quota) =
-                tokio::join!(disk(&config.repository), disk(&config.state_dir), p.quota());
-            let (workspace, history, (remaining, files)) = (workspace?, history?, quota?);
-            let headroom = remaining
-                .min(workspace.available_bytes.saturating_sub(p.reserve_bytes))
-                .min(history.available_bytes.saturating_sub(p.reserve_bytes));
-            let level = if files < 128
-                || headroom <= p.pause_bytes
-                || (previous == Level::Blocked && headroom < p.resume_bytes)
-            {
-                Level::Blocked
-            } else if headroom <= p.warning_bytes {
-                Level::LowSpace
-            } else {
-                Level::Normal
-            };
+            p.check_filesystems(config)?;
+            workspaces.check_filesystems()?;
+            let (workspace, history) =
+                tokio::join!(disk(workspaces.root()), disk(&config.state_dir));
+            let (workspace, history) = (workspace?, history?);
+            let level = p.level(
+                workspace.available_bytes.min(history.available_bytes),
+                previous,
+            );
             Ok::<_, io::Error>(Snapshot {
                 enabled: true,
                 level,
                 workspace_available_bytes: Some(workspace.available_bytes),
                 history_available_bytes: Some(history.available_bytes),
-                agent_remaining_bytes: Some(remaining),
-                reason: if files < 128 {
-                    "inode_limit"
-                } else {
-                    "disk_capacity"
-                },
+                reason: "disk_capacity",
             })
         }
         .await
@@ -508,4 +503,67 @@ fn a_name(file: &fs::File) -> io::Result<String> {
 #[cfg(not(target_os = "linux"))]
 pub fn clean_npm_cache(_: &Path, _: &Path) -> io::Result<usize> {
     Err(io::Error::other("cache cleanup requires Linux"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actual_free_space_warns_without_blocking_and_resumes_below_warning() {
+        let policy: Policy = serde_json::from_str(
+            r#"{"agent_uid":1001,"agent_gid":1001,"cache_dir":"/cache","cgroup_root":"/agents"}"#,
+        )
+        .unwrap();
+        for (available, before, expected) in [
+            (20_000_000_000, Level::Normal, Level::Normal),
+            (5_000_000_001, Level::LowSpace, Level::Normal),
+            (5_000_000_000, Level::Normal, Level::LowSpace),
+            (4_999_999_999, Level::Normal, Level::LowSpace),
+            (3_000_000_000, Level::LowSpace, Level::LowSpace),
+            (2_500_000_001, Level::Normal, Level::LowSpace),
+            (2_500_000_001, Level::Blocked, Level::LowSpace),
+            (2_500_000_000, Level::Blocked, Level::Blocked),
+            (2_499_999_999, Level::Blocked, Level::Blocked),
+            (2_000_000_001, Level::Normal, Level::LowSpace),
+            (2_000_000_000, Level::Normal, Level::LowSpace),
+            (1_999_999_999, Level::LowSpace, Level::Blocked),
+            (512_000_000, Level::Normal, Level::Blocked),
+            (0, Level::Normal, Level::Blocked),
+            (5_000_000_000, Level::Blocked, Level::LowSpace),
+            (5_000_000_001, Level::Blocked, Level::Normal),
+        ] {
+            let level = policy.level(available, before);
+            assert_eq!(level, expected, "{available} bytes, previously {before:?}");
+            let guard = Guard {
+                policy: None,
+                writers: Mutex::new(Vec::new()),
+                value: Mutex::new((
+                    Snapshot {
+                        enabled: true,
+                        level,
+                        workspace_available_bytes: Some(available),
+                        history_available_bytes: Some(available),
+                        reason: "disk_capacity",
+                    },
+                    Instant::now(),
+                )),
+            };
+            assert_eq!(guard.blocks(), expected == Level::Blocked);
+        }
+    }
+
+    #[test]
+    fn missing_or_stale_measurements_do_not_authorize_writes() {
+        let guard = Guard {
+            policy: None,
+            writers: Mutex::new(Vec::new()),
+            value: Mutex::new((Snapshot::unavailable(true), Instant::now())),
+        };
+        assert!(guard.blocks());
+        let mut snapshot = Snapshot::unavailable(true);
+        snapshot.level = Level::Normal;
+        *guard.value.lock().unwrap() = (snapshot, Instant::now() - Duration::from_secs(6));
+        assert!(guard.blocks());
+    }
 }

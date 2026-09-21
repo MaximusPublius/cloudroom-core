@@ -23,7 +23,7 @@ CLOUDROOM_PI_MODEL=gpt-6-astra
 
 Use the official `@earendil-works/pi-coding-agent` **0.85.1**, with its supported Node runtime on `/usr/local/bin:/usr/bin:/bin`. Provision the harness and its account credentials separately; the core does not install packages or perform login. Adapter startup verifies the resolved model/provider, native identity, and bundled context extension. Protocol compatibility must be tested before upgrading Pi.
 
-Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/telemetry are disabled through Pi's process flags. Existing Pi settings/resources and explicit project-trust decisions still apply. Prepare trusted packages before service startup. The account directory is separate from Cloudroom's protected state directory. Every configured harness home must be on the quota-protected filesystem, just like the workspace. Neither API/database tokens nor administrative environment variables are inherited by either harness. Pi credentials are available to that agent account; this is not isolation of inference credentials from its own tools.
+Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/telemetry are disabled through Pi's process flags. Existing Pi settings/resources and explicit project-trust decisions still apply. Prepare trusted packages before service startup. The account directory is separate from Cloudroom's protected state directory. Every configured harness home must share the monitored filesystem with the workspace. Neither API/database tokens nor administrative environment variables are inherited by either harness. Pi credentials are available to that agent account; this is not isolation of inference credentials from its own tools.
 
 ## API and compatibility
 
@@ -33,7 +33,11 @@ Select a configured harness when creating a session:
 {"request_id":"my-session","harness":"pi"}
 ```
 
-All other session, prompt, interrupt, close, events and SSE endpoints are shared. Session creation accepts a model override and a reasoning level for either harness. Pi maps `none` to `off`, verifies the model supports the requested level, and checks that Pi applied it; unsupported levels fail rather than being silently changed. Capabilities include each harness's configured inference provider. Harness selection, model, reasoning and provider are saved with acceptance; changing deployment defaults does not change an existing session's selected model. Explicitly selecting another harness with the same creation request ID conflicts. Legacy receipts without harness metadata mean Codex. Original stored records are not rewritten, and legacy Codex `data.value` is reconstructed on reads inside the adapter boundary.
+All other session, prompt, interrupt, close, events and SSE endpoints are shared. Session creation accepts a model override and a reasoning level for either harness. Pi maps `none` to `off`, verifies the model supports the requested level, and checks that Pi applied it; unsupported levels fail rather than being silently changed. Capabilities include each harness's default inference provider. Pi advertises `provider_selection: true`; creation accepts an optional `provider` override authenticated in its private Pi home. Omitting it preserves the configured default. Harness selection, model, reasoning and provider are saved with acceptance; changing deployment defaults does not change an existing session's selected model. Explicitly selecting another harness with the same creation request ID conflicts. Legacy receipts without harness metadata mean Codex. Original stored records are not rewritten, and legacy Codex `data.value` is reconstructed on reads inside the adapter boundary.
+
+Codex reasoning is validated against its native `model/list` catalog, not a fixed Cloudroom list. `/v1/capabilities` exposes `harnesses[].models` with each model's `reasoning_levels`; a null catalog means discovery failed, not unsupported models. Discovery creates no Codex thread or turn and is cached for 60 seconds. Pi exposes its adapter's `reasoning_levels`; its model-specific check still happens during startup. Existing accepted requests are deduplicated before model revalidation.
+
+Launch rejections include stable codes such as `invalid_reasoning_effort`, `invalid_model`, and `request_conflict`. `storage_blocked`, `service_stopping`, and `model_catalog_unavailable` are temporary. Clients should classify codes, not assume every HTTP 409 is permanent, and never display arbitrary remote error bodies.
 
 Session responses include `harness`, `provider`, `capabilities` and an adapter-owned `native_cursor`. `current_turn` and `native_offset` remain for legacy Codex readers; they are not portable request/capture identifiers. Follow `current_request` and receipts for execution. Pi emits common text/thinking deltas and item/tool events; `tool_snapshot` replaces previous partial tool output rather than appending it. Raw native frames and native session records are preserved.
 
@@ -67,7 +71,7 @@ python3 tests/pi_e2e.py
 python3 tests/core_e2e.py --fixture
 python3 tests/core_e2e.py
 python3 tests/core_e2e.py --harness pi
-# Prepared disposable quota VM and test accounts only:
+# Prepared disposable Linux VM and test accounts only:
 sudo python3 tests/storage_e2e.py --disposable --mixed
 ```
 

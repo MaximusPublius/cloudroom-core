@@ -3,6 +3,7 @@ pub mod config;
 mod observability;
 pub mod runtime;
 pub mod session;
+pub mod sync;
 pub mod workspace;
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -13,13 +14,14 @@ pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error:
         profile.home = profile.home.canonicalize()?;
         profile.binary = profile.binary.canonicalize()?;
     }
+    // A bind failure must not mutate saved sessions or claim their recovery.
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let manager = session::Manager::open(config.clone())?;
     manager.check_storage().await;
     // Reconcile previous workloads before the API or storage guard can start work.
     manager.restore_all().await?;
     manager.start_storage_guard();
     manager.start_uploader();
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     eprintln!("Cloudroom listening on {}", listener.local_addr()?);
     let shutdown = manager.clone();
     let mut changed = manager.subscribe();

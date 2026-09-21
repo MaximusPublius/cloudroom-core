@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Pi RPC fixture with real owned tools; no model or external credentials."""
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -40,15 +42,17 @@ def entry(message):
             f.write(json.dumps(value)+'\n')
     send({'type':'message_end','message':message})
 
-def finish(reason='stop'):
+def finish(reason='stop', text='done'):
     global running
     running = False
-    entry({'role':'assistant','content':[{'type':'text','text':'done'}],'stopReason':reason})
+    entry({'role':'assistant','content':[{'type':'text','text':text}],'stopReason':reason})
     send({'type':'turn_end'})
     send({'type':'agent_end','messages':[],'willRetry':False})
     send({'type':'agent_settled'})
 
 try:
+    if Path('startup-delay').exists():
+        time.sleep(float(Path('startup-delay').read_text()))
     for line in sys.stdin:
         v = json.loads(line); kind = v['type']; ident = v.get('id'); data = None
         if kind == 'get_state':
@@ -62,13 +66,25 @@ try:
             data = {'commands':[{'name':'cloudroom_context','description':'Cloudroom context-only notice (v1)','source':'extension','sourceInfo':{'path':str(helper)}}]}
         elif kind == 'prompt':
             text = v['message']
-            if text.startswith('/cloudroom_context '):
+            if v.get('streamingBehavior') == 'steer':
+                if not running:
+                    send({'id':ident,'type':'response','command':kind,'success':False,'error':'steer target is no longer active'})
+                    continue
+                data = {'steered':True}
+            elif text.startswith('/cloudroom_context '):
                 notice = json.loads(text.split(' ',1)[1])['text']
                 if Path('hold-cache').exists():
                     held.append(open(Path('hold-cache').read_text(), 'rb'))
                 with Path('warning-'+native).open('a') as warning:
                     warning.write(notice+'\n')
                 entry({'role':'custom','customType':'cloudroom_notice','content':notice})
+            elif text == '/cloudroom_snapshot':
+                pass
+            elif text.startswith('/cloudroom_child_result '):
+                reply = json.loads(text.split(' ',1)[1])
+                assert reply.get('result') == 'done', reply
+                Path('child-result').write_text(json.dumps(reply))
+                finish()
             elif text == 'reject':
                 send({'id':ident,'type':'response','command':kind,'success':False,'error':'rejected before acceptance'})
                 continue
@@ -84,7 +100,8 @@ try:
                 running = True
                 send({'type':'response','id':ident,'command':'prompt','success':True})
                 send({'type':'agent_start'})
-                entry({'role':'user','content':text})
+                content = [{'type':'text','text':text}, *v['images']] if v.get('images') else text
+                entry({'role':'user','content':content})
                 send({'type':'turn_start'})
                 if text in ('hold', 'hold-native-queue'):
                     native_queue = text == 'hold-native-queue'
@@ -92,6 +109,14 @@ try:
                     child = subprocess.Popen([sys.executable,'-c',code],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                     children.append(child)
                     send({'type':'tool_execution_start','toolCallId':'tool-1','toolName':'bash','args':{'command':'fixture'}})
+                elif text.startswith('verify attachments\n'):
+                    images = [base64.b64decode(image['data'], validate=True) for image in v['images']]
+                    files = [Path(line[16:-1]).read_bytes() for line in text.splitlines() if line.startswith('[Attached file: ')]
+                    assert len(images) == len(files) == 1
+                    proof = 'attachments read: ' + ' '.join(hashlib.sha256(data).hexdigest() for data in images + files)
+                    finish(text=proof)
+                elif text == 'child':
+                    send({'type':'cloudroom_child_request','id':'fixture-child','tool_call_id':'child-tool','prompt':'hello'})
                 elif text == 'retry':
                     def retry():
                         global compacting
@@ -132,6 +157,37 @@ try:
         elif kind in ('abort_bash','clear_queue'):
             if kind == 'clear_queue': native_queue = False
             data = {'steering':[],'followUp':[]}
+        elif kind == 'compact':
+            compacting = True
+            send({'type':'compaction_start','reason':'manual'})
+            compacting = False
+            if Path('compact-error').exists():
+                send({'type':'compaction_end','reason':'manual','aborted':False,'willRetry':False,'errorMessage':'Nothing to compact (session too small)'})
+                send({'type':'response','id':ident,'command':kind,'success':False,'error':'Nothing to compact (session too small)'})
+                continue
+            send({'type':'compaction_end','willRetry':False})
+            data = {}
+        elif kind == 'get_fork_messages':
+            entries = [json.loads(line) for line in path.read_text().splitlines()]
+            data = {'messages':[{'entryId':e['id'],'text':e['message']['content']} for e in entries if e.get('message',{}).get('role') == 'user']}
+        elif kind == 'get_last_assistant_text':
+            data = {'text':'done'}
+        elif kind == 'fork':
+            entries = [json.loads(line) for line in path.read_text().splitlines()]
+            selected = next((i for i,e in enumerate(entries) if e.get('id') == v.get('entryId') and e.get('message',{}).get('role') == 'user'), None)
+            if selected is None:
+                send({'type':'response','id':ident,'command':kind,'success':False,'error':'user checkpoint required'})
+                continue
+            if Path('hold-fork').exists():
+                Path('fork-ready').touch()
+                while not Path('release-fork').exists(): time.sleep(.01)
+            native = str(uuid.uuid4())
+            path = path.parent / (native + '.jsonl')
+            entries[0]['id'] = native
+            path.write_text(''.join(json.dumps(e)+'\n' for e in entries[:selected]))
+            data = {'text':entries[selected]['message']['content'],'cancelled':False}
+        elif kind == 'get_session_stats':
+            data = {'contextUsage':{'tokens':128,'contextWindow':100000},'tokens':{'input':100,'output':28,'cacheRead':0,'cacheWrite':0,'total':128}}
         else:
             raise RuntimeError('unexpected RPC command '+kind)
         send({'type':'response','id':ident,'command':kind,'success':True,**({'data':data} if data is not None else {})})

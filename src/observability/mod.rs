@@ -2,7 +2,10 @@ mod system;
 #[cfg(test)]
 mod tests;
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    runtime::{ExitDetails, Kind},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -11,7 +14,7 @@ use std::{
     fs::{self, OpenOptions},
     hash::BuildHasher,
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::Path,
     sync::{
         Arc,
@@ -23,6 +26,9 @@ use tokio::sync::{mpsc, watch};
 
 const CAPACITY: usize = 1024;
 const LOCAL_BYTES: u64 = 8 * 1024 * 1024;
+const STDERR_CAPACITY: usize = 32;
+const STDERR_BATCH: usize = 8;
+const STDERR_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Only diagnostic fields belong here: never prompts, native payloads, paths or credentials.
 #[derive(Serialize)]
@@ -40,9 +46,15 @@ pub(crate) enum Signal {
         duration_ms: u64,
     },
     AgentExit {
-        session_id: String,
+        session_id: Option<String>,
+        harness: Kind,
         expected: bool,
         reason: &'static str,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        stderr_bytes: u64,
+        stderr_complete: bool,
+        stderr_truncated: bool,
     },
     HistoryUpload {
         records: usize,
@@ -70,9 +82,16 @@ struct Record {
     signal: Signal,
 }
 
+// This separate, non-serializable envelope can never enter the PostgreSQL buffer.
+struct LocalStderr {
+    metadata: Value,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Observability {
     sender: mpsc::Sender<Record>,
+    stderr: mpsc::Sender<LocalStderr>,
     run_id: Arc<String>,
     sequence: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
@@ -95,10 +114,12 @@ pub(crate) fn elapsed_ms(start: Instant) -> u64 {
 impl Observability {
     pub fn start(config: &Config, pool: PgPool) -> Self {
         let (sender, receiver) = mpsc::channel(CAPACITY);
+        let (stderr, captures) = mpsc::channel(STDERR_CAPACITY);
         let (stop, stopping) = watch::channel(false);
         let (done, finished) = watch::channel(false);
         let this = Self {
             sender,
+            stderr,
             run_id: Arc::new(format!(
                 "{:016x}",
                 RandomState::new().hash_one(SystemTime::now())
@@ -112,7 +133,7 @@ impl Observability {
         let config = config.clone();
         let worker = this.clone();
         tokio::spawn(async move {
-            worker.run(config, pool, receiver, stopping).await;
+            worker.run(config, pool, receiver, captures, stopping).await;
             done.send_replace(true);
         });
         this
@@ -129,7 +150,41 @@ impl Observability {
 
     /// No disk or database waits on the caller's path. Overload is counted, not backpressured.
     pub fn record(&self, signal: Signal) -> String {
-        let record = self.make_record(signal);
+        self.submit(self.make_record(signal))
+    }
+
+    pub fn agent_exit(
+        &self,
+        session_id: Option<&str>,
+        harness: Kind,
+        reason: &'static str,
+        expected: bool,
+        details: ExitDetails,
+    ) -> String {
+        let record = self.make_record(Signal::AgentExit {
+            session_id: session_id.map(str::to_owned),
+            harness,
+            reason,
+            expected,
+            exit_code: details.code,
+            signal: details.signal,
+            stderr_bytes: details.stderr_bytes,
+            stderr_complete: details.stderr_complete,
+            stderr_truncated: details.stderr_bytes > details.stderr.len() as u64,
+        });
+        if !details.stderr.is_empty() {
+            let capture = LocalStderr {
+                metadata: serde_json::to_value(&record).expect("diagnostic serialization"),
+                bytes: details.stderr,
+            };
+            if self.stderr.try_send(capture).is_err() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.submit(record)
+    }
+
+    fn submit(&self, record: Record) -> String {
         let id = format!("{}-{}", record.run_id, record.sequence);
         if self.sender.try_send(record).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -152,6 +207,7 @@ impl Observability {
         config: Config,
         pool: PgPool,
         mut receiver: mpsc::Receiver<Record>,
+        mut captures: mpsc::Receiver<LocalStderr>,
         mut stop: watch::Receiver<bool>,
     ) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -162,10 +218,13 @@ impl Observability {
         let mut prune_at = Instant::now();
         let (mut local_write_failures, mut upload_failures) = (0, 0);
         loop {
-            tokio::select! { _ = tick.tick() => {}, _ = stop.changed() => {} }
+            if !*stop.borrow() {
+                tokio::select! { _ = tick.tick() => {}, _ = stop.changed() => {} }
+            }
             let stopping = *stop.borrow();
             if stopping {
                 receiver.close();
+                captures.close();
             }
             let mut batch = Vec::new();
             for _ in 0..CAPACITY {
@@ -211,6 +270,27 @@ impl Observability {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            let mut local = Vec::new();
+            for _ in 0..STDERR_BATCH {
+                match captures.try_recv() {
+                    Ok(capture) => local.push(capture),
+                    Err(_) => break,
+                }
+            }
+            if !local.is_empty() {
+                let directory = config.state_dir.clone();
+                if !matches!(
+                    tokio::task::spawn_blocking(move || write_stderr(&directory, local)).await,
+                    Ok(Ok(()))
+                ) {
+                    local_write_failures += 1;
+                    eprintln!("Cloudroom private harness diagnostic write failed");
+                }
+            }
+            // Finish bounded local batches before spending the shutdown budget on PostgreSQL.
+            if stopping && !captures.is_empty() {
+                continue;
+            }
             if !pending.is_empty() {
                 let payload = serde_json::to_string(&pending).expect("diagnostic serialization");
                 let upload = sqlx::query(
@@ -249,10 +329,61 @@ impl Observability {
     }
 }
 
+fn write_stderr(state: &Path, captures: Vec<LocalStderr>) -> io::Result<()> {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    let uid = unsafe { geteuid() };
+    let check_directory = |path: &Path, forbidden: u32| -> io::Result<()> {
+        let m = fs::symlink_metadata(path)?;
+        if !m.is_dir() || m.uid() != uid || m.mode() & forbidden != 0 {
+            return Err(io::Error::other("unsafe diagnostic directory"));
+        }
+        Ok(())
+    };
+    check_directory(state, 0o022)?;
+    let directory = state.join("harness-diagnostics");
+    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    check_directory(&directory, 0o077)?;
+    // The protected directory prevents agent races after these checks. Never repair unsafe files.
+    for name in ["stderr.jsonl", "stderr.previous.jsonl"] {
+        match fs::symlink_metadata(directory.join(name)) {
+            Ok(m)
+                if m.is_file()
+                    && m.uid() == uid
+                    && m.nlink() == 1
+                    && m.mode() & 0o777 == 0o600
+                    && m.len() <= STDERR_FILE_BYTES => {}
+            Ok(_) => return Err(io::Error::other("unsafe diagnostic file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    for capture in captures {
+        let mut record = capture.metadata;
+        record["stderr"] = json!(String::from_utf8_lossy(&capture.bytes));
+        let mut bytes = serde_json::to_vec(&record)?;
+        bytes.push(b'\n');
+        write_rotated(&directory, "stderr", &bytes, STDERR_FILE_BYTES)?;
+    }
+    Ok(())
+}
+
 fn write_local(directory: &Path, bytes: &[u8], limit: u64) -> io::Result<()> {
-    let path = directory.join("diagnostics.jsonl");
+    write_rotated(directory, "diagnostics", bytes, limit)
+}
+
+fn write_rotated(directory: &Path, name: &str, bytes: &[u8], limit: u64) -> io::Result<()> {
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::other("diagnostic batch exceeds file limit"));
+    }
+    let path = directory.join(format!("{name}.jsonl"));
     if fs::metadata(&path).is_ok_and(|m| m.len() + bytes.len() as u64 > limit) {
-        fs::rename(&path, directory.join("diagnostics.previous.jsonl"))?;
+        fs::rename(&path, directory.join(format!("{name}.previous.jsonl")))?;
     }
     let mut file = OpenOptions::new()
         .create(true)

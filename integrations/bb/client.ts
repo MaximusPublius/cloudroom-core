@@ -6,8 +6,8 @@ export type Json =
   | Json[]
   | { [key: string]: Json };
 export type Harness = "codex" | "pi";
-export type Workspace = { id: string; path: string };
-type Upload = { body: ReadableStream<Uint8Array>; length: number };
+export type Workspace = { id: string; path: string; parent?: string };
+type Upload = { body: ReadableStream<Uint8Array>; length: number; contentType?: string };
 export type Receipt = {
   request_id: string;
   command: string;
@@ -36,14 +36,79 @@ export type Session = {
   receipts: { [id: string]: Receipt };
 };
 
+const rejectionMessages: Record<string, string> = {
+  invalid_provider: "Select a valid inference provider for Pi.",
+  invalid_model: "This model is unavailable on Cloud. Refresh the model selection.",
+  invalid_reasoning_effort: "This reasoning level is unavailable for the cloud model. Select a supported level.",
+  request_conflict: "This request ID belongs to different content. Start a new request.",
+  harness_not_configured: "Configure the selected harness on Cloud before starting.",
+  invalid_workspace: "The cloud folder could not be selected. Check its name and saved mapping.",
+  storage_blocked: "Cloud storage is temporarily blocking new work. Your request will retry.",
+  service_stopping: "Cloud is restarting. Your request will retry.",
+  model_catalog_unavailable: "Cloud model discovery is unavailable. Your request will retry.",
+  invalid_service_tier: "This service tier is unavailable for the cloud model.",
+  invalid_attachment: "The attachment could not be stored on Cloud.",
+  attachment_permission_denied: "Cloud folder permission denied",
+  attachment_too_large: "The attachment exceeds the Cloud size limit (10 MiB per image, 25 MiB per file).",
+};
+const transientRejections = new Set(["storage_blocked", "service_stopping", "model_catalog_unavailable"]);
+
 export class CloudroomError extends Error {
   readonly status: number | null;
+  readonly code: string | null;
+  readonly retryable: boolean;
 
-  constructor(message: string, status: number | null = null) {
+  constructor(message: string, status: number | null = null, code: string | null = null) {
     super(message);
     this.name = "CloudroomError";
     this.status = status;
+    this.code = code;
+    this.retryable = code && Object.hasOwn(rejectionMessages, code)
+      ? transientRejections.has(code)
+      : status === null || status >= 500 || [408, 409, 429].includes(status);
   }
+}
+
+export class CloudroomConnectionError extends CloudroomError {
+  readonly networkCode: string | null;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "CloudroomConnectionError";
+    const detail = cause instanceof Error && cause.cause ? cause.cause : cause;
+    const code = detail && typeof detail === "object" && "code" in detail ? detail.code : null;
+    this.networkCode = typeof code === "string" && [
+      "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
+      "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+    ].includes(code) ? code : null;
+  }
+}
+
+async function rejectionCode(response: Response): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > 4096) return null;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    const body = JSON.parse(new TextDecoder().decode(bytes));
+    if (typeof body?.code === "string" && Object.hasOwn(rejectionMessages, body.code)) return body.code;
+    const legacy: Record<string, string> = {
+      "invalid reasoning effort": "invalid_reasoning_effort", "invalid model": "invalid_model",
+      "storage unsafe; new execution is blocked": "storage_blocked", "service is stopping": "service_stopping",
+    };
+    return typeof body?.error === "string" && Object.hasOwn(legacy, body.error) ? legacy[body.error] : null;
+  } catch { return null; }
+  finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -177,29 +242,31 @@ export class CloudroomClient {
             ? "text/event-stream"
             : "application/json",
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-          ...(upload ? { "Content-Type": "application/gzip", "Content-Length": String(upload.length) } : {}),
+          ...(upload ? { "Content-Type": upload.contentType ?? "application/gzip", "Content-Length": String(upload.length) } : {}),
         },
         ...(upload ? { body: upload.body, duplex: "half" } : body === undefined ? {} : { body: JSON.stringify(body) }),
         redirect: "error",
         signal,
       });
-    } catch {
+    } catch (error) {
       if (signal?.aborted)
         throw new DOMException(
           "Cloudroom request cancelled or timed out",
           "AbortError",
         );
-      throw new CloudroomError(
+      throw new CloudroomConnectionError(
         "Cloudroom is unreachable. For an unconfirmed command, retry the same request_id.",
+        error,
       );
     }
     if (!response.ok) {
+      const code = response.status === 400 || response.status === 409 ? await rejectionCode(response) : null;
       await response.body?.cancel();
       const message =
         response.status === 401 || response.status === 403
           ? "Cloudroom authentication failed"
-          : `Cloudroom rejected the request (HTTP ${response.status})`;
-      throw new CloudroomError(message, response.status);
+          : code ? rejectionMessages[code] : `Cloudroom rejected the request (HTTP ${response.status})`;
+      throw new CloudroomError(message, response.status, code);
     }
     return response;
   }
@@ -217,7 +284,7 @@ export class CloudroomClient {
       signal ? AbortSignal.any([signal, timeout]) : timeout,
       upload,
     );
-    if ((body !== undefined || upload) && response.status !== (upload ? 201 : 202)) {
+    if ((body !== undefined || upload) && response.status !== 202) {
       await response.body?.cancel();
       throw new CloudroomError(
         "Cloudroom did not acknowledge command acceptance",
@@ -233,7 +300,9 @@ export class CloudroomClient {
     let length = 0;
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await reader.read().catch((error: unknown) => {
+          throw new CloudroomConnectionError("Cloudroom response disconnected. Retry unconfirmed commands with the same request_id.", error);
+        });
         if (done) break;
         length += value.byteLength;
         if (length > MAX_RESPONSE_BYTES)
@@ -301,37 +370,133 @@ export class CloudroomClient {
     try {
       const value = await this.#json(`/v1/workspaces/${id}`, undefined, signal);
       if (value.id !== id) throw new CloudroomError("Cloudroom workspace mismatch");
-      return { id, path: text(value.path) };
+      return { id, path: text(value.path), ...(value.parent === undefined ? {} : { parent: text(value.parent) }) };
     } catch (error) {
       if (error instanceof CloudroomError && error.status === 404) return null;
       throw error;
     }
   }
 
-  async importWorkspace(id: string, name: string, upload: Upload, signal?: AbortSignal): Promise<Workspace> {
-    requestId(id);
-    if (!Number.isSafeInteger(upload.length) || upload.length <= 0 || upload.length > 4 * 1024 ** 3) throw new CloudroomError("Project archive exceeds the 4 GiB limit");
-    const value = await this.#json(`/v1/workspaces/${id}?name=${encodeURIComponent(name)}`, undefined, signal, upload);
-    if (value.id !== id) throw new CloudroomError("Cloudroom workspace mismatch");
-    return { id, path: text(value.path) };
-  }
-
-  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string } = {}) {
+  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string } = {}) {
     if (harness !== "codex" && harness !== "pi")
       throw new CloudroomError("Unsupported Cloudroom harness");
     return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
   }
 
-  prompt(sessionId: string, id: string, prompt: string) {
-    if (!prompt.trim() || new TextEncoder().encode(prompt).length > 32768) {
+  prompt(
+    sessionId: string,
+    id: string,
+    prompt: string,
+    reasoning?: string,
+    extra: { content?: Json; attachments?: Json; service_tier?: string } = {},
+  ) {
+    if ((!prompt.trim() && extra.attachments === undefined) || new TextEncoder().encode(prompt).length > 32768) {
       throw new CloudroomError("Prompt must contain 1–32768 bytes of text");
     }
     return this.#command(
       `${sessionPath(sessionId)}/prompts`,
       "prompt",
-      { request_id: id, text: prompt },
+      {
+        request_id: id,
+        text: prompt,
+        ...(reasoning ? { reasoning } : {}),
+        ...(extra.content === undefined ? {} : { content: extra.content }),
+        ...(extra.attachments === undefined ? {} : { attachments: extra.attachments }),
+        ...(extra.service_tier ? { service_tier: extra.service_tier } : {}),
+      },
       sessionId,
     );
+  }
+
+  edit(
+    sessionId: string,
+    id: string,
+    targetRequestId: string,
+    expectedRevision: number,
+    prompt: string,
+    extra: { content?: Json; attachments?: Json; reasoning?: string; service_tier?: string } = {},
+  ) {
+    return this.#command(
+      `${sessionPath(sessionId)}/edit`,
+      "edit",
+      {
+        request_id: id,
+        target_request_id: requestId(targetRequestId),
+        expected_revision: expectedRevision,
+        text: prompt,
+        ...extra,
+      },
+      sessionId,
+    );
+  }
+
+  cancel(sessionId: string, id: string, targetRequestId: string) {
+    return this.#command(
+      `${sessionPath(sessionId)}/cancel`,
+      "cancel",
+      { request_id: id, target_request_id: requestId(targetRequestId) },
+      sessionId,
+    );
+  }
+
+  steer(sessionId: string, id: string, targetRequestId: string, text: string) {
+    if (!text.trim() || new TextEncoder().encode(text).length > 32768) {
+      throw new CloudroomError("Prompt must contain 1–32768 bytes of text");
+    }
+    return this.#command(
+      `${sessionPath(sessionId)}/steer`,
+      "steer",
+      { request_id: id, target_request_id: requestId(targetRequestId), text },
+      sessionId,
+    );
+  }
+
+  compact(sessionId: string, id: string) {
+    return this.#command(`${sessionPath(sessionId)}/compact`, "compact", { request_id: id }, sessionId);
+  }
+
+  rewind(sessionId: string, id: string, before?: string, lastTurnId?: string, replacement?: { request_id: string; text: string; content?: Json; attachments?: Json; reasoning?: string; service_tier?: string }) {
+    return this.#command(
+      `${sessionPath(sessionId)}/rewind`,
+      "rewind",
+      {
+        request_id: id,
+        ...(before ? { before } : {}),
+        ...(lastTurnId ? { last_turn_id: lastTurnId } : {}),
+        ...(replacement ? { replacement } : {}),
+      },
+      sessionId,
+    );
+  }
+
+  async attach(
+    sessionId: string,
+    id: string,
+    name: string,
+    kind: "image" | "file",
+    upload: Upload,
+    signal?: AbortSignal,
+  ): Promise<Acceptance> {
+    requestId(id);
+    if (!Number.isSafeInteger(upload.length) || upload.length <= 0 || upload.length > 25 * 1024 * 1024) {
+      throw new CloudroomError("Attachment exceeds the size limit");
+    }
+    const query = new URLSearchParams({ request_id: id, name, kind });
+    const value = await this.#json(
+      `${sessionPath(sessionId)}/attachments?${query}`,
+      undefined,
+      signal,
+      { ...upload, contentType: "application/octet-stream" },
+    );
+    const accepted = {
+      session_id: text(value.session_id),
+      receipt: receipt(value.receipt),
+      saving: json(value.saving),
+    };
+    if (accepted.session_id !== sessionId || accepted.receipt.request_id !== id || accepted.receipt.command !== "attach") {
+      throw new CloudroomError("Cloudroom acceptance does not match the command");
+    }
+    return accepted;
   }
 
   interrupt(sessionId: string, id: string, targetRequestId: string) {
@@ -358,6 +523,15 @@ export class CloudroomClient {
       { request_id: id },
       sessionId,
     );
+  }
+
+  async sessionWorkspace(sessionId: string, signal?: AbortSignal): Promise<{ path: string; branch: string | null; head: string | null }> {
+    const value = await this.#json(`${sessionPath(sessionId)}/workspace`, undefined, signal);
+    return {
+      path: text(value.path),
+      branch: value.branch === null ? null : text(value.branch),
+      head: value.head === null ? null : text(value.head),
+    };
   }
 
   async session(sessionId: string, signal?: AbortSignal): Promise<Session> {
@@ -420,7 +594,7 @@ export class CloudroomClient {
 
   async *stream(
     sessionId: string,
-    options: { after?: number; signal: AbortSignal },
+    options: { after?: number; signal: AbortSignal; onConnected?: () => void | Promise<void> },
   ): AsyncGenerator<SessionRecord> {
     let cursor = sequence(options.after ?? 0);
     for await (const item of this.#stream(sessionId, options)) {
@@ -433,7 +607,7 @@ export class CloudroomClient {
 
   async *#stream(
     sessionId: string,
-    options: { after?: number; signal: AbortSignal },
+    options: { after?: number; signal: AbortSignal; onConnected?: () => void | Promise<void> },
   ): AsyncGenerator<SessionRecord> {
     const cursor = sequence(options.after ?? 0);
     const response = await this.#request(
@@ -454,8 +628,13 @@ export class CloudroomClient {
     let id = "";
     let frameSize = 0;
     try {
+      options.signal.throwIfAborted();
+      await options.onConnected?.();
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await reader.read().catch((error: unknown) => {
+          options.signal.throwIfAborted();
+          throw new CloudroomConnectionError("Cloudroom event stream disconnected", error);
+        });
         if (done) return;
         buffer += decoder.decode(value, { stream: true });
         if (buffer.length + frameSize > MAX_RESPONSE_BYTES)

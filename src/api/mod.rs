@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode, Version, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -24,16 +24,31 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/workspaces/{id}", get(workspace))
+        .route("/v1/settings", get(crate::sync::settings))
+        .route("/v1/sync", post(crate::sync::check_in))
+        .route("/v1/sync/{id}", get(crate::sync::scan))
         .route(
-            "/v1/workspaces/{id}",
-            get(workspace)
-                .post(import_workspace)
+            "/v1/sync/{id}/file",
+            get(crate::sync::read)
+                .put(crate::sync::apply)
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/dashboard", get(dashboard))
         .route("/v1/sessions", post(start))
         .route("/v1/sessions/{id}", get(status))
+        .route("/v1/sessions/{id}/workspace", get(session_workspace))
+        .route("/v1/sessions/{id}/recovery", get(recovery))
         .route("/v1/sessions/{id}/prompts", post(prompt))
+        .route("/v1/sessions/{id}/edit", post(edit))
+        .route("/v1/sessions/{id}/cancel", post(cancel))
+        .route("/v1/sessions/{id}/steer", post(steer))
+        .route("/v1/sessions/{id}/compact", post(compact))
+        .route("/v1/sessions/{id}/rewind", post(rewind))
+        .route(
+            "/v1/sessions/{id}/attachments",
+            post(attach).layer(DefaultBodyLimit::max(26 * 1024 * 1024)),
+        )
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop))
         .route("/v1/sessions/{id}/resume", post(resume))
@@ -58,6 +73,7 @@ async fn observe(
     next: Next,
 ) -> Response {
     let started = Instant::now();
+    let version = request.version();
     let method = match request.method().as_str() {
         "GET" => "GET",
         "POST" => "POST",
@@ -71,6 +87,17 @@ async fn observe(
         .unwrap_or("unmatched")
         .to_owned();
     let mut response = next.run(request).await;
+    // The hosting gateway retains idle upstream sockets. Keep SSE streams, not completed requests.
+    if matches!(version, Version::HTTP_10 | Version::HTTP_11)
+        && !response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"))
+    {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, "close".parse().unwrap());
+    }
     let id = diagnostics.record(Signal::Api {
         method,
         route,
@@ -117,7 +144,27 @@ impl IntoResponse for session::Error {
                 "storage unavailable; retry with the same request_id",
             ),
         };
-        (status, Json(json!({"error":error}))).into_response()
+        let code = match error {
+            "invalid model" => "invalid_model",
+            "invalid provider" | "provider selection requires Pi" => "invalid_provider",
+            "invalid reasoning effort" => "invalid_reasoning_effort",
+            "invalid service tier" => "invalid_service_tier",
+            "Cloud folder permission denied" => "attachment_permission_denied",
+            "attachment upload failed" => "invalid_attachment",
+            "image exceeds the 10 MiB limit" | "file exceeds the 25 MiB limit" => {
+                "attachment_too_large"
+            }
+            "request_id already has different content"
+            | "session already exists"
+            | "saved session has no matching receipt" => "request_conflict",
+            "agent setup is incomplete" | "harness is not configured" => "harness_not_configured",
+            "invalid workspace" | "workspace mapping unavailable" => "invalid_workspace",
+            "storage unsafe; new execution is blocked" => "storage_blocked",
+            "service is stopping" => "service_stopping",
+            "model catalog unavailable" => "model_catalog_unavailable",
+            _ => "request_rejected",
+        };
+        (status, Json(json!({"error":error,"code":code}))).into_response()
     }
 }
 
@@ -136,12 +183,8 @@ struct Start {
     model: Option<String>,
     reasoning: Option<String>,
     workspace: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkspaceName {
-    name: String,
+    provider: Option<String>,
+    workspace_name: Option<String>,
 }
 
 async fn workspace(
@@ -152,7 +195,7 @@ async fn workspace(
         Ok(Some(workspace)) => (StatusCode::OK, Json(json!(workspace))),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error":"workspace not prepared"})),
+            Json(json!({"error":"workspace not found"})),
         ),
         Err(_) => (
             StatusCode::CONFLICT,
@@ -161,38 +204,66 @@ async fn workspace(
     }
 }
 
-async fn import_workspace(
-    State(manager): State<Arc<Manager>>,
-    Path(id): Path<String>,
-    Query(query): Query<WorkspaceName>,
-    body: Body,
-) -> impl IntoResponse {
-    if manager.storage.blocks() || manager.is_stopping() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"workspace storage unavailable"})),
-        );
-    }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(15 * 60),
-        manager.workspaces.import(&id, &query.name, body),
-    )
-    .await
-    {
-        Ok(Ok(workspace)) => (StatusCode::CREATED, Json(json!(workspace))),
-        _ => (
-            StatusCode::CONFLICT,
-            Json(
-                json!({"error":"project import failed; check size, symlinks, Git state, and disk space"}),
-            ),
-        ),
-    }
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Prompt {
     request_id: String,
+    #[serde(default)]
     text: String,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    attachments: Option<Value>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Edit {
+    request_id: String,
+    target_request_id: String,
+    expected_revision: u64,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    attachments: Option<Value>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Target {
+    request_id: String,
+    target_request_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Steer {
+    request_id: String,
+    target_request_id: String,
+    text: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rewind {
+    request_id: String,
+    replacement: Option<Prompt>,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    last_turn_id: Option<String>,
+}
+#[derive(Deserialize)]
+struct AttachQuery {
+    request_id: String,
+    name: String,
+    kind: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -244,7 +315,7 @@ async fn ready(State(manager): State<Arc<Manager>>) -> impl IntoResponse {
 }
 
 async fn capabilities(State(manager): State<Arc<Manager>>) -> Json<Value> {
-    Json(manager.capabilities())
+    Json(manager.capabilities().await)
 }
 
 async fn stop(
@@ -275,6 +346,13 @@ async fn start(
     Json(body): Json<Start>,
 ) -> Result<impl IntoResponse> {
     key(&body.request_id)?;
+    if body.provider.as_ref().is_some_and(|p| {
+        p.is_empty()
+            || p.chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '/')
+    }) {
+        return Err(session::Error::Conflict("invalid provider"));
+    }
     if body
         .model
         .as_ref()
@@ -285,7 +363,7 @@ async fn start(
     if body
         .reasoning
         .as_deref()
-        .is_some_and(|r| !matches!(r, "none" | "minimal" | "low" | "medium" | "high" | "xhigh"))
+        .is_some_and(|r| r.is_empty() || r.len() > 64 || !r.bytes().all(|b| b.is_ascii_lowercase()))
     {
         return Err(session::Error::Conflict("invalid reasoning effort"));
     }
@@ -295,7 +373,8 @@ async fn start(
             body.harness,
             body.model,
             body.reasoning,
-            body.workspace,
+            (body.workspace, body.workspace_name),
+            body.provider,
         )
         .await?;
     Ok(accepted(&manager, &id, receipt))
@@ -326,18 +405,249 @@ async fn status(
         json!({"session":manager.session(&id).await?,"saving":manager.saving()}),
     ))
 }
+async fn recovery(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let session = manager.session(&id).await?;
+    Ok(Json(manager.recovery_check(&session)))
+}
+async fn session_workspace(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let session = manager.session(&id).await?;
+    let workspace = session.workspace.ok_or(session::Error::NotFound)?;
+    Ok(Json(manager.workspaces.checkout(&workspace).await?))
+}
+
+fn prompt_input(
+    text: String,
+    content: Option<Value>,
+    attachments: Option<Value>,
+    reasoning: Option<String>,
+    service_tier: Option<String>,
+) -> Result<Value> {
+    let has_attachments = attachments
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    if (text.trim().is_empty() && !has_attachments) || text.len() > 32768 {
+        return Err(session::Error::Conflict(
+            "prompt must contain 1-32768 bytes of text",
+        ));
+    }
+    let mut input = json!({"text": text});
+    if let Some(content) = content {
+        input["content"] = content;
+    }
+    if let Some(attachments) = attachments {
+        input["attachments"] = attachments;
+    }
+    if let Some(reasoning) = reasoning {
+        input["reasoning"] = json!(reasoning);
+    }
+    if let Some(service_tier) = service_tier {
+        input["service_tier"] = json!(service_tier);
+    }
+    Ok(input)
+}
+
 async fn prompt(
     State(manager): State<Arc<Manager>>,
     Path(id): Path<String>,
     Json(body): Json<Prompt>,
 ) -> Result<impl IntoResponse> {
     key(&body.request_id)?;
+    let input = prompt_input(
+        body.text,
+        body.content,
+        body.attachments,
+        body.reasoning.clone(),
+        body.service_tier.clone(),
+    )?;
+    // An accepted retry must not depend on the model catalog still being available.
+    if !manager.known_request(&id, &body.request_id) {
+        if body.reasoning.as_deref().is_some_and(|level| {
+            level.is_empty() || level.len() > 64 || !level.bytes().all(|b| b.is_ascii_lowercase())
+        }) {
+            return Err(session::Error::Conflict("invalid reasoning effort"));
+        }
+        manager
+            .check_prompt_reasoning(&id, body.reasoning.as_deref())
+            .await?;
+        manager.check_prompt_service_tier(&id, body.service_tier.as_deref())?;
+    }
+    let receipt = manager.command(&id, body.request_id, "prompt", input)?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn edit(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Edit>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    key(&body.target_request_id)?;
+    let mut input = prompt_input(
+        body.text,
+        body.content,
+        body.attachments,
+        body.reasoning.clone(),
+        body.service_tier.clone(),
+    )?;
+    input["target_request_id"] = json!(body.target_request_id);
+    input["expected_revision"] = json!(body.expected_revision);
+    if !manager.known_request(&id, &body.request_id) {
+        manager
+            .check_prompt_reasoning(&id, body.reasoning.as_deref())
+            .await?;
+        manager.check_prompt_service_tier(&id, body.service_tier.as_deref())?;
+    }
+    let receipt = manager.command(&id, body.request_id, "edit", input)?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn cancel(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Target>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    key(&body.target_request_id)?;
+    let receipt = manager.command(
+        &id,
+        body.request_id,
+        "cancel",
+        json!({"target_request_id":body.target_request_id}),
+    )?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn steer(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Steer>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    key(&body.target_request_id)?;
     if body.text.trim().is_empty() || body.text.len() > 32768 {
         return Err(session::Error::Conflict(
             "prompt must contain 1-32768 bytes of text",
         ));
     }
-    let receipt = manager.command(&id, body.request_id, "prompt", json!({"text":body.text}))?;
+    let receipt = manager.command(
+        &id,
+        body.request_id,
+        "steer",
+        json!({"target_request_id":body.target_request_id,"text":body.text}),
+    )?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn compact(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<RequestId>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    let receipt = manager.command(&id, body.request_id, "compact", json!({}))?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn rewind(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Rewind>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    let mut input = json!({});
+    if let Some(before) = body.before {
+        input["before"] = json!(before);
+    }
+    if let Some(last_turn_id) = body.last_turn_id {
+        input["last_turn_id"] = json!(last_turn_id);
+    }
+    if let Some(prompt) = body.replacement {
+        key(&prompt.request_id)?;
+        let payload = prompt_input(
+            prompt.text,
+            prompt.content,
+            prompt.attachments,
+            prompt.reasoning.clone(),
+            prompt.service_tier.clone(),
+        )?;
+        if !manager.known_request(&id, &body.request_id) {
+            manager
+                .check_prompt_reasoning(&id, prompt.reasoning.as_deref())
+                .await?;
+            manager.check_prompt_service_tier(&id, prompt.service_tier.as_deref())?;
+        }
+        input["replacement"] = json!({"request_id":prompt.request_id,"input":payload});
+    }
+    let receipt = manager.command(&id, body.request_id, "rewind", input)?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn attach(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Query(query): Query<AttachQuery>,
+    body: Body,
+) -> Result<impl IntoResponse> {
+    key(&query.request_id)?;
+    if let Some(receipt) = manager.receipt(&id, &query.request_id) {
+        if receipt.command != "attach" {
+            return Err(session::Error::Conflict(
+                "request_id already has different content",
+            ));
+        }
+        return Ok(accepted(&manager, &id, receipt));
+    }
+    let session = manager.session(&id).await?;
+    let workspace = session
+        .workspace
+        .ok_or(session::Error::Conflict("invalid workspace"))?;
+    if workspace.id != "legacy" && manager.workspaces.get(&workspace.id)?.is_none() {
+        return Err(session::Error::Conflict("workspace mapping unavailable"));
+    }
+    if !manager.recording_available() {
+        return Err(session::Error::Storage);
+    }
+    if manager.is_stopping() || manager.storage.blocks() {
+        return Err(session::Error::Conflict(
+            "storage unsafe; uploads are blocked",
+        ));
+    }
+    let written = manager
+        .workspaces
+        .attach(
+            &workspace,
+            &query.request_id,
+            &query.name,
+            &query.kind,
+            body,
+            &manager.storage,
+        )
+        .await
+        .map_err(|error| {
+            eprintln!(
+                "attachment upload failed: session={id} request={} kind={:?} errno={:?}",
+                query.request_id,
+                error.kind(),
+                error.raw_os_error()
+            );
+            session::Error::Conflict(match error.kind() {
+                std::io::ErrorKind::WouldBlock => "storage unsafe; uploads are blocked",
+                std::io::ErrorKind::PermissionDenied => "Cloud folder permission denied",
+                std::io::ErrorKind::FileTooLarge if query.kind == "image" => {
+                    "image exceeds the 10 MiB limit"
+                }
+                std::io::ErrorKind::FileTooLarge => "file exceeds the 25 MiB limit",
+                _ => "attachment upload failed",
+            })
+        })?;
+    let receipt = manager.command(&id, query.request_id, "attach", written)?;
     Ok(accepted(&manager, &id, receipt))
 }
 async fn interrupt(

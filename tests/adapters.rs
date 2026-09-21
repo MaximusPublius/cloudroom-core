@@ -52,7 +52,6 @@ impl Fixture {
                 },
             )]
             .into(),
-            max_harnesses: 2,
             storage: None,
         };
         Self { root, config }
