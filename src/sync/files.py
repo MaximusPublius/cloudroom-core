@@ -35,6 +35,10 @@ class Conflict(Exception):
     pass
 
 
+class AttachmentConflict(Exception):
+    pass
+
+
 def excluded(path):
     return any(part in EXCLUDED or part.startswith('.cloudroom-sync-') for part in path.split('/'))
 
@@ -141,6 +145,18 @@ class Tree:
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError('attachment must be a regular file')
+                if info.st_size != size:
+                    raise AttachmentConflict('attachment retry changed content')
+                received = 0
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as existing:
+                    while chunk := stream.read(CHUNK):
+                        received += len(chunk)
+                        if received > limit or received > size:
+                            raise AttachmentConflict('attachment retry changed content')
+                        if existing.read(len(chunk)) != chunk:
+                            raise AttachmentConflict('attachment retry changed content')
+                    if received != size or existing.read(1):
+                        raise AttachmentConflict('attachment retry changed content')
                 return {'size': info.st_size}
             except FileNotFoundError:
                 pass
@@ -458,6 +474,9 @@ def worker():
     elif op == 'attach':
         try:
             result = tree.attach(request['path'], sys.stdin.buffer, request['limit'], request['size'])
+        except AttachmentConflict:
+            print(json.dumps({'ok': False, 'error': 'attachment_conflict'}), flush=True)
+            return
         except Conflict:
             print(json.dumps({'ok': False, 'error': 'attachment_too_large'}), flush=True)
             return
