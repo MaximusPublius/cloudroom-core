@@ -1,0 +1,43 @@
+name: MDE CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.89
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
+
+      - name: Build debug binary
+        run: CARGO_BUILD_JOBS=1 cargo build --locked
+
+      - name: Rust tests
+        run: cargo test --locked --all-targets
+
+      - name: Workspace and recovery tests
+        run: |
+          python3 tests/core_fixture.py
+          python3 tests/workspaces.py
+          python3 tests/sync_e2e.py
+
+      - name: Production build
+        run: cargo build --locked --release
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
