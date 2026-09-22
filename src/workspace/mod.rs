@@ -282,6 +282,7 @@ impl Workspaces {
     pub async fn attach(
         &self,
         workspace: &Workspace,
+        session_id: &str,
         request_id: &str,
         name: &str,
         kind: &str,
@@ -295,6 +296,7 @@ impl Workspaces {
             ));
         }
         self.ensure_directory(workspace).await?;
+        valid_id(session_id)?;
         valid_id(request_id)?;
         if kind != "image" && kind != "file" {
             return Err(io::Error::other("attachment kind must be image or file"));
@@ -309,7 +311,7 @@ impl Workspaces {
         {
             return Err(io::Error::other("invalid attachment name"));
         }
-        let relative = format!(".cloudroom/attachments/{request_id}/{name}");
+        let relative = format!(".cloudroom/attachments/{session_id}/{request_id}/{name}");
         let limit = if kind == "image" {
             10 * 1024 * 1024
         } else {
