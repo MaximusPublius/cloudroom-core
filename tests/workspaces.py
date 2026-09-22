@@ -132,6 +132,16 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(uploaded['size'],len(payload))
             self.assertEqual(dest.stat().st_mode & 0o777,0o600)
             self.assertEqual(upload(kind,'note','note.txt',payload)['receipt']['input'],uploaded)
+            for changed in [
+                upload(kind,'note','different.txt',payload,expected=409),
+                upload(kind,'note','note.txt',payload,media='image',expected=409),
+                upload(kind,'note','note.txt',b'X'+payload[1:],expected=409),
+                upload(kind,'note','note.txt',payload+b'X',expected=409),
+            ]:
+                self.assertEqual(changed['code'],'request_conflict')
+                self.assertEqual(changed['error'],'request_id already has different content')
+            self.assertFalse((scope/'note'/'different.txt').exists())
+            self.assertEqual(dest.read_bytes(),payload)
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
