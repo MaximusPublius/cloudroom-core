@@ -19,9 +19,56 @@ pub(super) fn command(config: &Config, profile: &HarnessConfig) -> Command {
     command
 }
 
-pub(super) async fn start(handle: &Handle) -> io::Result<String> {
+async fn initialize(handle: &Handle) -> io::Result<()> {
     handle.call("initialize",json!({"clientInfo":{"name":"cloudroom","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
-    handle.process.notify("initialized").await?;
+    handle.process.notify("initialized").await
+}
+
+pub(super) async fn models(handle: &Handle) -> io::Result<Vec<super::Model>> {
+    initialize(handle).await?;
+    let mut models = Vec::new();
+    let mut cursor = Value::Null;
+    loop {
+        let page = handle
+            .call("model/list", json!({"includeHidden":true,"cursor":cursor}))
+            .await?;
+        let entries = page["data"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("missing model catalog"))?;
+        for entry in entries {
+            let model = entry["model"]
+                .as_str()
+                .ok_or_else(|| io::Error::other("missing model name"))?;
+            let levels = entry["supportedReasoningEfforts"]
+                .as_array()
+                .ok_or_else(|| io::Error::other("missing reasoning levels"))?;
+            let reasoning_levels = levels
+                .iter()
+                .map(|level| {
+                    level["reasoningEffort"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| io::Error::other("invalid reasoning level"))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            models.push(super::Model {
+                model: model.into(),
+                reasoning_levels,
+            });
+        }
+        let next = page["nextCursor"].clone();
+        if next.is_null() {
+            return Ok(models);
+        }
+        if !next.is_string() || next == cursor {
+            return Err(io::Error::other("invalid model cursor"));
+        }
+        cursor = next;
+    }
+}
+
+pub(super) async fn start(handle: &Handle) -> io::Result<String> {
+    initialize(handle).await?;
     let mut params = json!({"cwd":handle.repository,"model":handle.profile.model,"approvalPolicy":"never","sandbox":"danger-full-access","ephemeral":false});
     if let Some(reasoning) = &handle.reasoning {
         params["config"] = json!({"model_reasoning_effort":reasoning});
@@ -46,9 +93,79 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     }
     Ok(id.into())
 }
-pub(super) async fn send(handle: &Handle, request: &str, text: &str) -> io::Result<()> {
-    let mut params = json!({"threadId":handle.native()?,"clientUserMessageId":request,"input":[{"type":"text","text":text,"text_elements":[]}]});
-    if let Some(reasoning) = &handle.reasoning {
+fn prompt_items(input: &Value) -> Vec<Value> {
+    let mut items = Vec::new();
+    if let Some(content) = input["content"].as_array() {
+        for part in content {
+            match part["type"].as_str() {
+                Some("text") => items.push(json!({
+                    "type":"text",
+                    "text":part["text"].as_str().unwrap_or(""),
+                    "text_elements":[]
+                })),
+                Some("image") | Some("localImage") => {
+                    if let Some(path) = part["path"].as_str().or_else(|| part["url"].as_str()) {
+                        items.push(json!({"type":"localImage","path":path}));
+                    }
+                }
+                Some("localFile") | Some("file") => {
+                    if let Some(path) = part["path"].as_str() {
+                        items.push(json!({
+                            "type":"text",
+                            "text":format!("[Attached file: {path}]"),
+                            "text_elements":[]
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if items.is_empty() {
+        items.push(json!({
+            "type":"text",
+            "text":input["text"].as_str().unwrap_or(""),
+            "text_elements":[]
+        }));
+    }
+    if let Some(attachments) = input["attachments"].as_array() {
+        for attachment in attachments {
+            let Some(path) = attachment["path"].as_str() else {
+                continue;
+            };
+            if attachment["kind"] == "image" {
+                items.push(json!({"type":"localImage","path":path}));
+            } else {
+                items.push(json!({
+                    "type":"text",
+                    "text":format!("[Attached file: {path}]"),
+                    "text_elements":[]
+                }));
+            }
+        }
+    }
+    items
+}
+
+fn service_tier_for_turn(input: &Value) -> &'static str {
+    match input["service_tier"].as_str() {
+        Some("fast") => "fast",
+        _ => "default",
+    }
+}
+
+pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<()> {
+    let mut params = json!({
+        "threadId":handle.native()?,
+        "clientUserMessageId":request,
+        "input":prompt_items(input),
+        "serviceTierForTurn":service_tier_for_turn(input)
+    });
+    if let Some(reasoning) = handle
+        .reasoning
+        .as_deref()
+        .or_else(|| input["reasoning"].as_str())
+    {
         params["effort"] = json!(reasoning);
     }
     let result = handle
@@ -60,6 +177,60 @@ pub(super) async fn send(handle: &Handle, request: &str, text: &str) -> io::Resu
         .and_then(Value::as_str)
         .map(|_| ())
         .ok_or_else(|| io::Error::other("missing native turn identity; outcome uncertain"))
+}
+
+pub(super) async fn steer(handle: &Handle, state: Progress, text: &str) -> io::Result<()> {
+    let turn = state
+        .native_turn
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "turn has not started"))?;
+    let native = handle.native()?;
+    handle
+        .process
+        .control(
+            "turn/steer",
+            json!({
+                "threadId":native,
+                "expectedTurnId":turn,
+                "input":[{"type":"text","text":text,"text_elements":[]}]
+            }),
+            state.request.as_deref().unwrap(),
+        )
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn compact(handle: &Handle) -> io::Result<()> {
+    handle
+        .call("thread/compact/start", json!({"threadId":handle.native()?}))
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn rewind(handle: &Handle, input: &Value) -> io::Result<Value> {
+    let mut params = json!({"threadId":handle.native()?});
+    if let Some(id) = input["last_turn_id"]
+        .as_str()
+        .or_else(|| input["lastTurnId"].as_str())
+    {
+        params["lastTurnId"] = json!(id);
+    }
+    if let Some(id) = input["before"]
+        .as_str()
+        .or_else(|| input["before_turn_id"].as_str())
+        .or_else(|| input["beforeTurnId"].as_str())
+    {
+        params["beforeTurnId"] = json!(id);
+    }
+    let result = handle.call("thread/fork", params).await?;
+    let id = result
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("missing forked thread identity"))?;
+    Ok(json!({
+        "id":id,
+        "path":result.pointer("/thread/path"),
+        "cursor":{"offset":0}
+    }))
 }
 pub(super) async fn notice(handle: &Handle, text: &str) -> io::Result<()> {
     handle.call("thread/inject_items", json!({"threadId":handle.native()?,"items":[{"type":"message","role":"developer","content":[{"type":"input_text","text":text}]}]})).await?;
@@ -124,19 +295,29 @@ pub(super) async fn interrupt(handle: &Handle, state: Progress) -> io::Result<()
 
 pub(super) struct Protocol {
     home: PathBuf,
+    file_identity: super::files::Identity,
     tail: Tail,
     root: Option<String>,
     prompt_id: Option<u64>,
+    forking: Option<u64>,
+    compaction: Option<(u64, Option<String>)>,
 }
 impl Protocol {
-    pub fn new(profile: &HarnessConfig, resume: Option<&Resume>) -> Self {
+    pub fn new(
+        profile: &HarnessConfig,
+        resume: Option<&Resume>,
+        file_identity: super::files::Identity,
+    ) -> Self {
         Self {
             home: profile.home.clone(),
+            file_identity,
             tail: resume
                 .map(|s| Tail::new(s.path.clone(), s.cursor["offset"].as_u64().unwrap_or(0)))
                 .unwrap_or_default(),
             root: resume.map(|s| s.id.clone()),
             prompt_id: None,
+            forking: None,
+            compaction: None,
         }
     }
 }
@@ -144,6 +325,12 @@ impl Adapter for Protocol {
     fn encode(&mut self, id: u64, method: &str, params: Value, request: Option<&str>) -> Value {
         if request.is_some() {
             self.prompt_id = Some(id);
+        }
+        if method == "thread/fork" {
+            self.forking = Some(id);
+        }
+        if method == "thread/compact/start" {
+            self.compaction = Some((id, None));
         }
         if method == "initialized" {
             json!({"method":method})
@@ -184,12 +371,73 @@ impl Adapter for Protocol {
             "item/completed" => "item_completed",
             _ => "native_event",
         };
+        let usage = params
+            .pointer("/turn/usage")
+            .or_else(|| params.pointer("/turn/tokenUsage"))
+            .or_else(|| params.get("usage"))
+            .cloned()
+            .filter(|value| !value.is_null());
         let mut events = vec![Event::Record {
             kind: if root { kind } else { "native_event" },
-            data: json!({"method":method,"item_id":params["itemId"].as_str().or_else(||params.pointer("/item/id").and_then(Value::as_str)),"request_id":params["item"]["clientId"],"delta":params["delta"],"text":params["item"]["text"],"tool_name":params["item"]["command"],"output":params["item"]["aggregatedOutput"],"status":params["item"]["status"]}),
+            data: json!({"method":method,"item_id":params["itemId"].as_str().or_else(||params.pointer("/item/id").and_then(Value::as_str)),"request_id":params["item"]["clientId"],"delta":params["delta"],"text":params["item"]["text"],"tool_name":params["item"]["command"],"output":params["item"]["aggregatedOutput"],"status":params["item"]["status"],"usage":usage}),
             native: Some(raw),
         }];
-        if let Some(identity) = identity
+        if let Some((id, turn)) = &mut self.compaction {
+            if value["id"].as_u64() == Some(*id) && value.get("error").is_some() {
+                self.compaction = None;
+            } else if thread == self.root.as_deref() && thread.is_some() {
+                let native_turn = params.pointer("/turn/id").and_then(Value::as_str);
+                if method == "turn/started" && turn.is_none() {
+                    *turn = native_turn.map(str::to_owned);
+                }
+                let status = if method == "turn/completed"
+                    && turn.is_some()
+                    && native_turn == turn.as_deref()
+                {
+                    Some(params["turn"]["status"].as_str().unwrap_or("unknown"))
+                } else if method == "thread/compacted" && turn.is_none() {
+                    Some("completed")
+                } else {
+                    None
+                };
+                if let Some(status) = status {
+                    events.push(Event::Compacted {
+                        status: status.to_owned(),
+                    });
+                    self.compaction = None;
+                }
+            }
+        }
+        if self.forking.is_some() && value["id"].as_u64() == self.forking {
+            self.forking = None;
+            if value.get("error").is_none() {
+                let identity = identity.ok_or_else(|| io::Error::other("missing fork identity"))?;
+                let id = identity["id"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("missing fork ID"))?;
+                let path = identity["path"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("missing fork path"))?;
+                loop {
+                    events.extend(self.tail.capture(&self.home, self.file_identity)?);
+                    if !self.tail.more {
+                        break;
+                    }
+                }
+                self.root = Some(id.to_owned());
+                self.tail = Tail::new(path.into(), 0);
+                *state = Progress {
+                    native: Some(id.to_owned()),
+                    finished: true,
+                    ..Progress::default()
+                };
+                events.push(Event::Record {
+                    kind: "rewind_ready",
+                    data: json!({"id":id,"path":path,"cursor":{"offset":0}}),
+                    native: None,
+                });
+            }
+        } else if let Some(identity) = identity
             && identity["id"].as_str() == self.root.as_deref()
             && let Some(id) = &self.root
         {
@@ -257,7 +505,7 @@ impl Adapter for Protocol {
         }
     }
     fn capture(&mut self) -> io::Result<Vec<Event>> {
-        self.tail.capture(&self.home)
+        self.tail.capture(&self.home, self.file_identity)
     }
     fn capture_pending(&self) -> bool {
         self.tail.more
@@ -273,6 +521,7 @@ pub(super) fn for_client(data: &mut Value, native: Option<&str>) -> io::Result<(
 #[derive(Default)]
 struct Tail {
     path: Option<PathBuf>,
+    file: Option<File>,
     read_offset: u64,
     committed_offset: u64,
     partial: Vec<u8>,
@@ -282,28 +531,28 @@ impl Tail {
     fn new(path: PathBuf, offset: u64) -> Self {
         Self {
             path: Some(path),
+            file: None,
             read_offset: offset,
             committed_offset: offset,
             partial: Vec::new(),
             more: false,
         }
     }
-    fn capture(&mut self, home: &Path) -> io::Result<Vec<Event>> {
+    fn capture(&mut self, home: &Path, identity: super::files::Identity) -> io::Result<Vec<Event>> {
         self.more = false;
         let Some(path) = &self.path else {
             return Ok(vec![]);
         };
-        let path = match path.canonicalize() {
-            Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e),
-        };
-        if !path.starts_with(home.canonicalize()?.join("sessions")) {
-            return Err(io::Error::other(
-                "native history is outside the account sessions directory",
-            ));
+        if self.file.is_none() {
+            self.file = Some(
+                match super::files::open(&home.join("sessions"), path, identity) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+                    Err(error) => return Err(error),
+                },
+            );
         }
-        let mut file = File::open(path)?;
+        let file = self.file.as_mut().unwrap();
         if file.metadata()?.len() < self.read_offset {
             return Err(io::Error::other("native history was truncated"));
         }
@@ -312,28 +561,52 @@ impl Tail {
         // A bounded batch lets shutdown and RPC replies make progress during large rollouts.
         let mut bytes = vec![0; 65536];
         let n = file.read(&mut bytes)?;
-        self.more = n > 0;
-        self.read_offset += n as u64;
+        let previous_length = self.partial.len();
         self.partial.extend_from_slice(&bytes[..n]);
-        while let Some(end) = self.partial.iter().position(|b| *b == b'\n') {
-            let raw = String::from_utf8(self.partial.drain(..=end).collect())
-                .map_err(io::Error::other)?;
-            events.push(Event::Record {
-                kind: "native_record",
-                data: json!({"offset":self.committed_offset}),
-                native: Some(raw.clone()),
-            });
-            self.committed_offset += raw.len() as u64;
+        let parsed = (|| {
+            let mut consumed = 0;
+            let mut offset = self.committed_offset;
+            while let Some(end) = self.partial[consumed..].iter().position(|b| *b == b'\n') {
+                if end + 1 > MAX_LINE {
+                    return Err(io::Error::other("native history record too large"));
+                }
+                let line = &self.partial[consumed..consumed + end + 1];
+                let raw = std::str::from_utf8(line)
+                    .map_err(io::Error::other)?
+                    .to_owned();
+                events.push(Event::Record {
+                    kind: "native_record",
+                    data: json!({"offset":offset}),
+                    native: Some(raw),
+                });
+                consumed += end + 1;
+                offset += line.len() as u64;
+            }
+            if self.partial.len() - consumed > MAX_LINE {
+                return Err(io::Error::other("native history record too large"));
+            }
+            Ok((consumed, offset))
+        })();
+        match parsed {
+            Ok((consumed, offset)) => {
+                self.partial.drain(..consumed);
+                self.read_offset += n as u64;
+                self.committed_offset = offset;
+                self.more = n > 0;
+                Ok(events)
+            }
+            Err(error) => {
+                // Exit capture retries this same Tail. Never publish a cursor for a lost batch.
+                self.partial.truncate(previous_length);
+                Err(error)
+            }
         }
-        if self.partial.len() > MAX_LINE {
-            return Err(io::Error::other("native history record too large"));
-        }
-        Ok(events)
     }
 }
 pub(super) fn recover(
     profile: &HarnessConfig,
     saved: &Resume,
+    identity: super::files::Identity,
     mut emit: impl FnMut(Event) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut tail = Tail::new(
@@ -342,7 +615,7 @@ pub(super) fn recover(
     );
     loop {
         let before = tail.read_offset;
-        for event in tail.capture(&profile.home)? {
+        for event in tail.capture(&profile.home, identity)? {
             emit(event)?;
         }
         if before == tail.read_offset {

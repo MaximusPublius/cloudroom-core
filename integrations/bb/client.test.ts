@@ -6,7 +6,7 @@ import {
 } from "node:http";
 import { once } from "node:events";
 import { test } from "node:test";
-import { CloudroomClient, CloudroomError } from "./client.ts";
+import { CloudroomClient, CloudroomConnectionError, CloudroomError } from "./client.ts";
 
 async function fixture(
   handler: (
@@ -43,6 +43,64 @@ function sendJson(res: ServerResponse, value: unknown, status = 200) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(value));
 }
+
+test("reports allowlisted rejections, keeps temporary conflicts retryable, and never exposes response bodies", async (t) => {
+  let body: unknown;
+  const service = await fixture((_req, res) => sendJson(res, body, 409));
+  t.after(() => service.close());
+  for (const [value, code, retryable] of [
+    [{ code: "invalid_reasoning_effort", error: "SECRET-CANARY" }, "invalid_reasoning_effort", false],
+    [{ error: "invalid reasoning effort" }, "invalid_reasoning_effort", false],
+    [{ code: "invalid_model" }, "invalid_model", false],
+    [{ code: "invalid_provider" }, "invalid_provider", false],
+    [{ code: "request_conflict" }, "request_conflict", false],
+    [{ code: "storage_blocked" }, "storage_blocked", true],
+    [{ error: "storage unsafe; new execution is blocked" }, "storage_blocked", true],
+    [{ code: "service_stopping" }, "service_stopping", true],
+    [{ code: "model_catalog_unavailable" }, "model_catalog_unavailable", true],
+    [{ code: "SECRET-CANARY", error: "SECRET-CANARY" }, null, true],
+    [{ code: "constructor", error: "SECRET-CANARY" }, null, true],
+    [{ code: "invalid_model", padding: "SECRET-CANARY".repeat(1000) }, null, true],
+  ] as const) {
+    body = value;
+    await assert.rejects(service.client.start("rejected", "codex", { reasoning: "max" }), (error: unknown) => {
+      assert(error instanceof CloudroomError);
+      assert.equal(error.status, 409);
+      assert.equal(error.code, code);
+      assert.equal(error.retryable, retryable);
+      assert(!error.message.includes("SECRET-CANARY"));
+      return true;
+    });
+  }
+  assert.equal(service.requests.length, 12);
+});
+
+test("attachment failures distinguish permissions and size without disclosing server details or retrying", async (t) => {
+  let code = "";
+  const service = await fixture((req, res) => {
+    assert(req.url?.startsWith("/v1/sessions/s1/attachments?"));
+    sendJson(res, { code, error: "EACCES /private/SECRET-CANARY test-token" }, 409);
+  });
+  t.after(() => service.close());
+  for (const [rejection, message] of [
+    ["attachment_permission_denied", "Cloud folder permission denied"],
+    ["attachment_too_large", "The attachment exceeds the Cloud size limit (10 MiB per image, 25 MiB per file)."],
+    ["invalid_attachment", "The attachment could not be stored on Cloud."],
+  ]) {
+    code = rejection;
+    const bytes = new TextEncoder().encode("{}");
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } });
+    await assert.rejects(service.client.attach("s1", "upload", "image.png", "image", { body, length: bytes.length }), (error: unknown) => {
+      assert(error instanceof CloudroomError);
+      assert.equal(error.status, 409);
+      assert.equal(error.code, rejection);
+      assert.equal(error.message, message);
+      assert.equal(error.retryable, false);
+      return true;
+    });
+  }
+  assert.equal(service.requests.length, 3);
+});
 
 function event(sequence: number, data: unknown = {}, session_id = "s1") {
   return { sequence, session_id, kind: "native", data };
@@ -170,7 +228,9 @@ test("never forwards either credential to a redirect destination", async (t) => 
 });
 
 test("routes commands, preserves caller request IDs, and never treats acceptance as completion", async (t) => {
+  const prompts: unknown[] = [];
   const service = await fixture((req, res, body) => {
+    if (req.url?.endsWith("/prompts")) prompts.push(body);
     const command =
       req.url === "/v1/sessions"
         ? "start"
@@ -193,20 +253,53 @@ test("routes commands, preserves caller request IDs, and never treats acceptance
     );
   });
   t.after(() => service.close());
-  const accepted = await service.client.start("create_1");
+  const accepted = await service.client.start("create_1", "pi", { provider: "openai-codex", model: "gpt-6-astra" });
+  assert.deepEqual(accepted.receipt.input, { request_id: "create_1", harness: "pi", provider: "openai-codex", model: "gpt-6-astra" });
   assert.equal(accepted.receipt.state, "accepted");
   assert.equal(accepted.saving, "pending");
   await service.client.prompt("s1", "message_1", "hello");
   await service.client.prompt("s1", "message_1", "hello");
+  await service.client.prompt("s1", "level", "next", "high");
   await service.client.interrupt("s1", "stop_1", "message_1");
   await service.client.close("s1", "close_1");
+  assert.deepEqual(prompts[0], { request_id: "message_1", text: "hello" });
+  assert.deepEqual(prompts.at(-1), { request_id: "level", text: "next", reasoning: "high" });
   assert.deepEqual(service.requests, [
     "POST /v1/sessions",
+    "POST /v1/sessions/s1/prompts",
     "POST /v1/sessions/s1/prompts",
     "POST /v1/sessions/s1/prompts",
     "POST /v1/sessions/s1/interrupt",
     "POST /v1/sessions/s1/close",
   ]);
+});
+
+test("posts edit, cancel, steer, compact, and rewind commands", async (t) => {
+  const bodies: object[] = [];
+  const service = await fixture((req, res, body) => {
+    bodies.push({ url: req.url, ...body });
+    sendJson(res, {
+      session_id: "s1",
+      receipt: { request_id: body.request_id, command: String(req.url).split("/").pop(), input: body, state: "accepted" },
+      saving: {},
+    }, 202);
+  });
+  t.after(() => service.close());
+  await service.client.edit("s1", "e1", "p1", 1, "newer", { service_tier: "fast" });
+  await service.client.cancel("s1", "c1", "p1");
+  await service.client.steer("s1", "s1-steer", "p1", "turn left");
+  await service.client.compact("s1", "k1");
+  await service.client.rewind("s1", "r1", "turn-1");
+  assert.deepEqual(service.requests, [
+    "POST /v1/sessions/s1/edit",
+    "POST /v1/sessions/s1/cancel",
+    "POST /v1/sessions/s1/steer",
+    "POST /v1/sessions/s1/compact",
+    "POST /v1/sessions/s1/rewind",
+  ]);
+  assert.equal((bodies[0] as { expected_revision?: number }).expected_revision, 1);
+  assert.equal((bodies[2] as { text?: string }).text, "turn left");
+  assert.equal((bodies[4] as { before?: string }).before, "turn-1");
 });
 
 test("rejects invalid requests before network access", async (t) => {
@@ -387,6 +480,49 @@ test("preserves nested JSON payloads and rejects nonfinite nested numbers", asyn
     service.client.events("s1"),
     /Invalid Cloudroom response/,
   );
+});
+
+test("reports idle connections, distinguishes transport from replay failures, and keeps diagnostics safe", async (t) => {
+  let mode = "idle";
+  let stream: ServerResponse | undefined;
+  const service = await fixture((_req, res) => {
+    if (mode === "unauthorized") return sendJson(res, { error: "SECRET-CANARY" }, 401);
+    if (mode === "invalid-type") return sendJson(res, {});
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (mode === "invalid-record") return void res.end("id: 1\nevent: record\ndata: invalid-json\n\n");
+    res.write(": keep-alive\n\n");
+    stream = res;
+  });
+  t.after(() => service.close());
+  let connections = 0;
+  const connected = Promise.withResolvers<void>();
+  const consume = async () => {
+    for await (const _ of service.client.stream("s1", {
+      signal: AbortSignal.timeout(2000),
+      onConnected: () => { connections++; connected.resolve(); },
+    })) assert.fail("idle stream must not invent records");
+  };
+  const disconnected = assert.rejects(consume(), (error: unknown) => {
+    assert(error instanceof CloudroomConnectionError);
+    assert.equal(error.networkCode, "UND_ERR_SOCKET");
+    assert.equal(error.message, "Cloudroom event stream disconnected");
+    return true;
+  });
+  await connected.promise;
+  assert.equal(connections, 1);
+  stream!.destroy();
+  await disconnected;
+  for (mode of ["unauthorized", "invalid-type"]) {
+    await assert.rejects(consume(), CloudroomError);
+    assert.equal(connections, 1);
+  }
+  mode = "invalid-record";
+  await assert.rejects(consume(), (error: unknown) => error instanceof CloudroomError && !(error instanceof CloudroomConnectionError));
+  assert.equal(connections, 2);
+  const diagnostic = new CloudroomConnectionError("Disconnected", new Error("SECRET-CANARY", { cause: { code: "SECRET-CANARY" } }));
+  assert.equal(diagnostic.networkCode, null);
+  assert(!JSON.stringify(diagnostic).includes("SECRET-CANARY"));
+  assert(!diagnostic.stack?.includes("SECRET-CANARY"));
 });
 
 test("streams fragmented UTF-8 and CRLF frames, ignores heartbeat/duplicates, and detaches without closing the session", async (t) => {

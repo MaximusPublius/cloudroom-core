@@ -1,7 +1,12 @@
-use super::{Adapter, Event, Progress, SHUTDOWN_GRACE, linux};
+use super::{Adapter, Event, ExitDetails, Progress, SHUTDOWN_GRACE, linux};
 use crate::config::Config;
 use serde_json::Value;
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    os::unix::process::ExitStatusExt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -9,6 +14,59 @@ use tokio::{
 };
 
 pub(super) const MAX_LINE: usize = 16 * 1024 * 1024;
+const STDERR_BYTES: usize = 16 * 1024;
+
+struct StderrCapture {
+    task: tokio::task::JoinHandle<()>,
+    tail: Arc<Mutex<ExitDetails>>,
+}
+impl StderrCapture {
+    fn start(mut stderr: tokio::process::ChildStderr) -> Self {
+        let tail = Arc::new(Mutex::new(ExitDetails {
+            stderr: Vec::with_capacity(STDERR_BYTES),
+            ..ExitDetails::default()
+        }));
+        let captured = tail.clone();
+        let task = tokio::spawn(async move {
+            let mut bytes = [0; 8192];
+            loop {
+                match stderr.read(&mut bytes).await {
+                    Ok(0) => {
+                        captured.lock().unwrap().stderr_complete = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        let mut tail = captured.lock().unwrap();
+                        tail.stderr_bytes = tail.stderr_bytes.saturating_add(n as u64);
+                        let discard = (tail.stderr.len() + n).saturating_sub(STDERR_BYTES);
+                        tail.stderr.drain(..discard);
+                        tail.stderr.extend_from_slice(&bytes[..n]);
+                    }
+                    Err(_) => break, // Preserve partial bytes; never log the untrusted error text.
+                }
+            }
+        });
+        Self { task, tail }
+    }
+
+    async fn finish(mut self) -> ExitDetails {
+        // A descendant can retain the pipe after the direct child exits.
+        if tokio::time::timeout(Duration::from_millis(250), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+        std::mem::take(&mut *self.tail.lock().unwrap())
+    }
+}
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 struct Call {
     method: String,
     params: Value,
@@ -61,13 +119,12 @@ impl Process {
                 .take()
                 .ok_or_else(|| io::Error::other("missing stdout"))?,
         );
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("missing stderr"))?;
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
-        });
+        let stderr = StderrCapture::start(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| io::Error::other("missing stderr"))?,
+        );
         let (calls, mut receiver) = mpsc::channel::<Call>(16);
         let (events, incoming) = mpsc::channel(128);
         let (progress, observed) = watch::channel(Progress::default());
@@ -104,7 +161,7 @@ impl Process {
                     _ = paused.changed() => {},
                     Some(call) = receiver.recv(), if deadline.is_none() && !*paused.borrow() => {
                         if call.target.as_ref().is_some_and(|target| state.request.as_ref() != Some(target) || state.finished) {
-                            let _ = call.reply.map(|r|r.send(Err(io::Error::new(io::ErrorKind::InvalidInput,"interrupt target is no longer active"))));
+                            let _ = call.reply.map(|r|r.send(Err(io::Error::new(io::ErrorKind::InvalidInput,"target is no longer active"))));
                             continue;
                         }
                         if let Some(request) = &call.request {
@@ -146,15 +203,19 @@ impl Process {
             };
             drop(input);
             let exited = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
-            let graceful = matches!(exited, Ok(Ok(status)) if status.success());
-            if !matches!(exited, Ok(Ok(_))) {
+            let mut status = exited.ok().and_then(Result::ok);
+            let graceful = status.is_some_and(|status| status.success());
+            if status.is_none() {
                 let _ = child.kill().await;
-                let _ = child.wait().await;
+                status = child.wait().await.ok();
             }
             let cleaned_up = match owned {
                 Some(ref g) => g.stop().await.is_ok(),
                 None => true,
             };
+            let mut details = stderr.finish().await;
+            details.code = status.and_then(|status| status.code());
+            details.signal = status.and_then(|status| status.signal());
             let mut reason = reason;
             loop {
                 match adapter.capture() {
@@ -185,6 +246,7 @@ impl Process {
                     reason,
                     expected,
                     cleaned_up,
+                    details,
                 })
                 .await;
         });
@@ -209,10 +271,22 @@ impl Process {
         params: Value,
         request: Option<&str>,
     ) -> io::Result<Value> {
-        self.call_inner(method, params, request, None).await
+        self.call_inner(method, params, request, None, Duration::from_secs(30))
+            .await
+    }
+    pub async fn call_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        request: Option<&str>,
+        timeout: Duration,
+    ) -> io::Result<Value> {
+        self.call_inner(method, params, request, None, timeout)
+            .await
     }
     pub async fn control(&self, method: &str, params: Value, target: &str) -> io::Result<Value> {
-        self.call_inner(method, params, None, Some(target)).await
+        self.call_inner(method, params, None, Some(target), Duration::from_secs(30))
+            .await
     }
     async fn call_inner(
         &self,
@@ -220,6 +294,7 @@ impl Process {
         params: Value,
         request: Option<&str>,
         target: Option<&str>,
+        timeout: Duration,
     ) -> io::Result<Value> {
         if *self.stop.borrow() {
             return Err(io::Error::other("harness is closing"));
@@ -239,11 +314,16 @@ impl Process {
         .map_err(|_| io::Error::other("harness command queue timed out"))?
         .map_err(|_| io::Error::other("harness unavailable"))?;
         if let Some(group) = &self.group {
-            linux::reply(receive, group.paused()).await?
+            linux::reply(receive, group.paused(), timeout).await?
         } else {
-            tokio::time::timeout(Duration::from_secs(30), receive)
+            tokio::time::timeout(timeout, receive)
                 .await
-                .map_err(|_| io::Error::other("harness response timed out; outcome uncertain"))?
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "harness response timed out; outcome uncertain",
+                    )
+                })?
                 .map_err(|_| io::Error::other("harness response lost; outcome uncertain"))?
         }
     }

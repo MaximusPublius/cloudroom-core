@@ -10,6 +10,38 @@ import tempfile
 from urllib.parse import urlsplit
 
 CODE_ROOT = Path('/code')
+CACHE_ROOT = Path('/var/cache/cloudroom-agent')
+
+
+def accounts():
+    if os.geteuid() != 0:
+        raise ValueError('Run as the provisioning administrator')
+    service, agent = (pwd.getpwnam(name) for name in ('cloudroom', 'cloudroom-agent'))
+    if (0 in (service.pw_uid, service.pw_gid, agent.pw_uid, agent.pw_gid)
+            or service.pw_uid == agent.pw_uid or service.pw_gid == agent.pw_gid):
+        raise ValueError('Separate unprivileged service and agent accounts are required')
+    if os.getgrouplist('cloudroom-agent', agent.pw_gid) != [agent.pw_gid]:
+        raise ValueError('Agent must have only its own primary group')
+    return service, agent
+
+
+def setup_storage(directory, service, agent):
+    policy = directory / 'storage.json'
+    if not directory.is_absolute() or directory.is_symlink() or policy.is_symlink() or CACHE_ROOT.is_symlink():
+        raise ValueError('Storage configuration paths must be absolute and not symlinks')
+    directory.mkdir(mode=0o750, exist_ok=True)
+    os.chown(directory, 0, service.pw_gid)
+    directory.chmod(0o750)
+    CACHE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chown(CACHE_ROOT, agent.pw_uid, agent.pw_gid)
+    CACHE_ROOT.chmod(0o700)
+    if not policy.exists():
+        with os.fdopen(os.open(policy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w') as file:
+            json.dump({'agent_uid': agent.pw_uid, 'agent_gid': agent.pw_gid,
+                       'cache_dir': str(CACHE_ROOT), 'cgroup_root': '/sys/fs/cgroup/system.slice/cloudroom.service/agents'}, file)
+            file.flush(); os.fsync(file.fileno())
+            os.fchown(file.fileno(), service.pw_uid, service.pw_gid)
+
 
 def configure(data, directory=Path('/etc/cloudroom')):
     if os.geteuid() != 0:
@@ -30,10 +62,7 @@ def configure(data, directory=Path('/etc/cloudroom')):
     _ = connection.port  # Reject malformed ports before writing protected configuration.
     if (Path('/usr/local/lib/cloudroom/version').read_text().strip() != release):
         raise ValueError('The requested release does not match this template')
-    service = pwd.getpwnam('cloudroom')
-    agent = pwd.getpwnam('cloudroom-agent')
-    if agent.pw_uid == 0 or service.pw_uid == 0 or agent.pw_uid == service.pw_uid:
-        raise ValueError('Separate service and agent accounts are required')
+    service, agent = accounts()
     path = directory / 'core.env'
     if not directory.is_absolute() or directory.is_symlink() or path.is_symlink():
         raise ValueError('Configuration paths must not be symlinks')
@@ -54,6 +83,8 @@ def configure(data, directory=Path('/etc/cloudroom')):
             'CLOUDROOM_STATE_DIR': str(Path(service.pw_dir) / 'history'),
             'CLOUDROOM_STORAGE_POLICY': str(directory / 'storage.json'),
         }
+        if os.environ.get('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP') == '1':
+            settings['CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP'] = '1'
         if any(any(ord(c) < 32 or ord(c) == 127 for c in v) for v in settings.values()):
             raise ValueError('Invalid configuration value')
         fd, temp = tempfile.mkstemp(dir=directory, prefix='.core-')
@@ -71,21 +102,23 @@ def configure(data, directory=Path('/etc/cloudroom')):
     workspaces.mkdir(mode=0o700, exist_ok=True)
     os.chown(workspaces, agent.pw_uid, agent.pw_gid)
     workspaces.chmod(0o700)
-    policy = directory / 'storage.json'
-    if not policy.exists():
-        subprocess.run(['bash', '/usr/local/lib/cloudroom/storage.sh', 'cloudroom-agent', 'cloudroom', str(policy)], check=True)
+    setup_storage(directory, service, agent)
     subprocess.run(['systemctl', 'enable', '--now', 'cloudroom.service'], check=True)
     print('Core installed. Agent setup is still required.')
 
 
 if __name__ == '__main__':
     try:
-        raw = sys.stdin.buffer.read(16385)
-        if len(raw) > 16384:
-            raise ValueError('Setup input is too large')
-        if len(sys.argv) > 2:
-            raise ValueError('Use configure.py [protected-configuration-directory]')
-        configure(json.loads(raw), Path(sys.argv[1]) if len(sys.argv) == 2 else Path('/etc/cloudroom'))
+        if len(sys.argv) == 3 and sys.argv[1] == '--storage-only':
+            setup_storage(Path(sys.argv[2]), *accounts())
+            print('Disk policy configured. No quotas or filesystem settings changed.')
+        else:
+            raw = sys.stdin.buffer.read(16385)
+            if len(raw) > 16384:
+                raise ValueError('Setup input is too large')
+            if len(sys.argv) > 2:
+                raise ValueError('Use configure.py [protected-configuration-directory]')
+            configure(json.loads(raw), Path(sys.argv[1]) if len(sys.argv) == 2 else Path('/etc/cloudroom'))
     except (ValueError, OSError, KeyError, subprocess.SubprocessError):
         # Native exceptions may include the database password; keep provider logs generic.
         print('Core configuration failed. Inspect protected configuration and service status.', file=sys.stderr)

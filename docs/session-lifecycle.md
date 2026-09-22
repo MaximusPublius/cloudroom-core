@@ -1,5 +1,9 @@
 # Session lifecycle and replay
 
+## Inspect a session's checkout
+
+Authenticated `GET /v1/sessions/{id}/workspace` reads the session's cloud directory and returns `{path, branch, head}`. Detached HEAD has a null branch; an unborn branch has a null head. Both are null when Git metadata is unavailable. Reads never change the checkout or start a harness. Missing session/workspace data or an unreadable directory returns an error.
+
 ## Close a session
 
 `POST /v1/sessions/{id}/close` requires the same bearer authentication as other commands:
@@ -22,13 +26,25 @@ Service shutdown signals all harnesses before waiting. Session recording and bes
 - Acceptance and queue membership come from one fsynced receipt. Old separate `enqueue` records remain readable without duplicate delivery, including a crash between the old two writes.
 - Interrupt stops the current turn only; queued prompts continue afterwards. Close prevents further delivery and marks unrun queued receipts `failed`.
 - Normal service shutdown leaves eligible sessions `suspended`. Both normal and abrupt restarts resume the same saved Codex conversation. Deliberately closed sessions stay closed; historical `process_lost`/`failed` sessions are not automatically reopened.
-- An unexpected harness exit gets one recovery attempt after confirmed cleanup. A new user request or completed/interrupted turn permits a later attempt. A failed or interrupted resume becomes `process_lost`, and unrun queued receipts become `failed`; there is no restart loop or fresh-conversation fallback.
+- If a pending start's harness is no longer configured, that start and its unrun queued prompts fail with a recorded reason. Other sessions and history remain available. Restore configuration and use a new start request ID; retrying the failed ID does not launch or replay work.
+- An unexpected harness exit gets one recovery attempt after confirmed cleanup. A new user request or completed/interrupted turn permits a later attempt. Failed native resumes become `process_lost`; there is no restart loop or fresh-conversation fallback. Timeouts during native resume preserve unrun queued receipts, including across service restarts; other failures settle them as `failed`.
+- New and restored harnesses share a startup queue. At most half the available logical CPUs (minimum one) initialize concurrently; this does not cap running sessions. Startup RPCs allow 120 seconds instead of the ordinary 30-second deadline, and retain storage-pause-aware timing. A normal shutdown while waiting for or performing recovery leaves the saved conversation resumable.
 - Unfinished dispatched work becomes `unknown` on shutdown or `unknown_after_restart` on a crash and is never resent. Queued work waits for the native resume handshake, sufficient storage, and a ready harness. This does not promise continuation of an interrupted task or exactly-once external effects.
 - Before admitting execution, protected Linux startup clears only its validated workload subtree and confirms it is empty. Runtime also confirms each session's descendants have exited before recovery. Saved PIDs or similar command text never authorize killing a process. Unprotected local tests merely wait for an old PID to disappear; uncertainty blocks replacement and provides no descendant-containment guarantee.
+
+## Recovery preflight and explicit retry
+
+Authenticated `GET /v1/sessions/{id}/recovery` is read-only. It returns `status` and `message`: `ready` means a readable saved conversation exists, `empty` means none exists and no turn was dispatched, `missing` means dispatched work has lost its native history, and `unavailable` covers closed/history-only sessions or unsafe/unreadable files. File availability is not proof that the native handshake will succeed.
+
+Check this before deployment for every session expected to resume. Do not silently replace or discard `empty`/`missing` sessions to pass verification.
+
+A failed resume exposes `startup_error` (`startup_timeout`, `empty_session`, `missing_history`, or `resume_failed`). After correcting the cause, `POST /v1/sessions/{id}/resume` with a new `request_id` explicitly retries a failed startup only after old-process cleanup and a successful history preflight. Its receipt completes after the native handshake. It unpauses the queue, but never replays completed, failed, or uncertain prompts. Retrying the same request ID does not launch another process. Closed sessions stay closed.
 
 ## Storage and replay
 
 - All locally accepted records are fsynced before subscribers are notified. Native turn events own progress; RPC replies acknowledge delivery or rejection.
+- Native checkpoints are validated before journal persistence. Malformed native history fails that session without writing invalid checkpoints; source history is retained. Already-corrupt journals require explicit repair, never silent deletion.
+- A local journal write failure makes readiness and dashboard runtime readiness false and blocks new mutations. Saved history remains readable. Correct the storage problem and restart for validated recovery; never reset the write guard blindly. A remote database outage alone still permits local buffering.
 - Local replay uses a rebuilt, per-session sequence index. It does not scan other sessions.
 - Local and database event pages contain at most 256 records. Continue after the last returned sequence; sequences need not be contiguous within a session.
 - Saved-only metadata and the requested latest receipt share one bounded-memory scan, separate from replay pagination. Parsing stays in Rust because native output may contain NUL characters that PostgreSQL JSON processing rejects.

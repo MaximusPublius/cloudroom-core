@@ -1,11 +1,12 @@
 [Unit]
-Description=Cloudroom core with protected agent storage
+Description=Cloudroom core
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=cloudroom
 Group=cloudroom
+ExecStartPre=+/usr/bin/install -d -m 0700 -o cloudroom-agent -g cloudroom-agent /var/cache/cloudroom-agent
 ExecStart=/usr/local/lib/cloudroom/cloudroom
 EnvironmentFile=/etc/cloudroom/core.env
 Environment=CLOUDROOM_STORAGE_POLICY=/etc/cloudroom/storage.json
@@ -15,6 +16,8 @@ AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
 NoNewPrivileges=yes
 UMask=0077
+# The inherited 1024 soft limit was exhausted by HTTP/SSE gateway connections.
+LimitNOFILE=524288
 KillMode=control-group
 TimeoutStopSec=10
 Restart=on-failure

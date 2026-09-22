@@ -1,6 +1,8 @@
+mod children;
 mod outbox;
 pub use outbox::Journal;
 mod history;
+mod prompt;
 
 use crate::{
     config::Config,
@@ -19,7 +21,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
@@ -53,6 +55,8 @@ pub struct Receipt {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Default, Clone, Serialize)]
@@ -68,12 +72,25 @@ pub struct Session {
     pub state: String,
     pub current_request: Option<String>,
     pub current_turn: Option<String>,
+    pub startup_error: Option<String>,
+    #[serde(skip)]
+    has_dispatched: bool,
     pub last_sequence: u64,
     pub receipts: BTreeMap<String, Receipt>,
     // Ordered prompts accepted while busy, delivered one turn at a time.
     pub queue: Vec<String>,
+    #[serde(default)]
+    pub prompts: BTreeMap<String, prompt::PromptState>,
     pub storage_paused: bool,
     pub queue_paused: bool,
+    #[serde(default)]
+    pub compacting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Value>,
+    pub rewind_request: Option<String>,
+    pub parent_session: Option<String>,
     pub reasoning: Option<String>,
     pub workspace: Option<crate::workspace::Workspace>,
     #[serde(skip)]
@@ -115,8 +132,22 @@ impl Session {
             && self.close_request.is_none()
             && !matches!(
                 self.state.as_str(),
-                "closed" | "process_lost" | "failed" | "resuming"
+                "closed" | "process_lost" | "failed" | "resuming" | "rewinding"
             )
+    }
+
+    fn waiting_start(&self) -> Option<String> {
+        if !matches!(self.state.as_str(), "pending" | "waiting_for_files")
+            || self.close_request.is_some()
+            || self.native_id.is_some()
+            || self.harness_pid.is_some()
+        {
+            return None;
+        }
+        self.receipts
+            .values()
+            .find(|r| r.command == "start" && r.state == "accepted")
+            .map(|r| r.request_id.clone())
     }
 
     fn interrupt_pending(&self) -> bool {
@@ -156,7 +187,10 @@ pub struct Manager {
     pub(crate) observability: Observability,
     pub(crate) storage: Guard,
     pub(crate) workspaces: crate::workspace::Workspaces,
+    pub(crate) sync: crate::sync::Sync,
+    codex_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
     stopping: AtomicBool,
+    startups: Semaphore,
 }
 
 impl Local {
@@ -206,8 +240,37 @@ impl Local {
             "receipt" => {
                 let receipt = serde_json::from_value::<Receipt>(record.data.clone())?;
                 if receipt.command == "start" {
+                    session.parent_session =
+                        receipt.input["parent_session"].as_str().map(str::to_owned);
+                    if session.parent_session.is_some()
+                        && receipt.state == "accepted"
+                        && !session.receipts.contains_key(&receipt.request_id)
+                    {
+                        let task = Receipt {
+                            request_id: receipt.request_id.replacen("child_", "task_", 1),
+                            command: "prompt".into(),
+                            input: json!({"text":receipt.input["prompt"],"reasoning":receipt.input["reasoning"]}),
+                            state: "accepted".into(),
+                            model: None,
+                            provider: None,
+                            workspace: None,
+                            error: None,
+                        };
+                        prompt::apply(&mut session.prompts, &task);
+                        session.queue.push(task.request_id.clone());
+                        session.receipts.insert(task.request_id.clone(), task);
+                        session.state = "pending".into();
+                    }
                     session.workspace = receipt.workspace.clone().or(session.workspace.clone());
-                    session.reasoning = receipt.input["reasoning"].as_str().map(str::to_owned);
+                    if receipt.state == "accepted"
+                        && !session.receipts.contains_key(&receipt.request_id)
+                    {
+                        session.state = "pending".into();
+                    }
+                    // Completing this receipt must not erase a default captured after it was accepted.
+                    if let Some(level) = receipt.input["reasoning"].as_str() {
+                        session.reasoning = Some(level.to_owned());
+                    }
                     if receipt.model.is_some() {
                         session.model = receipt.model.clone();
                     }
@@ -252,13 +315,42 @@ impl Local {
                         session.recovery_attempted = false; // Healthy progress permits a later recovery.
                     }
                 }
+                if receipt.command == "cancel"
+                    && matches!(receipt.state.as_str(), "accepted" | "completed")
+                    && let Some(target) = receipt.input["target_request_id"].as_str()
+                {
+                    session.queue.retain(|id| id != target);
+                }
+                if receipt.command == "compact" {
+                    let terminal = matches!(
+                        receipt.state.as_str(),
+                        "completed"
+                            | "failed"
+                            | "interrupted"
+                            | "unknown"
+                            | "unknown_after_restart"
+                    );
+                    session.compacting = !terminal
+                        && matches!(
+                            receipt.state.as_str(),
+                            "accepted" | "delivered" | "running" | "unknown"
+                        );
+                    session.compact_request = (!terminal).then(|| receipt.request_id.clone());
+                }
+                if receipt.command == "rewind" && receipt.state == "accepted" {
+                    session.rewind_request = Some(receipt.request_id.clone());
+                    session.state = "rewinding".into();
+                }
+                prompt::apply(&mut session.prompts, &receipt);
                 session.receipts.insert(receipt.request_id.clone(), receipt);
             }
             "native_identity" => {
                 let id = record.data["id"]
                     .as_str()
                     .ok_or_else(|| io::Error::other("missing native identity"))?;
-                if session.native_id.as_deref().is_some_and(|old| old != id) {
+                if session.native_id.as_deref().is_some_and(|old| old != id)
+                    && record.data["replaced"] != true
+                {
                     return Err(io::Error::other("native identity changed"));
                 }
                 session.native_id = Some(id.into());
@@ -289,12 +381,20 @@ impl Local {
                 if session.state == "resuming" {
                     session.recovery_attempted = true;
                 }
+                if let Some(error) = record.data["startup_error"].as_str() {
+                    session.startup_error = Some(error.into());
+                } else if record.data["reason"] == "native resume or process cleanup failed" {
+                    session.startup_error = Some("resume_failed".into());
+                } else if session.state == "idle" {
+                    session.startup_error = None;
+                }
                 session.current_request = record.data["request_id"].as_str().map(str::to_owned);
                 session.current_turn = record.data["turn_id"].as_str().map(str::to_owned);
                 // Dispatching a queued prompt removes it from the pending queue.
                 if session.state == "starting_turn"
                     && let Some(request) = record.data["request_id"].as_str()
                 {
+                    session.has_dispatched = true;
                     session.queue.retain(|id| id != request);
                 }
             }
@@ -302,7 +402,43 @@ impl Local {
             "harness" => {
                 session.harness_pid = record.data["pid"].as_u64().map(|pid| pid as u32);
             }
+            "launch_reasoning" => {
+                if session.reasoning.is_none() {
+                    session.reasoning = record.data["reasoning"].as_str().map(str::to_owned);
+                }
+            }
             "workspace" => session.workspace = Some(serde_json::from_value(record.data.clone())?),
+            "checkpoint" => session.checkpoint = Some(record.data.clone()),
+            "rewind" => {
+                if let Some(id) = record.data["id"].as_str() {
+                    session.native_id = Some(id.into());
+                }
+                if let Some(path) = record.data["path"].as_str() {
+                    session.native_path = Some(path.into());
+                }
+                session.native_cursor = record.data["cursor"].clone();
+                session.native_offset = session.native_cursor["offset"].as_u64().unwrap_or(0);
+                session.checkpoint = None;
+                session.rewind_request = None;
+                session.state = "idle".into();
+                if let Some(request) = record.data["request_id"].as_str()
+                    && let Some(receipt) = session.receipts.get_mut(request)
+                {
+                    receipt.state = "completed".into();
+                }
+                if let Some(replacement) = record.data.get("replacement").filter(|v| !v.is_null()) {
+                    let receipt: Receipt = serde_json::from_value(replacement.clone())?;
+                    if !session.receipts.contains_key(&receipt.request_id) {
+                        prompt::apply(&mut session.prompts, &receipt);
+                        session.queue.push(receipt.request_id.clone());
+                        session.receipts.insert(receipt.request_id.clone(), receipt);
+                    }
+                }
+            }
+            "rewind_failed" => {
+                session.rewind_request = None;
+                session.state = "idle".into();
+            }
             "storage_warning" => session.storage_warned = true,
             "storage_pause" => session.storage_paused = record.data["paused"] == true,
             "storage_recovered" => {
@@ -325,6 +461,18 @@ impl Local {
         data: Value,
         native: Option<String>,
     ) -> io::Result<Record> {
+        if kind == "native_record" {
+            let current = self
+                .sessions
+                .get(session)
+                .ok_or_else(|| io::Error::other("native record has no session"))?;
+            runtime::checkpoint(
+                current.harness,
+                &current.native_cursor,
+                &data,
+                native.as_deref(),
+            )?;
+        }
         let record = Record {
             sequence: self.journal.last() + 1,
             session_id: session.into(),
@@ -369,7 +517,11 @@ impl Manager {
                     None,
                 )?;
             }
-            let eligible = session.can_resume();
+            if session.waiting_start().is_some() {
+                continue;
+            }
+            let eligible =
+                session.can_resume() || session.startup_error.as_deref() == Some("startup_timeout");
             for mut receipt in session.receipts.values().cloned() {
                 let terminal = matches!(
                     receipt.state.as_str(),
@@ -407,12 +559,18 @@ impl Manager {
         for session in local.sessions.values().cloned().collect::<Vec<_>>() {
             if let Some(saved) = session.resume()
                 && let Some(profile) = config.harnesses.get(&session.harness)
-                && runtime::recover_records(profile, session.harness, &saved, |event| {
-                    if let runtime::Event::Record { kind, data, native } = event {
-                        local.append(&session.session_id, kind, data, native)?;
-                    }
-                    Ok(())
-                })
+                && runtime::recover_records(
+                    profile,
+                    session.harness,
+                    &saved,
+                    config.storage.as_ref(),
+                    |event| {
+                        if let runtime::Event::Record { kind, data, native } = event {
+                            local.append(&session.session_id, kind, data, native)?;
+                        }
+                        Ok(())
+                    },
+                )
                 .is_err()
             {
                 local.append(
@@ -436,6 +594,7 @@ impl Manager {
         }
         let storage = Guard::new(&config)?;
         let workspaces = crate::workspace::Workspaces::open(&config)?;
+        let sync = crate::sync::Sync::open(&config)?;
         let history = history::History::new(&config)?;
         let observability = Observability::start(&config, history.pool.clone());
         Ok(Arc::new(Self {
@@ -445,7 +604,13 @@ impl Manager {
             observability,
             storage,
             workspaces,
+            sync,
+            codex_models: tokio::sync::Mutex::new(None),
             stopping: AtomicBool::new(false),
+            // Bound cold-start CPU contention, not the number of running sessions.
+            startups: Semaphore::new(
+                std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
+            ),
         }))
     }
 
@@ -457,8 +622,15 @@ impl Manager {
         self.local.lock().unwrap().changed.subscribe()
     }
 
+    pub(crate) fn recording_available(&self) -> bool {
+        self.local.lock().unwrap().journal.writable()
+    }
+
     pub async fn ready(&self) -> bool {
-        !self.is_stopping() && !self.storage.blocks() && self.history.ready().await
+        !self.is_stopping()
+            && !self.storage.blocks()
+            && self.recording_available()
+            && self.history.ready().await
     }
 
     pub fn dashboard(&self) -> Value {
@@ -495,18 +667,73 @@ impl Manager {
             })
             .collect();
         json!({"version":1,"sampledAt":sampled_at,
-            "runtime":{"ready":!self.is_stopping() && !self.storage.blocks(),"version":env!("CARGO_PKG_VERSION"),
+            "runtime":{"ready":!self.is_stopping() && !self.storage.blocks() && local.journal.writable(),"version":env!("CARGO_PKG_VERSION"),
                 "configured":!self.config.harnesses.is_empty()},
             "appConnectivity":"unknown","resources":resources,
             "onboarding":{"localConnected":null,"offlineTaskVerified":null},
-            "capabilities":{"settings":false,"updates":false},
+            "capabilities":{"settings":true,"updates":false},
             "sessionCount":sessions.len(),"sessions":summaries})
     }
 
-    pub fn capabilities(&self) -> Value {
-        json!({"version":1,"repository":self.config.repository,
-            "harnesses":self.config.harnesses.iter().map(|(kind, profile)| json!({"id":kind,"model":profile.model,"provider":profile.provider})).collect::<Vec<_>>(),
-            "stop":true,"resume":true,"launch_settings":true,"workspaces":true})
+    async fn codex_models(&self) -> Result<Vec<runtime::Model>> {
+        let mut cached = self.codex_models.lock().await;
+        if let Some((checked, models)) = &*cached
+            && checked.elapsed() < Duration::from_secs(60)
+        {
+            return Ok(models.clone());
+        }
+        let (result, exit) = runtime::codex_models(&self.config).await;
+        if let Some(runtime::Event::Exited {
+            reason,
+            expected,
+            details,
+            ..
+        }) = exit
+        {
+            self.observability
+                .agent_exit(None, runtime::Kind::Codex, reason, expected, details);
+        }
+        let models = result.map_err(|_| Error::Conflict("model catalog unavailable"))?;
+        *cached = Some((Instant::now(), models.clone()));
+        Ok(models)
+    }
+
+    pub async fn capabilities(&self) -> Value {
+        let mut harnesses = Vec::new();
+        for (kind, profile) in &self.config.harnesses {
+            let mut harness = json!({"id":kind,"model":profile.model,"provider":profile.provider});
+            match kind {
+                runtime::Kind::Codex => {
+                    harness["models"] = match self.codex_models().await {
+                        Ok(models) => json!(models),
+                        Err(_) => Value::Null,
+                    };
+                    harness["steer"] = json!(true);
+                    harness["compact"] = json!(true);
+                    harness["service_tier"] = json!(true);
+                    harness["rewind"] = json!(true);
+                    harness["attachments"] = json!({"images":true,"files":true});
+                    harness["subagents"] = json!(true);
+                    harness["usage"] = json!(true);
+                }
+                runtime::Kind::Pi => {
+                    harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
+                    harness["provider_selection"] = json!(true);
+                    harness["steer"] = json!(true);
+                    harness["compact"] = json!(true);
+                    harness["service_tier"] = json!(false);
+                    harness["rewind"] = json!(true);
+                    harness["attachments"] = json!({"images":true,"files":true});
+                    harness["subagents"] = json!(true);
+                    harness["usage"] = json!(true);
+                }
+            }
+            harnesses.push(harness);
+        }
+        json!({"version":1,"repository":self.config.repository,"harnesses":harnesses,
+            "stop":true,"resume":true,"launch_settings":true,"prompt_reasoning":true,"workspaces":true,"sync":true,"direct_workspaces":true,
+            "structured_prompt":true,"queue_edit":true,"queue_cancel":true,"steer":true,"rewind":true,
+            "attachments":true,"compact":true,"usage":true,"subagents":true})
     }
 
     pub fn saving(&self) -> Value {
@@ -552,6 +779,46 @@ impl Manager {
             .ok_or(Error::NotFound)
     }
 
+    pub fn recovery_check(&self, session: &Session) -> Value {
+        let (status, message) = if session.close_request.is_some()
+            || session.state == "closed"
+            || session.state == "saved_history_only"
+        {
+            (
+                "unavailable",
+                "This session is closed or has saved history only",
+            )
+        } else if let Some(saved) = session.resume()
+            && let Some(profile) = self.config.harnesses.get(&session.harness)
+        {
+            match runtime::check_resume_history(profile, &saved, self.config.storage.as_ref()) {
+                Ok(()) => (
+                    "ready",
+                    "Saved conversation is available; the native resume handshake is still required",
+                ),
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && !session.has_dispatched =>
+                {
+                    (
+                        "empty",
+                        "No turn was dispatched and no saved conversation exists; there is nothing to resume",
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                    "missing",
+                    "Saved conversation is missing; do not create a replacement or replay work",
+                ),
+                Err(_) => ("unavailable", "Saved conversation could not be read safely"),
+            }
+        } else {
+            (
+                "unavailable",
+                "No saved native conversation identity is available",
+            )
+        };
+        json!({"status":status,"message":message})
+    }
+
     fn retry(
         session: &Session,
         request: &str,
@@ -572,7 +839,8 @@ impl Manager {
         harness: Option<runtime::Kind>,
         model: Option<String>,
         reasoning: Option<String>,
-        workspace: Option<String>,
+        (workspace, workspace_name): (Option<String>, Option<String>),
+        provider: Option<String>,
     ) -> Result<(String, Receipt)> {
         let id = format!("cr_{request}");
         let kind = harness
@@ -593,6 +861,12 @@ impl Manager {
         if let Some(model) = &model {
             input["model"] = json!(model);
         }
+        if let Some(provider) = &provider {
+            if kind != runtime::Kind::Pi {
+                return Err(Error::Conflict("provider selection requires Pi"));
+            }
+            input["provider"] = json!(provider);
+        }
         if let Some(reasoning) = &reasoning {
             input["reasoning"] = json!(reasoning);
         }
@@ -601,10 +875,19 @@ impl Manager {
                 .map_err(|_| Error::Conflict("invalid workspace"))?;
             input["workspace"] = json!(workspace);
         }
+        if let Some(name) = &workspace_name {
+            if workspace.is_none() || crate::workspace::valid_name(name).is_err() {
+                return Err(Error::Conflict("invalid workspace"));
+            }
+            input["workspace_name"] = json!(name);
+        }
         if let Some(session) = self.local.lock().unwrap().sessions.get(&id) {
             return Self::retry(session, &request, "start", &input)?
                 .map(|r| (id.clone(), r))
                 .ok_or(Error::Conflict("session already exists"));
+        }
+        if !self.recording_available() {
+            return Err(Error::Storage);
         }
         if self.storage.blocks() {
             return Err(Error::Conflict("storage unsafe; new execution is blocked"));
@@ -632,14 +915,34 @@ impl Manager {
         if !self.config.harnesses.contains_key(&kind) {
             return Err(Error::Conflict("harness is not configured"));
         }
+        if let Some(reasoning) = &reasoning {
+            let supported = match kind {
+                runtime::Kind::Codex => {
+                    let models = self.codex_models().await?;
+                    let selected = model
+                        .as_ref()
+                        .unwrap_or(&self.config.harnesses[&kind].model);
+                    let entry = models
+                        .iter()
+                        .find(|entry| &entry.model == selected)
+                        .ok_or(Error::Conflict("invalid model"))?;
+                    entry.reasoning_levels.contains(reasoning)
+                }
+                runtime::Kind::Pi => runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str()),
+            };
+            if !supported {
+                return Err(Error::Conflict("invalid reasoning effort"));
+            }
+        }
         let workspace = match workspace {
             Some(id) => self
                 .workspaces
-                .get(&id)?
-                .ok_or(Error::Conflict("prepare the workspace before starting"))?,
+                .resolve(&id, workspace_name.as_deref())
+                .map_err(|_| Error::Conflict("workspace mapping unavailable"))?,
             None => crate::workspace::Workspace {
                 id: "legacy".into(),
                 path: self.config.repository.clone(),
+                parent: None,
             },
         };
         let receipt = Receipt {
@@ -648,8 +951,9 @@ impl Manager {
             input,
             state: "accepted".into(),
             model: Some(model.unwrap_or_else(|| self.config.harnesses[&kind].model.clone())),
-            provider: self.config.harnesses[&kind].provider.clone(),
+            provider: provider.or_else(|| self.config.harnesses[&kind].provider.clone()),
             workspace: Some(workspace),
+            error: None,
         };
         {
             let mut local = self.local.lock().unwrap();
@@ -663,17 +967,6 @@ impl Manager {
             }
             if self.storage.blocks() {
                 return Err(Error::Conflict("storage unsafe; new execution is blocked"));
-            }
-            if local
-                .sessions
-                .values()
-                .filter(|s| {
-                    s.handle.is_some() || matches!(s.state.as_str(), "starting" | "resuming")
-                })
-                .count()
-                >= self.config.max_harnesses
-            {
-                return Err(Error::Conflict("first-slice runtime capacity reached"));
             }
             local.append(
                 &id,
@@ -691,27 +984,52 @@ impl Manager {
     }
 
     async fn launch(self: Arc<Self>, id: String, request: String) {
-        while self.storage.blocks() {
-            if self.is_stopping() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
         let started = Instant::now();
+        let Ok(_startup) = self.startups.acquire().await else {
+            return;
+        };
+        let workspace = loop {
+            let workspace = {
+                let local = self.local.lock().unwrap();
+                let session = &local.sessions[&id];
+                if self.is_stopping() || session.close_request.is_some() {
+                    return;
+                }
+                session.workspace.clone()
+            };
+            if !self.storage.blocks() {
+                break workspace;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        if self.is_stopping() {
+            return;
+        }
+        let mut failure_reason = "Cloud folder could not be opened or created; check its permissions, symlinks, and available disk space";
         let result = async {
+            let workspace = workspace.ok_or_else(|| io::Error::other("session workspace missing"))?;
+            self.workspaces.ensure_directory(&workspace).await?;
+            failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
             let (handle, events) = {
                 let mut local = self.local.lock().unwrap();
                 if self.is_stopping() {
                     return Err(io::Error::other("service is stopping"));
                 }
+                if local.sessions[&id].close_request.is_some() { return Ok(()); }
                 let session = &local.sessions[&id];
                 let mut config = self.config.clone();
+                failure_reason = "The selected harness is no longer configured";
+                let profile = config.harnesses.get_mut(&session.harness)
+                    .ok_or_else(|| io::Error::other(failure_reason))?;
+                if let Some(model) = &session.model { profile.model = model.clone(); }
+                if let Some(provider) = &session.provider { profile.provider = Some(provider.clone()); }
+                failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
                 config.repository = session.workspace.as_ref().ok_or_else(|| io::Error::other("session workspace missing"))?.path.canonicalize()?;
-                if let Some(model) = &session.model {
-                    config.harnesses.get_mut(&session.harness).expect("configured harness").model = model.clone();
-                }
-                let (handle, events) = runtime::Handle::spawn(&config, session.harness, None)?;
-                let handle = handle.with_reasoning(session.reasoning.clone());
+                let (kind, reasoning) = (session.harness, session.reasoning.clone());
+                // Claim before spawning: a crash after this point must not repeat uncertain execution.
+                local.append(&id, "state", json!({"state":"starting"}), None)?;
+                let (handle, events) = runtime::Handle::spawn(&config, kind, None)?;
+                let handle = handle.with_reasoning(reasoning);
                 let pid = handle.pid();
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
                 local.append(&id, "harness", json!({"pid":pid}), None)?;
@@ -720,6 +1038,7 @@ impl Manager {
             self.watch_events(id.clone(), handle.clone(), events);
             let native = handle.start_session().await?;
             let mut local = self.local.lock().unwrap();
+            self.remember_launch_reasoning(&mut local, &id, &handle)?;
             local.append(
                 &id,
                 "native_identity",
@@ -734,6 +1053,14 @@ impl Manager {
             local
                 .finish_receipt(&id, &request, "completed")
                 .map_err(|_| io::Error::other("cannot record startup"))?;
+            // A stop accepted before the first harness existed only pauses the queue.
+            let stops: Vec<_> = local.sessions[&id].receipts.values()
+                .filter(|r| r.command == "stop" && r.state == "accepted")
+                .map(|r| r.request_id.clone()).collect();
+            for stop in stops {
+                local.finish_receipt(&id, &stop, "completed")
+                    .map_err(|_| io::Error::other("cannot record startup stop"))?;
+            }
             self.advance(&mut local, &id, true);
             Ok::<_, io::Error>(())
         }
@@ -746,12 +1073,93 @@ impl Manager {
         if result.is_err() {
             let mut local = self.local.lock().unwrap();
             let _ = local.finish_receipt(&id, &request, "failed");
-            let _ = local.append(&id,"state",json!({"state":"failed","reason":"Harness initialization failed; inspect native history"}),None);
+            let _ = local.append(
+                &id,
+                "state",
+                json!({"state":"failed","reason":failure_reason}),
+                None,
+            );
             let _ = local.fail_pending(&id);
             if let Some(handle) = local.sessions[&id].handle.as_ref() {
                 handle.request_shutdown();
             }
         }
+    }
+
+    pub fn known_request(&self, id: &str, request: &str) -> bool {
+        self.local
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.receipts.contains_key(request))
+    }
+
+    /// Follow-up reasoning is checked against the launch model. Omitted reasoning stays on the launch default.
+    pub async fn check_prompt_reasoning(&self, id: &str, reasoning: Option<&str>) -> Result<()> {
+        let Some(reasoning) = reasoning else {
+            return Ok(());
+        };
+        let (kind, model) = {
+            let local = self.local.lock().unwrap();
+            let session = local.sessions.get(id).ok_or(Error::NotFound)?;
+            let model = session.model.clone().or_else(|| {
+                self.config
+                    .harnesses
+                    .get(&session.harness)
+                    .map(|profile| profile.model.clone())
+            });
+            (session.harness, model)
+        };
+        let supported = match kind {
+            runtime::Kind::Codex => {
+                let models = self.codex_models().await?;
+                let selected = model.ok_or(Error::Conflict("invalid model"))?;
+                models
+                    .iter()
+                    .find(|entry| entry.model == selected)
+                    .ok_or(Error::Conflict("invalid model"))?
+                    .reasoning_levels
+                    .iter()
+                    .any(|level| level == reasoning)
+            }
+            runtime::Kind::Pi => runtime::PI_REASONING_LEVELS.contains(&reasoning),
+        };
+        if !supported {
+            return Err(Error::Conflict("invalid reasoning effort"));
+        }
+        Ok(())
+    }
+
+    pub fn check_prompt_service_tier(&self, id: &str, tier: Option<&str>) -> Result<()> {
+        let Some(tier) = tier else {
+            return Ok(());
+        };
+        if tier != "default" && tier != "fast" {
+            return Err(Error::Conflict("invalid service tier"));
+        }
+        let kind = self
+            .local
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .ok_or(Error::NotFound)?
+            .harness;
+        if kind != runtime::Kind::Codex && tier == "fast" {
+            return Err(Error::Conflict("invalid service tier"));
+        }
+        Ok(())
+    }
+
+    pub fn receipt(&self, id: &str, request: &str) -> Option<Receipt> {
+        self.local
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .and_then(|session| session.receipts.get(request))
+            .cloned()
     }
 
     pub fn command(
@@ -765,6 +1173,9 @@ impl Manager {
             None,
             Deliver(runtime::Handle, String),
             Interrupt(runtime::Handle, String),
+            Steer(runtime::Handle, String, String),
+            Compact(runtime::Handle, String),
+            Rewind(runtime::Handle, Value, String),
             Close(Option<runtime::Handle>),
             Resume,
         }
@@ -774,8 +1185,14 @@ impl Manager {
             if let Some(receipt) = Self::retry(session, &request, command, &input)? {
                 return Ok(receipt);
             }
+            if !local.journal.writable() {
+                return Err(Error::Storage);
+            }
             if self.is_stopping() {
                 return Err(Error::Conflict("service is stopping"));
+            }
+            if session.rewind_request.is_some() {
+                return Err(Error::Conflict("wait for the pending rewind"));
             }
             if session.close_request.is_some()
                 || (command != "close" && session.interrupt_pending())
@@ -787,12 +1204,35 @@ impl Manager {
             }
             if !matches!(
                 command,
-                "prompt" | "interrupt" | "close" | "stop" | "resume"
+                "prompt"
+                    | "interrupt"
+                    | "close"
+                    | "stop"
+                    | "resume"
+                    | "edit"
+                    | "cancel"
+                    | "steer"
+                    | "compact"
+                    | "rewind"
+                    | "attach"
             ) {
                 return Err(Error::Conflict("unsupported command"));
             }
             let handle = session.handle.clone();
-            if matches!(session.state.as_str(), "closed" | "process_lost" | "failed") {
+            let retry_startup = command == "resume"
+                && session.state == "process_lost"
+                && session.startup_error.is_some()
+                && session.current_request.is_none()
+                && handle.is_none()
+                && session.harness_pid.is_none();
+            if retry_startup && self.recovery_check(session)["status"] != "ready" {
+                return Err(Error::Conflict(
+                    "saved conversation is unavailable; inspect session recovery before retrying",
+                ));
+            }
+            if matches!(session.state.as_str(), "closed" | "process_lost" | "failed")
+                && !retry_startup
+            {
                 return Err(Error::Conflict(
                     "process unavailable; history does not restore execution",
                 ));
@@ -807,10 +1247,121 @@ impl Manager {
                     "workload is paused for storage; close it or wait for recovery",
                 ));
             }
+            if matches!(command, "edit" | "cancel") {
+                let target = input["target_request_id"].as_str().unwrap_or_default();
+                let cancelled = session
+                    .prompts
+                    .get(target)
+                    .is_some_and(|prompt| prompt.cancelled);
+                if target.is_empty() {
+                    return Err(Error::Conflict("queued message is no longer pending"));
+                }
+                if command == "edit" || !cancelled {
+                    if !session.queue.contains(&target.to_owned()) {
+                        return Err(Error::Conflict("queued message is no longer pending"));
+                    }
+                    if session.current_request.as_deref() == Some(target) {
+                        return Err(Error::Conflict("queued message is already being sent"));
+                    }
+                }
+                if command == "edit" && cancelled {
+                    return Err(Error::Conflict("queued message is no longer pending"));
+                }
+                if command == "edit" {
+                    let expected = input["expected_revision"].as_u64().unwrap_or(0);
+                    let current = session
+                        .prompts
+                        .get(target)
+                        .map(|prompt| prompt.revision)
+                        .unwrap_or(1);
+                    if expected != current {
+                        return Err(Error::Conflict(
+                            "queued message changed since editing began",
+                        ));
+                    }
+                }
+            }
+            if command == "steer"
+                && (!session.ready
+                    || handle.is_none()
+                    || session.current_request.as_deref() != input["target_request_id"].as_str())
+            {
+                return Err(Error::Conflict(
+                    "steer target is no longer the active request",
+                ));
+            }
+            if command == "compact" {
+                if session.compacting {
+                    return Err(Error::Conflict("compaction is already running"));
+                }
+                if session.current_request.is_some()
+                    || !matches!(session.state.as_str(), "idle" | "failed")
+                {
+                    return Err(Error::Conflict(
+                        "context can only be compacted while the thread is idle",
+                    ));
+                }
+                if !session.ready || handle.is_none() {
+                    return Err(Error::Conflict("harness is not ready for compaction"));
+                }
+            }
+            if command == "rewind" {
+                if local.sessions.values().any(|child| {
+                    child.parent_session.as_deref() == Some(id)
+                        && (child.current_request.is_some()
+                            || !child.queue.is_empty()
+                            || matches!(
+                                child.state.as_str(),
+                                "pending" | "starting" | "resuming" | "waiting_for_files"
+                            ))
+                }) {
+                    return Err(Error::Conflict(
+                        "wait for child agents before editing a message",
+                    ));
+                }
+                if input["before"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .is_none()
+                    && input["last_turn_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .is_none()
+                {
+                    return Err(Error::Conflict("a native rewind checkpoint is required"));
+                }
+                if let Some(replacement) = input.get("replacement") {
+                    let key = replacement["request_id"]
+                        .as_str()
+                        .ok_or(Error::Conflict("replacement request ID required"))?;
+                    if key == request || session.receipts.contains_key(key) {
+                        return Err(Error::Conflict("replacement request ID already exists"));
+                    }
+                }
+                if session.compacting {
+                    return Err(Error::Conflict("wait for compaction"));
+                }
+                if !session.queue.is_empty() {
+                    return Err(Error::Conflict(
+                        "send or remove queued messages before editing a message",
+                    ));
+                }
+                if session.current_request.is_some()
+                    || !matches!(session.state.as_str(), "idle" | "failed")
+                {
+                    return Err(Error::Conflict(
+                        "wait for the active turn to finish before editing a sent message",
+                    ));
+                }
+                if !session.ready || handle.is_none() {
+                    return Err(Error::Conflict("harness is not ready to rewind"));
+                }
+            }
             let deliver_now = command == "prompt"
                 && session.ready
                 && session.state == "idle"
                 && !session.queue_paused
+                && !session.compacting
                 && session.queue.is_empty();
             if command == "interrupt"
                 && (!session.ready
@@ -825,11 +1376,12 @@ impl Manager {
             let receipt = Receipt {
                 request_id: request.clone(),
                 command: command.into(),
-                input,
+                input: input.clone(),
                 state: "accepted".into(),
                 model: None,
                 provider: None,
                 workspace: None,
+                error: None,
             };
             local.append(
                 id,
@@ -843,6 +1395,14 @@ impl Manager {
                     Next::Deliver(handle.expect("ready harness"), request.clone())
                 }
                 "prompt" => Next::None,
+                "edit" | "cancel" | "attach" => {
+                    local.finish_receipt(id, &request, "completed")?;
+                    Next::None
+                }
+                "resume" if retry_startup => {
+                    self.schedule_resume(&mut local, id)?;
+                    Next::None
+                }
                 "resume" => {
                     local.finish_receipt(id, &request, "completed")?;
                     Next::Resume
@@ -851,6 +1411,23 @@ impl Manager {
                     local.finish_receipt(id, &request, "completed")?;
                     Next::None
                 }
+                "steer" => Next::Steer(
+                    handle.expect("validated live steer target"),
+                    input["target_request_id"]
+                        .as_str()
+                        .expect("validated steer target")
+                        .to_owned(),
+                    request.clone(),
+                ),
+                "compact" => {
+                    local.append(id, "state", json!({"state":"running"}), None)?;
+                    Next::Compact(handle.expect("validated compact harness"), request.clone())
+                }
+                "rewind" => Next::Rewind(
+                    handle.expect("validated rewind harness"),
+                    input,
+                    request.clone(),
+                ),
                 "close" => {
                     let session = &local.sessions[id];
                     let data = json!({"state":"closing","request_id":session.current_request,"turn_id":session.current_turn});
@@ -878,6 +1455,13 @@ impl Manager {
                 }
             }
             Next::Deliver(handle, request) => self.clone().deliver(id.to_owned(), request, handle),
+            Next::Steer(handle, target, request) => {
+                self.clone().steer(id.to_owned(), request, target, handle)
+            }
+            Next::Compact(handle, request) => self.clone().compact(id.to_owned(), request, handle),
+            Next::Rewind(handle, input, request) => {
+                self.clone().rewind(id.to_owned(), request, input, handle)
+            }
             Next::Interrupt(handle, target) => {
                 let manager = self.clone();
                 let id = id.to_owned();
@@ -907,6 +1491,24 @@ impl Manager {
         Ok(receipt)
     }
 
+    /// Pi's process keeps the last thinking level. Remember the level it started with
+    /// so a later message that omits reasoning can put that default back.
+    fn remember_launch_reasoning(
+        &self,
+        local: &mut Local,
+        id: &str,
+        handle: &runtime::Handle,
+    ) -> io::Result<()> {
+        if local.sessions[id].reasoning.is_some() {
+            return Ok(());
+        }
+        let Some(level) = handle.launch_baseline() else {
+            return Ok(());
+        };
+        local.append(id, "launch_reasoning", json!({"reasoning": level}), None)?;
+        Ok(())
+    }
+
     /// Record the start of a queued or immediate turn; dequeues the request.
     fn begin_turn(&self, local: &mut Local, id: &str, request: &str) -> io::Result<()> {
         local.append(
@@ -922,11 +1524,22 @@ impl Manager {
     /// turn never began, so advance to the next queued prompt.
     fn deliver(self: Arc<Self>, id: String, request: String, handle: runtime::Handle) {
         tokio::spawn(async move {
-            let text = self.local.lock().unwrap().sessions[&id].receipts[&request].input["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            let result = handle.send(&request, &text).await;
+            let (input, reasoning) = {
+                let local = self.local.lock().unwrap();
+                let session = &local.sessions[&id];
+                let input = prompt::latest(&session.prompts, &session.receipts, &request)
+                    .cloned()
+                    .unwrap_or_else(|| json!({"text":""}));
+                let reasoning = prompt::reasoning(&input).or_else(|| session.reasoning.clone());
+                (input, reasoning)
+            };
+            // The stored handle keeps the launch level. This copy is only for the turn being started.
+            let handle = handle.with_reasoning(reasoning);
+            let result = async {
+                handle.prepare_turn().await?;
+                handle.send_prompt(&request, &input).await
+            }
+            .await;
             let state = match &result {
                 Ok(_) => "delivered",
                 Err(e) if e.kind() == io::ErrorKind::InvalidInput => "failed",
@@ -940,6 +1553,15 @@ impl Manager {
             {
                 return;
             }
+            if let Err(error) = &result
+                && error.kind() == io::ErrorKind::InvalidInput
+                && let Some(receipt) = local
+                    .sessions
+                    .get_mut(&id)
+                    .and_then(|session| session.receipts.get_mut(&request))
+            {
+                receipt.error = Some(error.to_string());
+            }
             let _ = local.finish_receipt(&id, &request, state);
             if result.is_err_and(|e| e.kind() == io::ErrorKind::InvalidInput)
                 && local.sessions.get(&id).is_some_and(|s| {
@@ -951,12 +1573,131 @@ impl Manager {
         });
     }
 
+    fn steer(
+        self: Arc<Self>,
+        id: String,
+        request: String,
+        target: String,
+        handle: runtime::Handle,
+    ) {
+        tokio::spawn(async move {
+            let text = {
+                let local = self.local.lock().unwrap();
+                local.sessions[&id]
+                    .receipts
+                    .get(&request)
+                    .map(|receipt| {
+                        receipt.input["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .unwrap_or_default()
+            };
+            let result = handle.steer(&target, &text).await;
+            let state = match &result {
+                Ok(_) => "completed",
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => "failed",
+                Err(_) => "unknown",
+            };
+            let mut local = self.local.lock().unwrap();
+            if !local.sessions[&id]
+                .handle
+                .as_ref()
+                .is_some_and(|current| current.same_process(&handle))
+            {
+                return;
+            }
+            if let Err(error) = &result
+                && error.kind() == io::ErrorKind::InvalidInput
+                && let Some(receipt) = local
+                    .sessions
+                    .get_mut(&id)
+                    .and_then(|session| session.receipts.get_mut(&request))
+            {
+                receipt.error = Some(error.to_string());
+            }
+            let _ = local.finish_receipt(&id, &request, state);
+        });
+    }
+
+    fn compact(self: Arc<Self>, id: String, request: String, handle: runtime::Handle) {
+        tokio::spawn(async move {
+            let result = handle.compact().await;
+            let state = match &result {
+                Ok(_) => "delivered",
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => "failed",
+                Err(_) => "unknown",
+            };
+            let mut local = self.local.lock().unwrap();
+            if !local.sessions[&id]
+                .handle
+                .as_ref()
+                .is_some_and(|current| current.same_process(&handle))
+            {
+                return;
+            }
+            if let Err(error) = &result
+                && error.kind() == io::ErrorKind::InvalidInput
+                && let Some(receipt) = local
+                    .sessions
+                    .get_mut(&id)
+                    .and_then(|session| session.receipts.get_mut(&request))
+                && !matches!(
+                    receipt.state.as_str(),
+                    "completed" | "failed" | "interrupted"
+                )
+            {
+                receipt.error = Some(error.to_string());
+            }
+            let _ = local.finish_receipt(&id, &request, state);
+            if state == "failed" {
+                self.advance(&mut local, &id, false);
+            }
+        });
+    }
+
+    fn rewind(self: Arc<Self>, id: String, request: String, input: Value, handle: runtime::Handle) {
+        tokio::spawn(async move {
+            let result = handle.rewind(&input).await;
+            let mut local = self.local.lock().unwrap();
+            if !local.sessions[&id]
+                .handle
+                .as_ref()
+                .is_some_and(|current| current.same_process(&handle))
+            {
+                return;
+            }
+            match result {
+                Ok(_) => {} // The adapter's ordered rewind_ready event commits the identity before capture or dispatch.
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    if let Some(receipt) = local
+                        .sessions
+                        .get_mut(&id)
+                        .and_then(|session| session.receipts.get_mut(&request))
+                    {
+                        receipt.error = Some(error.to_string());
+                    }
+                    let _ = local.finish_receipt(&id, &request, "failed");
+                    let _ = local.append(&id, "rewind_failed", json!({"request_id":request}), None);
+                }
+                Err(_) => {
+                    let _ = local.finish_receipt(&id, &request, "unknown");
+                }
+            }
+        });
+    }
+
     /// Move a ready session to its next turn: dispatch the next queued prompt, wait
     /// out a pending interrupt, or return to idle. `turn_ended` bypasses the active
     /// turn guard when the just-finished turn is the reason for advancing.
     fn advance(self: &Arc<Self>, local: &mut Local, id: &str, turn_ended: bool) {
         let session = &local.sessions[id];
-        if session.close_request.is_some() || !session.ready || self.is_stopping() {
+        if session.close_request.is_some()
+            || session.rewind_request.is_some()
+            || !session.ready
+            || self.is_stopping()
+        {
             return;
         }
         if !turn_ended && session.current_request.is_some() {
@@ -966,8 +1707,17 @@ impl Manager {
             let _ = local.append(id, "state", json!({"state":"interrupting"}), None);
             return;
         }
-        if self.storage.blocks() || session.storage_paused || session.queue_paused {
-            let _ = local.append(id, "state", json!({"state":"idle"}), None);
+        if self.storage.blocks()
+            || session.storage_paused
+            || session.queue_paused
+            || session.compacting
+        {
+            let state = if session.compacting {
+                "running"
+            } else {
+                "idle"
+            };
+            let _ = local.append(id, "state", json!({"state":state}), None);
             return;
         }
         if let Some(next) = session.queue.first().cloned()
@@ -978,6 +1728,30 @@ impl Manager {
             return;
         }
         let _ = local.append(id, "state", json!({"state":"idle"}), None);
+    }
+
+    fn snapshot_usage(self: Arc<Self>, id: String, handle: runtime::Handle) {
+        tokio::spawn(async move {
+            let Ok(Some(usage)) = handle.usage().await else {
+                return;
+            };
+            let mut local = self.local.lock().unwrap();
+            if !local.sessions.get(&id).is_some_and(|session| {
+                session
+                    .handle
+                    .as_ref()
+                    .is_some_and(|current| current.same_process(&handle))
+            }) {
+                return;
+            }
+            if usage["sessionId"]
+                .as_str()
+                .is_some_and(|native| local.sessions[&id].native_id.as_deref() != Some(native))
+            {
+                return;
+            }
+            let _ = local.append(&id, "usage", usage, None);
+        });
     }
 
     /// Forward native events into the record path, shutting the harness if recording fails.
@@ -1022,6 +1796,14 @@ impl Manager {
             self.schedule_resume(&mut local, &id)
                 .map_err(|_| io::Error::other("cannot save recovery state"))?;
         }
+        for session in local.sessions.values() {
+            if let Some(request) = session.waiting_start() {
+                let (manager, id) = (self.clone(), session.session_id.clone());
+                tokio::spawn(async move {
+                    manager.launch(id, request).await;
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1037,6 +1819,9 @@ impl Manager {
     }
 
     async fn relaunch(self: Arc<Self>, id: String) {
+        let Ok(_startup) = self.startups.acquire().await else {
+            return;
+        };
         let result = async {
             loop {
                 {
@@ -1080,7 +1865,7 @@ impl Manager {
                     .get(&kind)
                     .ok_or_else(|| io::Error::other("harness not configured"))?;
                 // Capture any final orphan writes after ownership reconciliation.
-                runtime::recover_records(profile, kind, &saved, |event| {
+                runtime::recover_records(profile, kind, &saved, self.config.storage.as_ref(), |event| {
                     if let runtime::Event::Record { kind, data, native } = event {
                         local.append(&id, kind, data, native)?;
                     }
@@ -1097,6 +1882,7 @@ impl Manager {
             self.watch_events(id.clone(), handle.clone(), events);
             handle.start_session().await?;
             let mut local = self.local.lock().unwrap();
+            self.remember_launch_reasoning(&mut local, &id, &handle)?;
             if local.sessions[&id].close_request.is_some() || self.is_stopping() {
                 return Ok(());
             }
@@ -1111,6 +1897,12 @@ impl Manager {
                 None,
             )?;
             local.append(&id, "state", json!({"state":"idle"}), None)?;
+            let retries: Vec<_> = local.sessions[&id].receipts.values()
+                .filter(|r| r.command == "resume" && r.state == "accepted")
+                .map(|r| r.request_id.clone()).collect();
+            for request in retries {
+                local.finish_receipt(&id, &request, "completed").map_err(|_| io::Error::other("cannot record resume outcome"))?;
+            }
             if local.sessions[&id].storage_paused {
                 local.append(
                     &id,
@@ -1123,11 +1915,52 @@ impl Manager {
             Ok::<_, io::Error>(())
         }
         .await;
-        if result.is_err() {
+        if let Err(error) = result {
+            if self.is_stopping() {
+                return;
+            }
             let mut local = self.local.lock().unwrap();
             if local.sessions[&id].close_request.is_none() {
-                let _ = local.append(&id, "state", json!({"state":"process_lost","reason":"native resume or process cleanup failed"}), None);
-                let _ = local.fail_pending(&id);
+                let check = self.recovery_check(&local.sessions[&id]);
+                let (code, reason) = if error.kind() == io::ErrorKind::TimedOut {
+                    (
+                        "startup_timeout",
+                        "Harness startup timed out; saved history and queued prompts are preserved. Retry resume when load settles.",
+                    )
+                } else if check["status"] == "empty" {
+                    (
+                        "empty_session",
+                        "No saved native conversation exists and no turn was dispatched; nothing can be resumed.",
+                    )
+                } else if check["status"] == "missing" {
+                    (
+                        "missing_history",
+                        "Saved native conversation is missing; refusing to replace it or replay work.",
+                    )
+                } else {
+                    (
+                        "resume_failed",
+                        "Native resume failed; inspect native history and protected local harness diagnostics for this session, then retry explicitly after correcting the cause.",
+                    )
+                };
+                let _ = local.append(
+                    &id,
+                    "state",
+                    json!({"state":"process_lost","reason":reason,"startup_error":code}),
+                    None,
+                );
+                if code != "startup_timeout" {
+                    let _ = local.fail_pending(&id);
+                }
+                let retries: Vec<_> = local.sessions[&id]
+                    .receipts
+                    .values()
+                    .filter(|r| r.command == "resume" && r.state == "accepted")
+                    .map(|r| r.request_id.clone())
+                    .collect();
+                for request in retries {
+                    let _ = local.finish_receipt(&id, &request, "failed");
+                }
             }
             if let Some(handle) = local.sessions[&id].handle.as_ref() {
                 handle.request_shutdown();
@@ -1150,8 +1983,67 @@ impl Manager {
             return Ok(());
         }
         match event {
+            runtime::Event::ChildRequest(child) => {
+                self.start_child(&mut local, id, handle, child)?;
+            }
+            runtime::Event::Record {
+                kind: "rewind_ready",
+                mut data,
+                ..
+            } => {
+                let request = local.sessions[id]
+                    .rewind_request
+                    .clone()
+                    .ok_or(Error::Conflict("unexpected native replacement"))?;
+                let input = local.sessions[id].receipts[&request].input.clone();
+                data["request_id"] = json!(request);
+                data["before"] = input["before"].clone();
+                if let Some(replacement) = input.get("replacement") {
+                    data["replacement"] = json!(Receipt {
+                        request_id: replacement["request_id"]
+                            .as_str()
+                            .ok_or(Error::Conflict("invalid replacement"))?
+                            .into(),
+                        command: "prompt".into(),
+                        input: replacement["input"].clone(),
+                        state: "accepted".into(),
+                        model: None,
+                        provider: None,
+                        workspace: None,
+                        error: None,
+                    });
+                }
+                local.append(id, "rewind", data, None)?;
+                self.advance(&mut local, id, true);
+            }
             runtime::Event::Record { kind, data, native } => {
+                let usage = data.get("usage").cloned().filter(|value| !value.is_null());
                 local.append(id, kind, data, native)?;
+                if let Some(usage) = usage {
+                    let _ = local.append(id, "usage", usage, None);
+                }
+            }
+            runtime::Event::Compacted { status } => {
+                if let Some(request) = local.sessions[id].compact_request.clone() {
+                    let status = match status.as_str() {
+                        "completed" => "completed",
+                        "interrupted" => "interrupted",
+                        _ => "failed",
+                    };
+                    if status == "failed" {
+                        local
+                            .sessions
+                            .get_mut(id)
+                            .unwrap()
+                            .receipts
+                            .get_mut(&request)
+                            .unwrap()
+                            .error = Some("Context compaction failed; see native history".into());
+                    }
+                    local.finish_receipt(id, &request, status)?;
+                    self.clone().snapshot_usage(id.to_owned(), handle.clone());
+                    self.advance(&mut local, id, false);
+                }
             }
             runtime::Event::Started {
                 request,
@@ -1171,6 +2063,15 @@ impl Manager {
             }
             runtime::Event::Finished { request, status } => {
                 if local.sessions[id].current_request.as_deref() == Some(&request) {
+                    let session = &local.sessions[id];
+                    let checkpoint = session
+                        .current_turn
+                        .clone()
+                        .map(|turn| json!({"kind":"turn","id":turn,"request_id":request}));
+                    if let Some(checkpoint) = checkpoint {
+                        let _ = local.append(id, "checkpoint", checkpoint, None);
+                    }
+                    self.clone().snapshot_usage(id.to_owned(), handle.clone());
                     if let Some(request) = local.sessions[id].current_request.clone() {
                         local.finish_receipt(id, &request, &status)?;
                     }
@@ -1181,19 +2082,28 @@ impl Manager {
                 reason,
                 expected,
                 cleaned_up,
+                details,
             } => {
-                self.observability.record(Signal::AgentExit {
-                    session_id: id.into(),
-                    expected,
+                let diagnostic_id = self.observability.agent_exit(
+                    Some(id),
+                    local.sessions[id].harness,
                     reason,
-                });
+                    expected,
+                    details,
+                );
                 let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
-                let resumable = cleaned_up && session.ready && session.can_resume();
+                let restoring = session.state == "resuming"
+                    && session.native_id.is_some()
+                    && session.native_path.is_some();
+                let resumable = cleaned_up
+                    && ((session.ready && session.can_resume())
+                        || (self.is_stopping() && restoring));
                 let recover = resumable && !self.is_stopping() && !session.recovery_attempted;
                 session.handle = None;
                 session.ready = false;
                 let request = session.current_request.clone();
                 let close = session.close_request.clone();
+                let preserve_queue = session.startup_error.as_deref() == Some("startup_timeout");
                 let interrupts: Vec<_> = session
                     .receipts
                     .values()
@@ -1227,7 +2137,12 @@ impl Manager {
                 } else {
                     "process_lost"
                 };
-                local.append(id, "state", json!({"state":state,"reason":reason}), None)?;
+                local.append(
+                    id,
+                    "state",
+                    json!({"state":state,"reason":reason,"diagnostic_id":diagnostic_id}),
+                    None,
+                )?;
                 if let Some(request) = close {
                     local.finish_receipt(
                         id,
@@ -1235,7 +2150,7 @@ impl Manager {
                         if expected { "completed" } else { "unknown" },
                     )?;
                 }
-                if state != "suspended" {
+                if state != "suspended" && !preserve_queue {
                     local.fail_pending(id)?;
                 }
                 if recover {
@@ -1247,7 +2162,7 @@ impl Manager {
     }
 
     pub async fn check_storage(&self) -> Snapshot {
-        self.storage.refresh(&self.config).await
+        self.storage.refresh(&self.config, &self.workspaces).await
     }
 
     fn has_storage_warning(&self) -> bool {
@@ -1282,7 +2197,11 @@ impl Manager {
                             .collect();
                         let mut warnings = Vec::new();
                         for id in ids {
-                            let text = "Cloudroom: storage is running low. New execution is blocked. Avoid large writes; work may pause while safe cleanup runs. Your files and history will not be deleted.";
+                            let text = if snapshot.level == Level::Blocked {
+                                "Cloudroom: disk space is critically low or could not be measured. Work is paused until storage recovers. Your files and history are preserved."
+                            } else {
+                                "Cloudroom: disk space is running low. Work and sync continue. Remove disposable files or add storage; large writes may trigger an emergency pause."
+                            };
                             // Persist before delivery. A timed-out native notification is not blindly repeated.
                             if local
                                 .append(
@@ -1321,38 +2240,41 @@ impl Manager {
                             None,
                         );
                     }
-                    if snapshot.level == Level::Blocked {
-                        let handles: Vec<_> = manager
-                            .local
-                            .lock()
-                            .unwrap()
-                            .sessions
-                            .values()
-                            .filter_map(|s| s.handle.clone().map(|h| (s.session_id.clone(), h)))
-                            .collect();
-                        let mut all_paused = true;
-                        for (id, handle) in handles {
-                            if handle.pause(true).await.is_ok() {
-                                let mut local = manager.local.lock().unwrap();
-                                if !local.sessions[&id].storage_paused {
-                                    let _ = local.append(
+                }
+                if snapshot.level == Level::Blocked {
+                    let handles: Vec<_> = manager
+                        .local
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .values()
+                        .filter_map(|s| s.handle.clone().map(|h| (s.session_id.clone(), h)))
+                        .collect();
+                    let mut all_paused = manager.storage.pause_writers(true).await.is_ok();
+                    for (id, handle) in handles {
+                        if handle.pause(true).await.is_ok() {
+                            let mut local = manager.local.lock().unwrap();
+                            if !local.sessions[&id].storage_paused {
+                                let _ = local.append(
                                         &id,
                                         "storage_pause",
-                                        json!({"paused":true}),
+                                        json!({"paused":true,"text":"Cloudroom: work paused because disk space is critically low or could not be measured. Your files and history are preserved."}),
                                         None,
                                     );
-                                }
-                            } else {
-                                all_paused = false;
                             }
-                        }
-                        if all_paused && last_cleanup.elapsed() >= Duration::from_secs(30) {
-                            let _ = manager.storage.clean().await;
-                            last_cleanup = Instant::now();
+                        } else {
+                            all_paused = false;
                         }
                     }
+                    if all_paused && last_cleanup.elapsed() >= Duration::from_secs(30) {
+                        let _ = manager.storage.clean().await;
+                        last_cleanup = Instant::now();
+                    }
                     was_blocked = true;
-                } else if was_blocked || manager.has_storage_warning() {
+                } else if was_blocked
+                    || (snapshot.level == Level::Normal && manager.has_storage_warning())
+                {
+                    let writers_resumed = manager.storage.pause_writers(false).await.is_ok();
                     let handles: Vec<_> = manager
                         .local
                         .lock()
@@ -1364,13 +2286,19 @@ impl Manager {
                     for (id, handle) in handles {
                         if handle.pause(false).await.is_ok() {
                             let mut local = manager.local.lock().unwrap();
-                            let _ = local.append(&id, "storage_recovered", json!({"text":"Cloudroom: storage is available again. Paused work can continue."}), None);
-                            manager.advance(&mut local, &id, false);
+                            let result = if snapshot.level == Level::Normal {
+                                local.append(&id, "storage_recovered", json!({"text":"Cloudroom: disk space has recovered. Work can continue."}), None)
+                            } else {
+                                local.append(&id, "storage_pause", json!({"paused":false,"text":"Cloudroom: work resumed. Disk space is still low."}), None)
+                            };
+                            if result.is_ok() {
+                                manager.advance(&mut local, &id, false);
+                            }
                         }
                     }
                     // Resume only workloads this guard actually paused. Process-loss
                     // recovery remains the separate lifecycle owner's responsibility.
-                    was_blocked = false;
+                    was_blocked = !writers_resumed;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }

@@ -145,8 +145,9 @@ pub(crate) fn as_agent(_: &mut Command, _: u32, _: u32, _: Option<&Path>) -> io:
 pub(super) async fn reply<T>(
     mut result: tokio::sync::oneshot::Receiver<T>,
     mut paused: watch::Receiver<bool>,
+    timeout: Duration,
 ) -> io::Result<T> {
-    let mut remaining = Duration::from_secs(30);
+    let mut remaining = timeout;
     loop {
         if *paused.borrow() {
             tokio::select! {
@@ -157,7 +158,7 @@ pub(super) async fn reply<T>(
             let start = tokio::time::Instant::now();
             tokio::select! {
                 value = &mut result => return value.map_err(|_| io::Error::other("harness response lost; outcome uncertain")),
-                _ = tokio::time::sleep(remaining) => return Err(io::Error::other("harness response timed out; outcome uncertain")),
+                _ = tokio::time::sleep(remaining) => return Err(io::Error::new(io::ErrorKind::TimedOut, "harness response timed out; outcome uncertain")),
                 changed = paused.changed() => if changed.is_err() { return Err(io::Error::other("workload owner lost")); },
             }
             remaining = remaining.saturating_sub(start.elapsed());

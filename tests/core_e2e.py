@@ -291,13 +291,18 @@ def main():
                    "CLOUDROOM_TOKEN": secrets.token_hex(32), "CLOUDROOM_STATE_DIR": str(root / "state"),
                    "CLOUDROOM_REPOSITORY": str(repo), "CLOUDROOM_DATABASE_URL": f"postgres://postgres:{password}@127.0.0.1:{port}/cloudroom_core_test",
                    "CLOUDROOM_STORE": name, "CLOUDROOM_ALLOW_INSECURE_DATABASE": "1",
-                   "CLOUDROOM_CODEX_BINARY": str(ROOT / "tests/core_fixture.py") if args.fixture else "/usr/local/bin/codex", "CLOUDROOM_ACCOUNT_HOME": str(home),
-                   "CLOUDROOM_CODEX_HOME": str(codex_home), "CLOUDROOM_MODEL": model, "CLOUDROOM_MAX_HARNESSES": "2",
+                   "CLOUDROOM_CODEX_BINARY": str(ROOT / "tests/core_fixture.py") if (args.foundation or args.fixture) else "/usr/local/bin/codex", "CLOUDROOM_ACCOUNT_HOME": str(home),
+                   "CLOUDROOM_CODEX_HOME": str(codex_home), "CLOUDROOM_MODEL": model,
                    "DATABASE_ADMIN_SECRET": "must-not-reach-harness", "BB_CONTROL_SECRET": "must-not-reach-harness"}
             if args.harness == "pi":
                 env.pop("CLOUDROOM_CODEX_BINARY"); env.pop("CLOUDROOM_CODEX_HOME")
                 env.update(CLOUDROOM_HARNESS="pi", CLOUDROOM_PI_BINARY=os.environ.get("CLOUDROOM_TEST_PI_BINARY", "/usr/local/bin/pi"),
                            CLOUDROOM_PI_HOME=str(codex_home), CLOUDROOM_PI_PROVIDER=os.environ.get("CLOUDROOM_TEST_PI_PROVIDER", "openai-codex"))
+            if args.fixture:
+                pi_home = home / ".pi/agent"
+                pi_home.mkdir(parents=True)
+                env.update(CLOUDROOM_PI_BINARY=str(ROOT / "tests/pi_fixture.py"),
+                           CLOUDROOM_PI_HOME=str(pi_home), CLOUDROOM_PI_PROVIDER="default-provider", CLOUDROOM_PI_MODEL="fixture")
             service = Service(env, root / "service.log").start()
             def local_diagnostics():
                 records = []
@@ -324,7 +329,32 @@ def main():
                 run("docker", "exec", "-i", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1",
                     input=(MIGRATIONS / "0002-diagnostics.sql").read_text())
                 session_checks(service, root)
-                passed("acceptance wakes quiet SSE; idle/active close, safe retry, capacity release, peer isolation and shutdown")
+                assert next(h for h in service.request("GET", "/v1/capabilities")["harnesses"] if h["id"] == "pi")["provider_selection"]
+                pi_sessions = []
+                for provider in [None, "other-provider"]:
+                    request = {"request_id": "pi-" + str(provider), "harness": "pi", "model": "family/test-model", "reasoning": "high"}
+                    if provider:
+                        request["provider"] = provider
+                    sid = service.request("POST", "/v1/sessions", request, 202)["session_id"]
+                    until(lambda: service.session(sid)["state"] == "idle", "selected Pi provider")
+                    assert service.session(sid)["provider"] == (provider or "default-provider")
+                    service.request("POST", "/v1/sessions", request, 202)
+                    service.request("POST", "/v1/sessions", {**request, "provider": "changed-provider"}, 409)
+                    pi_sessions.append((sid, provider or "default-provider", service.session(sid)["native_id"]))
+                for harness, provider in [("codex", "other-provider"), ("pi", ""), ("pi", "bad/provider")]:
+                    assert service.request("POST", "/v1/sessions", {"request_id": "invalid-provider", "harness": harness, "provider": provider}, 409)["code"] == "invalid_provider"
+                service.stop()
+                service.env["CLOUDROOM_PI_PROVIDER"] = "changed-default"
+                service.start()
+                for sid, provider, native in pi_sessions:
+                    until(lambda: service.session(sid)["state"] == "idle", "saved Pi provider after restart")
+                    assert service.session(sid)["provider"] == provider and service.session(sid)["native_id"] == native
+                    frames = [json.loads(r["native"]) for r in service.records(sid) if r.get("native") and r["kind"] != "native_record"]
+                    assert any(f.get("command") == "get_state" and f.get("data", {}).get("model", {}).get("provider") == provider for f in frames)
+                    service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "followup", "text": "hello"}, 202)
+                    until(lambda: service.session(sid)["receipts"]["followup"]["state"] == "completed", "Pi provider follow-up")
+                passed("Pi selects providers per session; retries and restart preserve native provider, model and identity")
+                passed("acceptance wakes quiet SSE; idle/active close, safe retry, parallel sessions, peer isolation and shutdown")
                 check_database_pagination(service, name, name)
                 passed("bounded database replay with complete late metadata and latest receipts")
                 return
@@ -426,7 +456,10 @@ def main():
             assert second_harness not in before_second and second_harness in second_children
             assert Path(f"/proc/{second_harness}/stat").read_text().rsplit(")", 1)[1].split()[1] == str(service.process.pid)
             second_identity = second_children[second_harness]
-            service.request("POST", "/v1/sessions", {"request_id": "capacity"}, 409)
+            third = service.request("POST", "/v1/sessions", {"request_id": "third-session"}, 202)["session_id"]
+            until(lambda: service.session(third)["state"] == "idle", "third live session", 45)
+            service.request("POST", f"/v1/sessions/{third}/close", {"request_id": "close-third"}, 202)
+            until(lambda: service.session(third)["state"] == "closed", "third session closed")
             service.request("POST", f"/v1/sessions/{sid2}/prompts", {"request_id": "independent", "text": "Run exactly python3 stop-job.py other in the foreground. Wait for it to finish. Do not edit the script, spawn agents or do any other work."}, 202)
             until(lambda: (repo / "other.ticks").exists(), "second running tool")
             target_pid = (repo / "interrupt.pid").read_text()
@@ -464,10 +497,13 @@ def main():
             assert body["text"] not in json.dumps(diagnostics())
             passed("real harness crash automatically resumes the same native conversation; follow-up succeeds; diagnostics contain no conversation copies")
             service.request("POST", f"/v1/sessions/{sid2}/close", {"request_id": "close-recovered"}, 202)
-            until(lambda: service.session(sid2)["state"] == "closed", "release recovered session capacity")
+            until(lambda: service.session(sid2)["state"] == "closed", "recovered session closed")
             close_id = service.request("POST", "/v1/sessions", {"request_id": "close-idle"}, 202)["session_id"]
             until(lambda: service.session(close_id)["state"] == "idle", "idle close candidate", 45)
-            service.request("POST", "/v1/sessions", {"request_id": "still-full"}, 409)
+            extra = service.request("POST", "/v1/sessions", {"request_id": "alongside-idle"}, 202)["session_id"]
+            until(lambda: service.session(extra)["state"] == "idle", "idle peers do not block starts", 45)
+            service.request("POST", f"/v1/sessions/{extra}/close", {"request_id": "close-extra"}, 202)
+            until(lambda: service.session(extra)["state"] == "closed", "extra session closed")
             close = {"request_id": "close"}
             service.request("POST", f"/v1/sessions/{close_id}/close", close, 202)
             until(lambda: service.session(close_id)["state"] == "closed" and service.session(close_id)["receipts"]["close"]["state"] == "completed", "idle close completion")
@@ -486,7 +522,7 @@ def main():
             time.sleep(.5)
             assert (repo / "closing.ticks").read_text() == close_tick
             assert service.session(sid)["native_id"] == native_id and service.session(sid)["state"] == "idle"
-            passed("real idle/active session close, stable retries, released capacity and tool exit before cleanup")
+            passed("real idle/active session close, stable retries, parallel sessions and tool exit before cleanup")
             run("docker", "stop", "-t", "5", name)
             outage = {"request_id": "outage", "text": "Run this shell command: python3 -c \"from pathlib import Path; import time; p=Path('counter.txt'); p.open('a').write('outage\\n'); Path('outage-started').write_text('ready'); time.sleep(45); Path('after-crash').write_text('bad')\". Wait for it to finish. Do not spawn agents or do other work."}
             service.request("POST", f"/v1/sessions/{sid}/prompts", outage, 202)

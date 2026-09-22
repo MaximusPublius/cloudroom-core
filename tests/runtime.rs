@@ -1,6 +1,7 @@
 use cloudroom::{config::Config, runtime};
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -42,10 +43,168 @@ fn fixture() -> (Directory, Config) {
             },
         )]
         .into(),
-        max_harnesses: 1,
         storage: None,
     };
     (dir, config)
+}
+
+async fn capture_stderr(script: &str, shutdown: bool) -> runtime::ExitDetails {
+    let (dir, mut config) = fixture();
+    let binary = dir.0.join("stderr-harness");
+    fs::write(
+        &binary,
+        format!("#!/usr/bin/env python3\nimport os, sys, time, signal\n{script}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    config
+        .harnesses
+        .get_mut(&runtime::Kind::Codex)
+        .unwrap()
+        .binary = binary;
+    let (handle, mut events) = runtime::Handle::spawn(&config, runtime::Kind::Codex, None).unwrap();
+    if shutdown {
+        handle.request_shutdown();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let runtime::Event::Exited {
+                details, expected, ..
+            } = event
+            {
+                assert_eq!(expected, shutdown);
+                return details;
+            }
+        }
+        panic!("missing exit details");
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn stderr_keeps_bounded_final_bytes_and_separates_concurrent_harnesses() {
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..4 {
+        tasks.spawn(async move {
+            let marker = format!("PRIVATE-STDERR-{n}");
+            let script = format!(
+                "data = b'x' * (1024 * 1024) + b'\\xff\\x00' + {marker:?}.encode()\nwhile data:\n n = os.write(2, data); data = data[n:]\nos._exit(42)"
+            );
+            let details = capture_stderr(&script, false).await;
+            assert_eq!((details.code, details.signal), (Some(42), None));
+            assert!(details.stderr_complete);
+            assert_eq!(details.stderr_bytes, (1024 * 1024 + 2 + marker.len()) as u64);
+            let expected = [vec![b'x'; 16 * 1024 - 2 - marker.len()], vec![0xff, 0], marker.into_bytes()].concat();
+            assert_eq!(details.stderr(), expected);
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stderr_survives_stdout_eof_signals_and_clean_shutdown() {
+    for (script, shutdown, code, signal) in [
+        (
+            "os.close(1)\ntime.sleep(.05)\nos.write(2, b'FINAL')\nos._exit(42)",
+            false,
+            Some(42),
+            None,
+        ),
+        (
+            "os.write(2, b'FINAL')\nos.kill(os.getpid(), signal.SIGTERM)",
+            false,
+            None,
+            Some(15),
+        ),
+        (
+            "sys.stdin.buffer.read()\nos.write(2, b'FINAL')",
+            true,
+            Some(0),
+            None,
+        ),
+    ] {
+        let details = capture_stderr(script, shutdown).await;
+        assert_eq!((details.code, details.signal), (code, signal));
+        assert_eq!(details.stderr(), b"FINAL");
+        assert!(details.stderr_complete);
+    }
+}
+
+#[tokio::test]
+async fn inherited_stderr_cannot_hold_exit_and_marks_capture_incomplete() {
+    let details = capture_stderr(
+        "if os.fork() == 0:\n time.sleep(2); os._exit(0)\nos.write(2, b'BEFORE-EXIT')\nos._exit(42)",
+        false,
+    ).await;
+    // Allow the synthetic orphan to finish before this test returns, even on assertion failure.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(details.code, Some(42));
+    assert_eq!(details.stderr(), b"BEFORE-EXIT");
+    assert!(!details.stderr_complete);
+}
+
+#[test]
+fn native_recovery_rejects_links_and_special_files_but_reads_valid_history() {
+    use std::os::unix::fs::symlink;
+    let (dir, config) = fixture();
+    let profile = &config.harnesses[&runtime::Kind::Codex];
+    let root = profile.home.join("sessions");
+    fs::create_dir(&root).unwrap();
+    let outside = dir.0.join("service-secret");
+    fs::write(&outside, "SYNTHETIC_PROTECTED_SECRET\n").unwrap();
+    let capture = |path: PathBuf| {
+        let saved = runtime::Resume {
+            id: "fixture".into(),
+            path,
+            cursor: serde_json::json!({"offset":0}),
+            model: None,
+            provider: None,
+            reasoning: None,
+        };
+        let mut contents = String::new();
+        let result =
+            runtime::recover_records(profile, runtime::Kind::Codex, &saved, None, |event| {
+                if let runtime::Event::Record {
+                    native: Some(raw), ..
+                } = event
+                {
+                    contents.push_str(&raw);
+                }
+                Ok(())
+            });
+        (result, contents)
+    };
+    let valid = root.join("valid.jsonl");
+    fs::write(&valid, "{\"safe\":true}\n").unwrap();
+    let (result, contents) = capture(valid);
+    result.unwrap();
+    assert_eq!(contents, "{\"safe\":true}\n");
+    let linked = root.join("linked.jsonl");
+    symlink(&outside, &linked).unwrap();
+    let ancestor = root.join("ancestor");
+    symlink(&dir.0, &ancestor).unwrap();
+    let fifo = root.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for path in [
+        outside,
+        linked,
+        ancestor.join("service-secret"),
+        fifo,
+        root.clone(),
+    ] {
+        let (result, contents) = capture(path);
+        assert!(result.is_err(), "unsafe history was accepted");
+        assert!(contents.is_empty(), "unsafe bytes were emitted");
+    }
 }
 
 #[tokio::test]
@@ -58,13 +217,10 @@ async fn workload_cleanup_requires_confirmed_empty_group() {
     config.storage = Some(cloudroom::workspace::storage::Policy {
         agent_uid: 1,
         agent_gid: 1,
-        quota_mount: "/".into(),
-        quota_limit_bytes: 1024,
         cache_dir: dir.0.join("cache"),
         cgroup_root: root.clone(),
-        reserve_bytes: 1,
-        warning_bytes: 2,
-        pause_bytes: 1,
+        warning_bytes: 5,
+        pause_bytes: 2,
         resume_bytes: 3,
     });
     let caller = config.clone();
