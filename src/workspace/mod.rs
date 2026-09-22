@@ -366,6 +366,8 @@ fn file_result(output: std::process::Output) -> io::Result<serde_json::Value> {
     if !output.status.success() || result["ok"] != true {
         return Err(if result["error"] == "attachment_too_large" {
             io::ErrorKind::FileTooLarge.into()
+        } else if result["error"] == "attachment_conflict" {
+            io::ErrorKind::AlreadyExists.into()
         } else {
             result["errno"]
                 .as_i64()
