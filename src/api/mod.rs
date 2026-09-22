@@ -597,12 +597,16 @@ async fn attach(
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
     if let Some(receipt) = manager.receipt(&id, &query.request_id) {
-        if receipt.command != "attach" {
+        if receipt.command != "attach"
+            || receipt.input["name"].as_str() != Some(query.name.as_str())
+            || receipt.input["kind"].as_str() != Some(query.kind.as_str())
+        {
             return Err(session::Error::Conflict(
                 "request_id already has different content",
             ));
         }
-        return Ok(accepted(&manager, &id, receipt));
+        // Continue through storage so an exact retry verifies the submitted bytes
+        // against the already-saved attachment before returning the old receipt.
     }
     let session = manager.session(&id).await?;
     let workspace = session
@@ -640,6 +644,7 @@ async fn attach(
             );
             session::Error::Conflict(match error.kind() {
                 std::io::ErrorKind::WouldBlock => "storage unsafe; uploads are blocked",
+                std::io::ErrorKind::AlreadyExists => "request_id already has different content",
                 std::io::ErrorKind::PermissionDenied => "Cloud folder permission denied",
                 std::io::ErrorKind::FileTooLarge if query.kind == "image" => {
                     "image exceeds the 10 MiB limit"
