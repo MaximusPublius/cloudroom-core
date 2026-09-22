@@ -80,6 +80,19 @@ class WorkspaceTests(unittest.TestCase):
         for item in results:
             until(lambda:self.service.session(item['session_id'])['state']=='idle','peer',10)
             self.assertEqual(self.service.session(item['session_id'])['workspace']['path'],str(path))
+        shared = []
+        for index,item in enumerate(results):
+            content = ('peer-'+str(index)).encode()
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST',f"/v1/sessions/{item['session_id']}/attachments?request_id=same-request&name=note.txt&kind=file",content,
+                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            uploaded = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status,202,uploaded)
+            shared.append((uploaded['receipt']['input'],content))
+        self.assertNotEqual(shared[0][0]['path'],shared[1][0]['path'])
+        for uploaded,content in shared:
+            self.assertEqual(Path(uploaded['path']).read_bytes(),content)
         self.assertEqual((path/'keep').read_text(),'cloud work')
         print('Direct empty-folder start + attachment + first prompt (protocol fixtures), seconds:',samples)
 
