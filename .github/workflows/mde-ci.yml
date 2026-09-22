@@ -28,6 +28,9 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --all-targets
 
+      - name: Prepare disposable PostgreSQL fixture
+        run: docker pull postgres:16-alpine
+
       - name: Workspace and recovery tests
         run: |
           python3 tests/core_fixture.py
