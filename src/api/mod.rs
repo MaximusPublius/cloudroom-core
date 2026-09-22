@@ -623,6 +623,7 @@ async fn attach(
         .workspaces
         .attach(
             &workspace,
+            &id,
             &query.request_id,
             &query.name,
             &query.kind,
