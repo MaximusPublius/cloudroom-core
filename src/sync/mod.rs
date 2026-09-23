@@ -141,6 +141,9 @@ impl Sync {
                 None,
             ),
             "skills-claude" => (home.join(".claude/skills"), "skills", None),
+            "skills-cursor" => (home.join(".cursor/skills"), "skills", None),
+            "rules-cursor" => (home.join(".cursor/rules"), "skills", None),
+            "settings-cursor" => (home.join(".cursor"), "cursor", Some("cli-config.json")),
             "settings-codex" => (
                 profile(runtime::Kind::Codex, ".codex"),
                 "codex",
@@ -152,11 +155,6 @@ impl Sync {
                 Some("settings.json"),
             ),
             "settings-claude" => (home.join(".claude"), "claude", Some("settings.json")),
-            "auth-codex" => (
-                profile(runtime::Kind::Codex, ".codex"),
-                "auth",
-                Some("auth.json"),
-            ),
             _ => return Err(Failure(StatusCode::GONE)),
         };
         Ok(json!({"root":root,"kind":kind,"filename":filename}))

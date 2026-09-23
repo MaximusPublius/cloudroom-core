@@ -10,7 +10,14 @@ use std::{
     time::Duration,
 };
 use tokio::{process::Command, sync::mpsc};
+pub(crate) mod auth;
+mod claude;
+pub(crate) mod claude_auth;
+mod claude_skills;
 mod codex;
+mod command_guard;
+pub(crate) mod cursor;
+pub(crate) mod cursor_auth;
 mod files;
 pub(crate) mod linux;
 mod pi;
@@ -26,6 +33,9 @@ pub enum Kind {
     #[default]
     Codex,
     Pi,
+    Cursor,
+    #[serde(rename = "claude-code")]
+    Claude,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -36,8 +46,16 @@ pub struct Model {
 
 pub const PI_REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 
+pub async fn claude_auth_ready(config: &Config) -> io::Result<bool> {
+    claude::auth_ready(config).await
+}
+
 pub async fn codex_models(config: &Config) -> (io::Result<Vec<Model>>, Option<Event>) {
-    let (handle, mut events) = match Handle::spawn(config, Kind::Codex, None) {
+    models(config, Kind::Codex).await
+}
+
+pub async fn models(config: &Config, kind: Kind) -> (io::Result<Vec<Model>>, Option<Event>) {
+    let (handle, mut events) = match Handle::spawn(config, kind, None) {
         Ok(spawned) => spawned,
         Err(error) => return (Err(error), None),
     };
@@ -49,10 +67,16 @@ pub async fn codex_models(config: &Config) -> (io::Result<Vec<Model>>, Option<Ev
         }
         None
     });
-    let result = tokio::time::timeout(Duration::from_secs(10), codex::models(&handle))
-        .await
-        .map_err(|_| io::Error::other("model discovery timed out"))
-        .and_then(|result| result);
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        match kind {
+            Kind::Codex => codex::models(&handle).await,
+            Kind::Claude => claude::model_catalog(&claude::initialize(&handle).await?),
+            _ => Err(io::Error::other("harness uses its own model catalog")),
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("model discovery timed out"))
+    .and_then(|result| result);
     handle.request_shutdown();
     (result, drain.await.ok().flatten())
 }
@@ -75,6 +99,9 @@ pub struct ChildRequest {
 }
 
 pub enum Event {
+    Authentication {
+        accepted: bool,
+    },
     ChildRequest(ChildRequest),
     Record {
         kind: &'static str,
@@ -125,6 +152,8 @@ struct Progress {
     finished: bool,
     status: String,
     last_usage: Value,
+    last_text: String,
+    model: Option<String>,
     processes: HashSet<String>,
 }
 impl Progress {
@@ -154,6 +183,9 @@ impl Progress {
 
 // Protocol differences stay here, not in Session Management or the process driver.
 trait Adapter: Send {
+    fn validate(&self, _method: &str, _params: &Value) -> io::Result<()> {
+        Ok(())
+    }
     fn encode(&mut self, id: u64, method: &str, params: Value, request: Option<&str>) -> Value;
     fn receive(
         &mut self,
@@ -175,6 +207,9 @@ trait Adapter: Send {
     fn closed(&mut self, _value: &Value) -> bool {
         false
     }
+    fn clean_exit(&self, code: Option<i32>) -> bool {
+        code == Some(0)
+    }
 }
 
 #[derive(Clone)]
@@ -190,6 +225,8 @@ pub struct Handle {
     reasoning: Option<String>,
     baseline: Arc<Mutex<Option<String>>>,
     rpc_timeout: Duration,
+    command_guard_enabled: bool,
+    controls: Arc<tokio::sync::Mutex<()>>,
 }
 impl Handle {
     pub fn spawn(
@@ -197,13 +234,32 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
+        Self::spawn_guarded(config, kind, resume, true)
+    }
+
+    pub fn spawn_guarded(
+        config: &Config,
+        kind: Kind,
+        resume: Option<Resume>,
+        command_guard_enabled: bool,
+    ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
+        Self::spawn_inner(config, kind, resume, command_guard_enabled, None)
+    }
+
+    fn spawn_inner(
+        config: &Config,
+        kind: Kind,
+        resume: Option<Resume>,
+        command_guard_enabled: bool,
+        fork: Option<&str>,
+    ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
         let mut profile = config
             .harnesses
             .get(&kind)
             .cloned()
             .ok_or_else(|| io::Error::other("harness not configured"))?;
         if let Some(saved) = &resume {
-            check_resume_history(&profile, saved, config.storage.as_ref())?;
+            check_resume_history(kind, &profile, saved, config.storage.as_ref())?;
             if let Some(model) = &saved.model {
                 profile.model = model.clone();
             }
@@ -214,8 +270,28 @@ impl Handle {
         let file_identity = config.storage.as_ref().map(|p| (p.agent_uid, p.agent_gid));
         let (command, adapter, session_file, context_file): (_, Box<dyn Adapter>, _, _) = match kind
         {
+            Kind::Claude => {
+                let (command, id) = claude::command(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    fork,
+                    command_guard_enabled,
+                )?;
+                let saved = resume.as_ref().filter(|_| fork.is_none());
+                (
+                    command,
+                    Box::new(claude::Protocol::new(&profile, id, saved, file_identity)?),
+                    None,
+                    None,
+                )
+            }
             Kind::Codex => (
-                codex::command(config, &profile),
+                if command_guard_enabled {
+                    command_guard::codex_command(config, &profile)
+                } else {
+                    codex::command(config, &profile)
+                },
                 Box::new(codex::Protocol::new(
                     &profile,
                     resume.as_ref(),
@@ -224,8 +300,15 @@ impl Handle {
                 None,
                 None,
             ),
+            Kind::Cursor => (
+                cursor::command(config, &profile, command_guard_enabled)?,
+                Box::new(cursor::Protocol::new(config, &profile, resume.as_ref())),
+                None,
+                None,
+            ),
             Kind::Pi => {
-                let (command, path, helper) = pi::command(config, &profile, resume.as_ref())?;
+                let (command, path, helper) =
+                    pi::command(config, &profile, resume.as_ref(), command_guard_enabled)?;
                 (
                     command,
                     Box::new(pi::Protocol::new(
@@ -250,6 +333,8 @@ impl Handle {
                 reasoning: resume.as_ref().and_then(|saved| saved.reasoning.clone()),
                 baseline: Arc::new(Mutex::new(None)),
                 rpc_timeout: Duration::from_secs(30),
+                command_guard_enabled,
+                controls: Arc::new(tokio::sync::Mutex::new(())),
                 resume,
                 session_file,
                 context_file,
@@ -280,9 +365,26 @@ impl Handle {
     pub fn provider(&self) -> Option<&str> {
         self.profile.provider.as_deref()
     }
+    pub fn native_identity(&self, id: &str) -> io::Result<Value> {
+        let model = self
+            .process
+            .progress
+            .borrow()
+            .model
+            .clone()
+            .unwrap_or_else(|| self.profile.model.clone());
+        let mut data = json!({"id":id,"model":model,"provider":self.provider(),"capabilities":self.capabilities()});
+        if self.kind == Kind::Claude {
+            data["path"] = json!(self.native_location()?);
+        }
+        Ok(data)
+    }
     pub fn capabilities(&self) -> Value {
+        if self.kind == Kind::Cursor {
+            return cursor::capabilities();
+        }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
-            "steer":true,"compact":true,"rewind":true,"attachments":true,
+            "steer":self.kind!=Kind::Claude,"compact":true,"rewind":true,"attachments":true,
             "service_tier":self.kind==Kind::Codex,"subagents":true,"usage":true})
     }
     pub async fn start_session(&self) -> io::Result<String> {
@@ -291,6 +393,8 @@ impl Handle {
         match self.kind {
             Kind::Codex => codex::start(&startup).await,
             Kind::Pi => pi::start(&startup).await,
+            Kind::Claude => claude::start(&startup).await,
+            Kind::Cursor => cursor::start(&startup).await,
         }
     }
     /// Pi confirms the turn's thinking level before the prompt. Codex sends effort with turn/start.
@@ -309,6 +413,8 @@ impl Handle {
         match self.kind {
             Kind::Codex => codex::send(self, request, input).await,
             Kind::Pi => pi::send(self, request, input).await,
+            Kind::Claude => claude::send(self, request, input).await,
+            Kind::Cursor => cursor::send(self, request, input).await,
         }
     }
     pub async fn steer(&self, request: &str, text: &str) -> io::Result<()> {
@@ -322,21 +428,73 @@ impl Handle {
         match self.kind {
             Kind::Codex => codex::steer(self, state, text).await,
             Kind::Pi => pi::steer(self, request, text).await,
+            Kind::Claude => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Claude live steering is not supported",
+            )),
+            Kind::Cursor => cursor::steer(self, request, text).await,
         }
     }
     pub async fn compact(&self) -> io::Result<()> {
         match self.kind {
             Kind::Codex => codex::compact(self).await,
             Kind::Pi => pi::compact(self).await,
+            Kind::Claude => claude::compact(self).await,
+            Kind::Cursor => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cursor ACP compaction is not supported",
+            )),
         }
     }
     pub async fn rewind(&self, input: &Value) -> io::Result<Value> {
         match self.kind {
             Kind::Codex => codex::rewind(self, input).await,
             Kind::Pi => pi::rewind(self, input).await,
+            Kind::Claude => Err(io::Error::other(
+                "Claude rewind requires native process replacement",
+            )),
+            Kind::Cursor => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cursor ACP rewind is not supported",
+            )),
+        }
+    }
+    pub fn rewind_replacement(
+        &self,
+        config: &Config,
+        input: &Value,
+    ) -> io::Result<Option<(Self, mpsc::Receiver<Event>)>> {
+        if self.kind != Kind::Claude {
+            return Ok(None);
+        }
+        let before = input["before"].as_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Claude requires a user-message checkpoint",
+            )
+        })?;
+        let (saved, parent) = claude::fork_source(self, before)?;
+        Self::spawn_inner(
+            config,
+            self.kind,
+            Some(saved),
+            self.command_guard_enabled,
+            Some(&parent),
+        )
+        .map(|(handle, events)| Some((handle.with_reasoning(self.reasoning.clone()), events)))
+    }
+    pub fn native_location(&self) -> io::Result<PathBuf> {
+        match self.kind {
+            Kind::Claude => claude::transcript(&self.profile, &self.native()?),
+            _ => Err(io::Error::other(
+                "native location is delivered by the adapter",
+            )),
         }
     }
     pub async fn child_result(&self, request: &str, result: Value) -> io::Result<()> {
+        if self.kind == Kind::Claude {
+            return claude::child_result(self, request, result).await;
+        }
         self.process
             .control(
                 "prompt",
@@ -347,6 +505,9 @@ impl Handle {
         Ok(())
     }
     pub async fn last_text(&self) -> io::Result<String> {
+        if self.kind == Kind::Claude {
+            return Ok(self.process.progress.borrow().last_text.clone());
+        }
         let result = self.call("get_last_assistant_text", json!({})).await?;
         Ok(result["text"].as_str().unwrap_or_default().to_owned())
     }
@@ -354,6 +515,8 @@ impl Handle {
         match self.kind {
             Kind::Codex => Ok(None),
             Kind::Pi => pi::usage(self).await,
+            Kind::Claude => Ok(Some(self.process.progress.borrow().last_usage.clone())),
+            Kind::Cursor => Ok(None),
         }
     }
     pub async fn interrupt(&self, request: &str) -> io::Result<()> {
@@ -367,12 +530,19 @@ impl Handle {
         match self.kind {
             Kind::Codex => codex::interrupt(self, state).await,
             Kind::Pi => pi::interrupt(self, request).await,
+            Kind::Claude => claude::interrupt(self, request).await,
+            Kind::Cursor => cursor::interrupt(self, state).await,
         }
     }
     pub async fn system_message(&self, text: &str) -> io::Result<()> {
         match self.kind {
             Kind::Codex => codex::notice(self, text).await,
             Kind::Pi => pi::notice(self, text).await,
+            Kind::Claude => claude::notice(self, text).await,
+            Kind::Cursor => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cursor ACP context-only notices are unavailable",
+            )),
         }
     }
     pub async fn pause(&self, paused: bool) -> io::Result<()> {
@@ -397,12 +567,20 @@ impl Handle {
 }
 
 pub fn check_resume_history(
+    kind: Kind,
     profile: &HarnessConfig,
     saved: &Resume,
     policy: Option<&crate::workspace::storage::Policy>,
 ) -> io::Result<()> {
+    if kind == Kind::Cursor {
+        return cursor::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)));
+    }
     let file = files::open(
-        &profile.home.join("sessions"),
+        &profile.home.join(if kind == Kind::Claude {
+            "projects"
+        } else {
+            "sessions"
+        }),
         &saved.path,
         policy.map(|p| (p.agent_uid, p.agent_gid)),
     )?;
@@ -423,6 +601,7 @@ pub fn recover_records(
     emit: impl FnMut(Event) -> io::Result<()>,
 ) -> io::Result<()> {
     match kind {
+        Kind::Cursor => cursor::recover(profile, saved, policy, emit),
         Kind::Codex => codex::recover(
             profile,
             saved,
@@ -430,6 +609,12 @@ pub fn recover_records(
             emit,
         ),
         Kind::Pi => pi::recover(
+            profile,
+            saved,
+            policy.map(|p| (p.agent_uid, p.agent_gid)),
+            emit,
+        ),
+        Kind::Claude => claude::recover(
             profile,
             saved,
             policy.map(|p| (p.agent_uid, p.agent_gid)),
@@ -453,8 +638,9 @@ pub fn checkpoint(
     native: Option<&str>,
 ) -> io::Result<Value> {
     match kind {
-        Kind::Codex => codex::checkpoint(previous, data, native),
+        Kind::Codex | Kind::Claude => files::checkpoint(previous, data, native),
         Kind::Pi => pi::checkpoint(data, native),
+        Kind::Cursor => cursor::checkpoint(previous, data, native),
     }
 }
 

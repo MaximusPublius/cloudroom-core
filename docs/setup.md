@@ -48,6 +48,14 @@ sudo -u cloudroom-agent -H /usr/local/bin/codex login --device-auth
 
 Complete the login in your browser. If device login is unavailable for your account, use [Codex's supported login methods](https://developers.openai.com/codex/auth/) under the same `cloudroom-agent` account. Do not put inference credentials in the service environment.
 
+### Retire standalone shell agents on a managed VM
+
+Keep Codex/Pi setup under the agent account. SSH remains for administration; tasks go through the core API. After shell-owned agents exit, run `sudo python3 install/agent-home.py --shell-user YOUR_SSH_USER` to preview, then repeat with `--apply`.
+
+This preserves the old setup in a root-private archive, copies only missing supported settings, and blocks the administrator's normal Codex/Pi commands and default auth writes. Core logins, processes and histories stay untouched. Conflicts and symlinked settings remain archived for review; do not restore stale tokens automatically. `--check` detects competing shell setup without deleting it. This is an operational guard, not a sandbox against a VM administrator.
+
+New managed templates run `--apply` before service startup: Boat may restore shell settings even with `noEnv`. Recreated files under a previously retired home are archived separately, never used as runtime credentials. Unmarked conflicting setup fails closed. Review provider credential injection separately; do not blindly change a shared environment or erase unrelated credentials.
+
 ## 3. Prepare PostgreSQL
 
 Supply a **dedicated PostgreSQL database outside this VM**, with an owner login and TLS. Any compatible PostgreSQL provider works; Supabase is optional. Never share this database login across unrelated users.

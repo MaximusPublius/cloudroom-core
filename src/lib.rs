@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 mod observability;
+pub mod preview;
 pub mod runtime;
 pub mod session;
 pub mod sync;
@@ -20,8 +21,10 @@ pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error:
     manager.check_storage().await;
     // Reconcile previous workloads before the API or storage guard can start work.
     manager.restore_all().await?;
+    manager.previews.listen().await?;
     manager.start_storage_guard();
     manager.start_uploader();
+    manager.start_auth_monitor();
     eprintln!("Cloudroom listening on {}", listener.local_addr()?);
     let shutdown = manager.clone();
     let mut changed = manager.subscribe();

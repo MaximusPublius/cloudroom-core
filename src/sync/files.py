@@ -27,6 +27,7 @@ DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 PORTABLE = {
     'pi': {'defaultProvider', 'defaultModel', 'defaultThinkingLevel', 'hideThinkingBlock', 'quietStartup'},
     'claude': {'model', 'effortLevel', 'language'},
+    'cursor': {'notifications', 'hints', 'suggestNextPrompt'},
     'codex': {'model', 'model_reasoning_effort', 'model_verbosity', 'personality'},
 }
 
@@ -167,6 +168,86 @@ class Tree:
                     os.unlink(temporary, dir_fd=fd)
                 except FileNotFoundError:
                     pass
+
+    def install_transfer(self, request, stream):
+        relative = request['path']
+        native = request.get('native')
+        digest = hashlib.sha256()
+        count = 0
+        with self.parent(relative, create=True) as (fd, name):
+            temporary = '.teleport-' + uuid.uuid4().hex
+            try:
+                out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+                with os.fdopen(out, 'wb') as output:
+                    if native:
+                        line = stream.readline(16 * 1024 * 1024 + 1)
+                        if len(line) > 16 * 1024 * 1024 or not line.endswith(b'\n'):
+                            raise ValueError('invalid native header')
+                        digest.update(line); count += len(line)
+                        header = json.loads(line)
+                        metadata = header if native['harness'] == 'pi' else header.get('payload', {})
+                        if metadata.get('id') != native['id']:
+                            raise ValueError('native identity mismatch')
+                        if native['harness'] == 'pi':
+                            if header.get('type') != 'session' or header.get('version') != 3:
+                                raise ValueError('unsupported Pi session')
+                        elif header.get('type') != 'session_meta':
+                            raise ValueError('unsupported Codex session')
+                        metadata['cwd'] = native['cwd']
+                        metadata.pop('dynamic_tools', None)
+                        output.write((json.dumps(header, separators=(',', ':')) + '\n').encode())
+                    while chunk := stream.read(CHUNK):
+                        count += len(chunk)
+                        if count > request['size']:
+                            raise Conflict('upload exceeds manifest size')
+                        digest.update(chunk); output.write(chunk)
+                    if count != request['size'] or digest.hexdigest() != request['sha256']:
+                        raise Conflict('upload checksum mismatch')
+                    output.flush(); os.fsync(output.fileno())
+                    os.fchmod(output.fileno(), 0o700 if request.get('executable') else 0o600)
+                try:
+                    os.link(temporary, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+                except FileExistsError:
+                    def checksum(filename):
+                        with os.fdopen(os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as existing:
+                            if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
+                                raise ValueError('expected regular transfer file')
+                            checksum = hashlib.sha256()
+                            while chunk := existing.read(CHUNK): checksum.update(chunk)
+                            return checksum.digest()
+                    if checksum(name) != checksum(temporary):
+                        raise Conflict('transfer destination changed')
+                os.fsync(fd)
+            finally:
+                try: os.unlink(temporary, dir_fd=fd)
+                except FileNotFoundError: pass
+            project_path = request.get('project_path')
+            if project_path:
+                # Incoming bytes are durable. A conflicting directory or unwritable
+                # checkout must not prevent the agent from using the preserved copy.
+                with contextlib.suppress(OSError):
+                    with self.parent(project_path, create=True) as (target_fd, target_name):
+                        staged = '.teleport-' + uuid.uuid4().hex
+                        try:
+                            with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as incoming:
+                                if request.get('symlink'):
+                                    target = incoming.read(os.pathconf(self.root, 'PC_PATH_MAX') + 1).decode()
+                                    self.check_link(project_path, target)
+                                    os.symlink(target, staged, dir_fd=target_fd)
+                                else:
+                                    output_fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700 if request.get('executable') else 0o600, dir_fd=target_fd)
+                                    with os.fdopen(output_fd, 'wb') as output:
+                                        shutil.copyfileobj(incoming, output, CHUNK)
+                                        output.flush(); os.fsync(output.fileno())
+                            try:
+                                os.link(staged, target_name, src_dir_fd=target_fd, dst_dir_fd=target_fd, follow_symlinks=False)
+                            except FileExistsError:
+                                pass
+                            os.fsync(target_fd)
+                        finally:
+                            try: os.unlink(staged, dir_fd=target_fd)
+                            except FileNotFoundError: pass
+        return {'path': str(self.root / relative)}
 
     def projected(self, data):
         if self.kind == 'auth':
@@ -461,6 +542,8 @@ def worker():
         except Conflict:
             print(json.dumps({'ok': False, 'error': 'attachment_too_large'}), flush=True)
             return
+    elif op == 'teleport':
+        result = tree.install_transfer(request, sys.stdin.buffer)
     elif op == 'scan':
         result = tree.scan(request.get('cache'))
     elif op == 'read':
@@ -470,6 +553,27 @@ def worker():
             print(json.dumps({'ok': True, **entry}), flush=True)
             shutil.copyfileobj(data, sys.stdout.buffer, CHUNK)
         return
+    elif op == 'cursor_key':
+        if tree.filename != 'cloudroom-api-key' or not isinstance(request['key'], str):
+            raise ValueError('invalid Cursor key destination')
+        data = request['key'].encode()
+        if not data or len(data) > 4096 or any(byte < 33 or byte > 126 for byte in data):
+            raise ValueError('invalid Cursor key')
+        try:
+            with tree.snapshot(tree.filename) as (previous, _):
+                expected = previous['tag']
+        except FileNotFoundError:
+            expected = None
+        tree.apply(tree.filename, expected, transfer(io.BytesIO(data), 'file', False), io.BytesIO(data))
+        result = {}
+    elif op == 'import_auth':
+        data = json.dumps(request['credentials'], separators=(',', ':')).encode()
+        entry = transfer(io.BytesIO(data), 'file', False)
+        try:
+            tree.apply('auth.json', None, entry, io.BytesIO(data))
+        except (Conflict, FileExistsError):
+            pass  # An existing login always wins, including a concurrent native sign-in.
+        result = {}
     elif op == 'apply':
         tree.apply(request['path'], request['expected'], request.get('entry'), sys.stdin.buffer)
         result = {}

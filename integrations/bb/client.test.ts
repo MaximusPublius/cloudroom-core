@@ -14,6 +14,7 @@ async function fixture(
     res: ServerResponse,
     body: Record<string, unknown>,
   ) => void | Promise<void>,
+  timeoutMs = 5000,
 ) {
   const requests: string[] = [];
   const server = createServer(async (req, res) => {
@@ -29,7 +30,7 @@ async function fixture(
   assert(address && typeof address !== "string");
   const url = `http://127.0.0.1:${address.port}`;
   return {
-    client: new CloudroomClient({ url, token: "test-token", timeoutMs: 150 }),
+    client: new CloudroomClient({ url, token: "test-token", timeoutMs }),
     url,
     requests,
     async close() {
@@ -43,6 +44,25 @@ function sendJson(res: ServerResponse, value: unknown, status = 200) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(value));
 }
+
+test("routes Cursor account operations and rejects off-domain login links", async (t) => {
+  let url = "https://cursor.com/loginDeepControl?challenge=fixture";
+  const bodies: Record<string, unknown>[] = [];
+  const service = await fixture((req, res, body) => {
+    bodies.push(body);
+    sendJson(res, { state: "waiting", email: null, plan: null, message: null, login_id: "login", verification_url: url, user_code: null }, req.method === "POST" ? 202 : 200);
+  });
+  t.after(() => service.close());
+  assert.equal((await service.client.cursorAuth()).verification_url, url);
+  await service.client.cursorAuth("login", "login");
+  await service.client.cursorAuth("cancel", "login");
+  await service.client.cursorAuth("key", "key", "synthetic-key");
+  assert.deepEqual(bodies, [{}, { request_id: "login" }, { request_id: "login" }, { request_id: "key", api_key: "synthetic-key" }]);
+  assert.deepEqual(service.requests, ["GET /v1/accounts/cursor", "POST /v1/accounts/cursor/login", "POST /v1/accounts/cursor/cancel", "POST /v1/accounts/cursor/key"]);
+  for (url of ["https://cursor.com.evil.invalid/loginDeepControl?challenge=fixture", "https://user:pass@cursor.com/loginDeepControl", "https://cursor.com/other", "http://cursor.com/loginDeepControl"]) {
+    await assert.rejects(service.client.cursorAuth(), /Unexpected Cursor sign-in URL/);
+  }
+});
 
 test("reports allowlisted rejections, keeps temporary conflicts retryable, and never exposes response bodies", async (t) => {
   let body: unknown;
@@ -573,7 +593,7 @@ test("rejects invalid stream cursors and mismatched event bodies", async (t) => 
 });
 
 test("times out a stalled command without resubmitting", async (t) => {
-  const service = await fixture(() => {});
+  const service = await fixture(() => {}, 150);
   t.after(() => service.close());
   await assert.rejects(service.client.start("once"), /cancelled or timed out/);
   assert.equal(service.requests.length, 1);

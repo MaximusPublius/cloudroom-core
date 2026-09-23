@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::process::Command;
 
@@ -154,6 +154,9 @@ pub struct Snapshot {
     pub level: Level,
     pub workspace_available_bytes: Option<u64>,
     pub history_available_bytes: Option<u64>,
+    pub workspace_total_bytes: Option<u64>,
+    pub history_total_bytes: Option<u64>,
+    pub sampled_at: Option<u64>,
     pub reason: &'static str,
 }
 impl Snapshot {
@@ -167,6 +170,9 @@ impl Snapshot {
             },
             workspace_available_bytes: None,
             history_available_bytes: None,
+            workspace_total_bytes: None,
+            history_total_bytes: None,
+            sampled_at: None,
             reason: if enabled {
                 "measurement_unavailable"
             } else {
@@ -272,6 +278,14 @@ impl Guard {
                 level,
                 workspace_available_bytes: Some(workspace.available_bytes),
                 history_available_bytes: Some(history.available_bytes),
+                workspace_total_bytes: Some(workspace.total_bytes),
+                history_total_bytes: Some(history.total_bytes),
+                sampled_at: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                ),
                 reason: "disk_capacity",
             })
         }
@@ -545,6 +559,7 @@ mod tests {
                         workspace_available_bytes: Some(available),
                         history_available_bytes: Some(available),
                         reason: "disk_capacity",
+                        ..Snapshot::unavailable(true)
                     },
                     Instant::now(),
                 )),

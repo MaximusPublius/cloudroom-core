@@ -279,6 +279,67 @@ impl Workspaces {
         Ok(serde_json::json!({"path":workspace.path,"branch":branch,"head":head}))
     }
 
+    pub async fn install_transfer(
+        &self,
+        workspace: &Workspace,
+        id: &str,
+        entry: &crate::session::teleport::Entry,
+        source: &Path,
+        native: Option<(&crate::config::HarnessConfig, crate::runtime::Kind, &str)>,
+        guard: &storage::Guard,
+    ) -> io::Result<String> {
+        self.ensure_directory(workspace).await?;
+        let (root, relative) = match native {
+            Some((profile, _, _)) => (
+                profile.home.join("sessions"),
+                format!("teleport/{id}/{}", entry.path),
+            ),
+            None => (
+                workspace.path.clone(),
+                format!(".cloudroom/teleport/{id}/{}/{}", entry.kind, entry.path),
+            ),
+        };
+        let request = serde_json::json!({"op":"teleport","tree":{"root":root,"create":true},
+            "path":relative,"size":entry.size,"sha256":entry.sha256,"executable":entry.executable,"symlink":entry.symlink,
+            "project_path":(entry.kind == "project").then_some(&entry.path),
+            "native":native.map(|(_,kind,native_id)| serde_json::json!({"harness":kind,"id":native_id,"cwd":workspace.path}))});
+        let mut command = Command::new("python3");
+        command
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .args(["-I", "-c", include_str!("../sync/files.py")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let (mut child, _workload) = guard.spawn_writer(&mut command)?;
+        let mut input = child.stdin.take().unwrap();
+        let mut file = fs::File::open(source)?;
+        let result = async {
+            use std::io::Read;
+            input.write_all(&serde_json::to_vec(&request)?).await?;
+            input.write_all(b"\n").await?;
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                input.write_all(&buffer[..count]).await?;
+            }
+            Ok::<_, io::Error>(())
+        }
+        .await;
+        drop(input);
+        let output = child.wait_with_output().await?;
+        let installed = file_result(output)?;
+        result?;
+        installed["path"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("transfer path missing"))
+    }
+
     pub async fn attach(
         &self,
         workspace: &Workspace,
@@ -373,6 +434,17 @@ fn file_result(output: std::process::Output) -> io::Result<serde_json::Value> {
         });
     }
     Ok(result)
+}
+
+pub fn transfer_destination(
+    workspace: &Workspace,
+    id: &str,
+    entry: &crate::session::teleport::Entry,
+) -> PathBuf {
+    workspace.path.join(format!(
+        ".cloudroom/teleport/{id}/{}/{}",
+        entry.kind, entry.path
+    ))
 }
 
 pub fn valid_name(name: &str) -> io::Result<()> {

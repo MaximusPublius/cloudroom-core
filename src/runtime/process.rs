@@ -72,6 +72,7 @@ struct Call {
     params: Value,
     request: Option<String>,
     target: Option<String>,
+    dispatch_only: bool,
     reply: Option<oneshot::Sender<io::Result<Value>>>,
 }
 
@@ -164,15 +165,22 @@ impl Process {
                             let _ = call.reply.map(|r|r.send(Err(io::Error::new(io::ErrorKind::InvalidInput,"target is no longer active"))));
                             continue;
                         }
+                        if let Err(error) = adapter.validate(&call.method, &call.params) {
+                            let _ = call.reply.map(|reply| reply.send(Err(error)));
+                            continue;
+                        }
                         if let Some(request) = &call.request {
                             if state.request.is_some() && !state.finished { let _ = call.reply.map(|r| r.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "harness is busy")))); continue; }
-                            state = Progress { native: state.native.clone(), request: Some(request.clone()), ..Progress::default() };
+                            state = Progress { native: state.native.clone(), model: state.model.clone(), request: Some(request.clone()), ..Progress::default() };
                             progress.send_replace(state.clone());
                         }
                         next += 1;
                         let frame = adapter.encode(next, &call.method, call.params, call.request.as_deref());
-                        if let Some(reply) = call.reply { pending.insert(next, reply); }
                         if write(input.as_mut().unwrap(), &frame).await.is_err() { break "harness stdin closed"; }
+                        if let Some(reply) = call.reply {
+                            if call.dispatch_only { let _ = reply.send(Ok(Value::Null)); }
+                            else { pending.insert(next, reply); }
+                        }
                     }
                     result = bounded.read_until(b'\n', &mut line), if !output_closed => {
                         if matches!(result, Ok(0)) && deadline.is_some() { output_closed = true; continue; }
@@ -204,7 +212,7 @@ impl Process {
             drop(input);
             let exited = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
             let mut status = exited.ok().and_then(Result::ok);
-            let graceful = status.is_some_and(|status| status.success());
+            let graceful = status.is_some_and(|status| adapter.clean_exit(status.code()));
             if status.is_none() {
                 let _ = child.kill().await;
                 status = child.wait().await.ok();
@@ -226,8 +234,11 @@ impl Process {
                                 break;
                             }
                         }
-                        if empty && !adapter.capture_pending() {
-                            break;
+                        if empty {
+                            if !adapter.capture_pending() {
+                                break;
+                            }
+                            tick.tick().await;
                         }
                     }
                     Err(_) => {
@@ -271,8 +282,15 @@ impl Process {
         params: Value,
         request: Option<&str>,
     ) -> io::Result<Value> {
-        self.call_inner(method, params, request, None, Duration::from_secs(30))
-            .await
+        self.call_inner(
+            method,
+            params,
+            request,
+            None,
+            Duration::from_secs(30),
+            false,
+        )
+        .await
     }
     pub async fn call_timeout(
         &self,
@@ -281,12 +299,37 @@ impl Process {
         request: Option<&str>,
         timeout: Duration,
     ) -> io::Result<Value> {
-        self.call_inner(method, params, request, None, timeout)
+        self.call_inner(method, params, request, None, timeout, false)
             .await
     }
     pub async fn control(&self, method: &str, params: Value, target: &str) -> io::Result<Value> {
-        self.call_inner(method, params, None, Some(target), Duration::from_secs(30))
-            .await
+        self.call_inner(
+            method,
+            params,
+            None,
+            Some(target),
+            Duration::from_secs(30),
+            false,
+        )
+        .await
+    }
+    pub async fn dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        request: Option<&str>,
+        target: Option<&str>,
+    ) -> io::Result<()> {
+        self.call_inner(
+            method,
+            params,
+            request,
+            target,
+            Duration::from_secs(30),
+            true,
+        )
+        .await?;
+        Ok(())
     }
     async fn call_inner(
         &self,
@@ -295,6 +338,7 @@ impl Process {
         request: Option<&str>,
         target: Option<&str>,
         timeout: Duration,
+        dispatch_only: bool,
     ) -> io::Result<Value> {
         if *self.stop.borrow() {
             return Err(io::Error::other("harness is closing"));
@@ -307,6 +351,7 @@ impl Process {
                 params,
                 request: request.map(str::to_owned),
                 target: target.map(str::to_owned),
+                dispatch_only,
                 reply: Some(reply),
             }),
         )
@@ -334,6 +379,7 @@ impl Process {
                 params: Value::Null,
                 request: None,
                 target: None,
+                dispatch_only: false,
                 reply: None,
             })
             .await

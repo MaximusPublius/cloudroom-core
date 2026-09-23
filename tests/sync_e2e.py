@@ -162,7 +162,7 @@ class SyncTests(unittest.TestCase):
             self.remote.upload('skills-shared','escape/file',None,{'tag':'x','kind':'file','executable':False,'size':1},io.BytesIO(b'x'))
         self.assertFalse((outside / 'file').exists())
 
-    def test_settings_preserve_local_fields_and_codex_login_moves_both_ways(self):
+    def test_settings_sync_without_copying_codex_logins_and_old_workers_are_denied(self):
         self.prepare()
         local = self.root / 'settings'; local.mkdir()
         cloud_home = Path(self.env['CLOUDROOM_ACCOUNT_HOME'])
@@ -184,8 +184,12 @@ class SyncTests(unittest.TestCase):
         remote_auth = cloud_home / '.codex/auth.json'
         remote_auth.write_text('{"account":"synthetic-cloud"}')
         self.sync()
-        self.assertEqual((local / 'auth.json').read_text(), remote_auth.read_text())
-        self.assertEqual((local / 'auth.json').stat().st_mode & 0o777, 0o600)
+        self.assertEqual((local / 'auth.json').read_text(), '{"account":"synthetic-mac"}')
+        self.assertEqual(remote_auth.read_text(), '{"account":"synthetic-cloud"}')
+        self.service.request('GET', '/v1/sync/auth-codex?device=' + self.config['device'], expected=410)
+        with self.assertRaises(OSError):
+            self.remote.upload('auth-codex', 'auth.json', None, {'tag':'x','kind':'file','executable':False,'size':1}, io.BytesIO(b'x'))
+        self.assertEqual(remote_auth.read_text(), '{"account":"synthetic-cloud"}')
 
     def test_pending_recovery_requires_manual_cleanup_and_preserves_late_writers(self):
         self.prepare()

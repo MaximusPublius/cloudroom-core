@@ -36,6 +36,10 @@ def fixture():
         v = json.loads(line); method = v.get('method'); p = v.get('params', {})
         if 'id' not in v: continue
         result = {}
+        if method == 'account/read':
+            result = {'account': {'type': 'chatgpt', 'email': 'fixture@example.invalid', 'planType': 'plus'}, 'requiresOpenaiAuth': True}
+        elif method == 'account/rateLimits/read':
+            result = {'rateLimits': {'primary': {'usedPercent': 0}, 'secondary': None}}
         if method == 'thread/inject_items':
             if (Path.cwd() / 'hold-cache').exists():
                 held.append(open((Path.cwd() / 'hold-cache').read_text(), 'rb'))
@@ -239,6 +243,11 @@ def main():
         filler=work/'large-output'; write_as_agent(filler,shutil.disk_usage(base).free//1048576-180)
         filler_size=filler.stat().st_size
         wait(lambda:request('GET','/v1/health')['storage']['level']=='low_space','warning threshold')
+        storage=request('GET','/v1/dashboard')['storage']
+        assert storage['level']=='low_space' and storage['reason']=='disk_capacity'
+        assert 0 < storage['workspace_available_bytes'] <= storage['workspace_total_bytes']
+        assert 0 < storage['history_available_bytes'] <= storage['history_total_bytes']
+        assert 0 <= time.time()*1000-storage['sampled_at'] < 5000
         wait(lambda:all((work/('warning-'+n)).exists() for n in names),'native warning delivered to every busy agent')
         for sid in ids:
             records=events(sid); warnings=[r for r in records if r['kind']=='storage_warning'];assert len(warnings)==1
@@ -287,6 +296,7 @@ def main():
         before={p:p.read_text() for p in ticks()};time.sleep(.3)
         assert all(p.read_text()==v for p,v in before.items())
         assert request('GET','/v1/health')['status']=='ready'
+        assert next(h for h in request('GET','/v1/capabilities')['harnesses'] if h['id']=='codex')['models'] is None
         request('POST','/v1/sessions',{'request_id':'blocked'},409)
         request('POST','/v1/sessions/'+ids[0]+'/prompts',{'request_id':'blocked-input','text':'never run'},409)
         assert request('GET','/v1/sessions/'+ids[0]+'/events')['events']

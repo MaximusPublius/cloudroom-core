@@ -11,6 +11,8 @@ ExecStart=/usr/local/lib/cloudroom/cloudroom
 EnvironmentFile=/etc/cloudroom/core.env
 Environment=CLOUDROOM_STORAGE_POLICY=/etc/cloudroom/storage.json
 Delegate=yes
+RuntimeDirectory=cloudroom
+RuntimeDirectoryMode=0711
 # The trusted core attaches children to cgroups, then drops all their capabilities.
 AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL

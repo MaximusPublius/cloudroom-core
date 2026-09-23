@@ -72,7 +72,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy(&config.database_url)
         .unwrap();
-    let diagnostics = Observability::start(&config, pool);
+    let diagnostics = Observability::start(&config, pool, metrics::AgentCounts::default);
     // No await: the producer must neither block nor allocate an unbounded queue.
     for _ in 0..CAPACITY * 2 {
         diagnostics.record(Signal::HistoryFault { operation: "test" });

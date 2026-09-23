@@ -5,6 +5,11 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
+  if (commandGuardEnabled) pi.on("tool_call", event => {
+    if (event.toolName !== "bash") return;
+    const reason = checkCommand(event.input.command);
+    if (reason) return { block: true, reason };
+  });
   const pending = new Map<string, (reply: { result?: string; error?: string; session_id?: string }) => void>();
   pi.registerCommand("cloudroom_context", {
     description: "Cloudroom context-only notice (v1)",

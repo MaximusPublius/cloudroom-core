@@ -1,3 +1,4 @@
+pub(crate) mod metrics;
 mod system;
 #[cfg(test)]
 mod tests;
@@ -10,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{
-    collections::{VecDeque, hash_map::RandomState},
+    collections::{BTreeMap, VecDeque, hash_map::RandomState},
     fs::{self, OpenOptions},
     hash::BuildHasher,
     io::{self, Write},
@@ -26,6 +27,9 @@ use tokio::sync::{mpsc, watch};
 
 const CAPACITY: usize = 1024;
 const LOCAL_BYTES: u64 = 8 * 1024 * 1024;
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+const SLOW_API_MS: u64 = 1000;
+const PRUNE_BATCH: i64 = 1000;
 const STDERR_CAPACITY: usize = 32;
 const STDERR_BATCH: usize = 8;
 const STDERR_FILE_BYTES: u64 = 1024 * 1024;
@@ -40,6 +44,7 @@ pub(crate) enum Signal {
         status: u16,
         duration_ms: u64,
     },
+    ApiSummary(ApiSummary),
     AgentStart {
         session_id: String,
         success: bool,
@@ -65,12 +70,31 @@ pub(crate) enum Signal {
     HistoryFault {
         operation: &'static str,
     },
+    AuthHealth {
+        harness: Kind,
+        credentials: crate::runtime::claude_auth::Credentials,
+        last_request: crate::runtime::claude_auth::RequestStatus,
+        last_request_at_ms: Option<u64>,
+        reason: &'static str,
+    },
     Resources(system::Resources),
     Diagnostics {
         dropped: u64,
         local_write_failures: u64,
         upload_failures: u64,
     },
+}
+
+#[derive(Serialize)]
+pub(crate) struct ApiSummary {
+    method: &'static str,
+    route: String,
+    status: u16,
+    requests: u64,
+    total_duration_ms: u64,
+    max_duration_ms: u64,
+    first_timestamp_ms: u64,
+    last_timestamp_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -98,6 +122,7 @@ pub(crate) struct Observability {
     stop: watch::Sender<bool>,
     finished: watch::Receiver<bool>,
     resources: watch::Sender<(Option<u64>, Value)>,
+    pub metrics: Arc<metrics::History>,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -112,7 +137,11 @@ pub(crate) fn elapsed_ms(start: Instant) -> u64 {
 }
 
 impl Observability {
-    pub fn start(config: &Config, pool: PgPool) -> Self {
+    pub fn start(
+        config: &Config,
+        pool: PgPool,
+        agents: impl Fn() -> metrics::AgentCounts + Send + 'static,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(CAPACITY);
         let (stderr, captures) = mpsc::channel(STDERR_CAPACITY);
         let (stop, stopping) = watch::channel(false);
@@ -129,11 +158,14 @@ impl Observability {
             stop,
             finished,
             resources: watch::channel((None, json!({"cpu":null,"memory":null,"disk":null}))).0,
+            metrics: Arc::new(metrics::History::new(pool.clone(), config.store.clone())),
         };
         let config = config.clone();
         let worker = this.clone();
         tokio::spawn(async move {
-            worker.run(config, pool, receiver, captures, stopping).await;
+            worker
+                .run(config, pool, receiver, captures, stopping, agents)
+                .await;
             done.send_replace(true);
         });
         this
@@ -209,12 +241,15 @@ impl Observability {
         mut receiver: mpsc::Receiver<Record>,
         mut captures: mpsc::Receiver<LocalStderr>,
         mut stop: watch::Receiver<bool>,
+        agents: impl Fn() -> metrics::AgentCounts + Send,
     ) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut pending = VecDeque::new();
         let mut sampler = system::Sampler::default();
         let mut sample_at = Instant::now();
+        let mut summaries = BTreeMap::new();
+        let mut summary_at = Instant::now() + SUMMARY_INTERVAL;
         let mut prune_at = Instant::now();
         let (mut local_write_failures, mut upload_failures) = (0, 0);
         loop {
@@ -234,7 +269,8 @@ impl Observability {
                 }
             }
             if !stopping && Instant::now() >= sample_at {
-                let resources = sampler.sample(&config).await;
+                let mut resources = sampler.sample(&config).await;
+                resources.agents = Some(agents());
                 self.resources
                     .send_replace((Some(now_ms()), resources.dashboard()));
                 batch.push(self.make_record(Signal::Resources(resources)));
@@ -264,11 +300,49 @@ impl Observability {
                     local_write_failures += 1;
                     eprintln!("Cloudroom diagnostic file write failed");
                 }
-                pending.extend(batch);
-                while pending.len() > CAPACITY {
-                    pending.pop_front();
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                for record in batch {
+                    if let Signal::Api {
+                        method,
+                        route,
+                        status,
+                        duration_ms,
+                    } = &record.signal
+                        && (*method == "GET" || (*method == "POST" && route == "/v1/sync"))
+                        && (200..400).contains(status)
+                        && *duration_ms < SLOW_API_MS
+                    {
+                        let summary = summaries
+                            .entry((*method, route.clone(), *status))
+                            .or_insert_with(|| ApiSummary {
+                                method,
+                                route: route.clone(),
+                                status: *status,
+                                requests: 0,
+                                total_duration_ms: 0,
+                                max_duration_ms: 0,
+                                first_timestamp_ms: record.timestamp_ms,
+                                last_timestamp_ms: record.timestamp_ms,
+                            });
+                        summary.requests += 1;
+                        summary.total_duration_ms += duration_ms;
+                        summary.max_duration_ms = summary.max_duration_ms.max(*duration_ms);
+                        summary.last_timestamp_ms = record.timestamp_ms;
+                    } else {
+                        pending.push_back(record);
+                    }
                 }
+            }
+            if stopping || Instant::now() >= summary_at {
+                pending.extend(
+                    std::mem::take(&mut summaries)
+                        .into_values()
+                        .map(|summary| self.make_record(Signal::ApiSummary(summary))),
+                );
+                summary_at = Instant::now() + SUMMARY_INTERVAL;
+            }
+            while pending.len() > CAPACITY {
+                pending.pop_front();
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
             let mut local = Vec::new();
             for _ in 0..STDERR_BATCH {
@@ -315,15 +389,23 @@ impl Observability {
             }
             if Instant::now() >= prune_at {
                 // Scope retention to this store; never touch session history or another owner.
-                let prune = sqlx::query("DELETE FROM cloudroom_diagnostics WHERE store=$1 AND timestamp_ms < (extract(epoch FROM now() - interval '7 days') * 1000)::bigint")
-                    .bind(&config.store).execute(&pool);
-                if !matches!(
-                    tokio::time::timeout(Duration::from_secs(2), prune).await,
-                    Ok(Ok(_))
-                ) {
-                    upload_failures += 1;
-                }
-                prune_at = Instant::now() + Duration::from_secs(3600);
+                let prune = sqlx::query(
+                    "DELETE FROM cloudroom_diagnostics WHERE store=$1 AND ctid IN (\
+                     SELECT ctid FROM cloudroom_diagnostics WHERE store=$1 \
+                     AND timestamp_ms < (extract(epoch FROM now() - interval '7 days') * 1000)::bigint \
+                     AND (record->>'kind' IS DISTINCT FROM 'resources' \
+                          OR timestamp_ms < (extract(epoch FROM now() - interval '30 days') * 1000)::bigint) \
+                     ORDER BY timestamp_ms LIMIT $2)")
+                    .bind(&config.store).bind(PRUNE_BATCH).execute(&pool);
+                let delay = match tokio::time::timeout(Duration::from_secs(2), prune).await {
+                    Ok(Ok(result)) if result.rows_affected() == PRUNE_BATCH as u64 => 1,
+                    Ok(Ok(_)) => 3600,
+                    _ => {
+                        upload_failures += 1;
+                        60
+                    }
+                };
+                prune_at = Instant::now() + Duration::from_secs(delay);
             }
         }
     }

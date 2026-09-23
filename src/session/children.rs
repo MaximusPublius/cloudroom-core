@@ -15,10 +15,12 @@ impl Manager {
             prompt: text,
         } = child;
         let session = &local.sessions[parent];
-        if session.harness != runtime::Kind::Pi
+        if !matches!(session.harness, runtime::Kind::Pi | runtime::Kind::Claude)
             || session.current_request.as_deref() != Some(&request)
         {
-            return Err(Error::Conflict("child requires the current Pi turn"));
+            return Err(Error::Conflict(
+                "child requires the current managed parent turn",
+            ));
         }
         if self.storage.blocks() || self.is_stopping() {
             let handle = handle.clone();
@@ -33,7 +35,10 @@ impl Manager {
         let reasoning = prompt::latest(&session.prompts, &session.receipts, &request)
             .and_then(prompt::reasoning)
             .or_else(|| session.reasoning.clone());
-        let input = json!({"harness":"pi","parent_session":parent,"parent_request":request,"tool_call_id":tool_call_id,"prompt":text,"reasoning":reasoning});
+        let mut input = json!({"harness":session.harness,"parent_session":parent,"parent_request":request,"tool_call_id":tool_call_id,"prompt":text,"reasoning":reasoning});
+        if !session.command_guard_enabled() {
+            input["command_guard_enabled"] = json!(false);
+        }
         if let Some(existing) = local.sessions.get(&id) {
             Self::retry(existing, &start_id, "start", &input)?
                 .ok_or(Error::Conflict("child identity conflict"))?;

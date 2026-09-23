@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, Version, header},
     middleware::{self, Next},
@@ -21,9 +21,16 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub fn router(manager: Arc<Manager>, token: String) -> Router {
     Router::new()
+        .merge(crate::preview::routes())
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/accounts/cursor", get(cursor_auth))
+        .route("/v1/accounts/cursor/{action}", post(cursor_account))
+        .route("/v1/accounts/codex", get(codex_auth))
+        .route("/v1/accounts/codex/login", post(codex_login))
+        .route("/v1/accounts/codex/import", post(codex_import))
+        .route("/v1/accounts/codex/cancel", post(codex_cancel))
         .route("/v1/workspaces/{id}", get(workspace))
         .route("/v1/settings", get(crate::sync::settings))
         .route("/v1/sync", post(crate::sync::check_in))
@@ -35,6 +42,18 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/dashboard", get(dashboard))
+        .route("/v1/metrics", get(metrics))
+        .route(
+            "/v1/teleports",
+            post(teleport_prepare).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/v1/teleports/{id}", get(teleport_status))
+        .route("/v1/teleports/{id}/activate", post(teleport_activate))
+        .route("/v1/teleports/{id}/cancel", post(teleport_cancel))
+        .route(
+            "/v1/teleports/{id}/files/{index}",
+            post(teleport_upload).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route("/v1/sessions", post(start))
         .route("/v1/sessions/{id}", get(status))
         .route("/v1/sessions/{id}/workspace", get(session_workspace))
@@ -65,6 +84,132 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
             observe,
         ))
         .with_state(manager)
+}
+
+async fn cursor_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
+    Json(manager.cursor_auth_status().await)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorAccountRequest {
+    request_id: String,
+    api_key: Option<String>,
+}
+async fn cursor_account(
+    State(manager): State<Arc<Manager>>,
+    Path(action): Path<String>,
+    Json(input): Json<CursorAccountRequest>,
+) -> Result<(StatusCode, Json<crate::runtime::auth::Status>)> {
+    crate::workspace::valid_id(&input.request_id)
+        .map_err(|_| session::Error::Conflict("invalid request ID"))?;
+    if !matches!(action.as_str(), "login" | "cancel" | "key")
+        || (action == "key") != input.api_key.is_some()
+    {
+        return Err(session::Error::Conflict("invalid Cursor account operation"));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .cursor_account(&action, input.request_id, input.api_key)
+                .await?,
+        ),
+    ))
+}
+
+async fn codex_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
+    Json(manager.codex_auth_status().await)
+}
+async fn codex_login(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<RequestId>,
+) -> Result<(StatusCode, Json<crate::runtime::auth::Status>)> {
+    crate::workspace::valid_id(&input.request_id)
+        .map_err(|_| session::Error::Conflict("invalid request ID"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.codex_login(input.request_id).await?),
+    ))
+}
+async fn codex_import(
+    State(manager): State<Arc<Manager>>,
+    Json(credentials): Json<Value>,
+) -> Result<Json<crate::runtime::auth::Status>> {
+    Ok(Json(manager.import_codex_login(credentials).await?))
+}
+async fn codex_cancel(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<RequestId>,
+) -> (StatusCode, Json<crate::runtime::auth::Status>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(manager.cancel_codex_login(&input.request_id).await),
+    )
+}
+
+async fn teleport_prepare(
+    State(manager): State<Arc<Manager>>,
+    Json(manifest): Json<session::teleport::Manifest>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.teleport_prepare(manifest).await?),
+    ))
+}
+async fn teleport_status(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    Ok(Json(manager.teleport_status(&id).await?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeleportActivation {
+    retry_request_id: Option<String>,
+}
+async fn teleport_activate(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<TeleportActivation>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .teleport_activate(&id, body.retry_request_id)
+                .await?,
+        ),
+    ))
+}
+async fn teleport_cancel(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.teleport_cancel(&id).await?),
+    ))
+}
+#[derive(Deserialize)]
+struct TeleportOffset {
+    offset: u64,
+    sha256: String,
+    size: Option<u64>,
+}
+async fn teleport_upload(
+    State(manager): State<Arc<Manager>>,
+    Path((id, index)): Path<(String, usize)>,
+    Query(query): Query<TeleportOffset>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .teleport_upload(&id, index, query.offset, query.sha256, query.size, body)
+                .await?,
+        ),
+    ))
 }
 
 async fn observe(
@@ -149,6 +294,19 @@ impl IntoResponse for session::Error {
             "invalid provider" | "provider selection requires Pi" => "invalid_provider",
             "invalid reasoning effort" => "invalid_reasoning_effort",
             "invalid service tier" => "invalid_service_tier",
+            "invalid teleport manifest"
+            | "invalid teleport file"
+            | "invalid transfer ID"
+            | "invalid upload offset"
+            | "overlapping upload"
+            | "upload content changed"
+            | "upload checksum changed"
+            | "teleport file validation failed"
+            | "session text is still uploading"
+            | "saved transfer requires recovery"
+            | "native conversation already belongs to a cloud session" => "teleport_rejected",
+            "transfer cancelled" => "teleport_cancelled",
+            "cloud execution already owns this transfer; use Stop" => "teleport_running",
             "Cloud folder permission denied" => "attachment_permission_denied",
             "attachment upload failed" => "invalid_attachment",
             "image exceeds the 10 MiB limit" | "file exceeds the 25 MiB limit" => {
@@ -162,6 +320,17 @@ impl IntoResponse for session::Error {
             "storage unsafe; new execution is blocked" => "storage_blocked",
             "service is stopping" => "service_stopping",
             "model catalog unavailable" => "model_catalog_unavailable",
+            "connect Codex before starting cloud work" => "codex_auth_required",
+            "connect Claude Code before starting cloud work" => "claude_auth_required",
+            "Claude account could not be verified" => "claude_auth_unavailable",
+            "Claude live steering is not supported" => "unsupported_command",
+            "Codex usage limit reached" => "codex_usage_limit",
+            "Codex account could not be verified" => "codex_auth_unavailable",
+            "Cursor Command Guard support is not verified" => "cursor_guard_unsupported",
+            "connect Cursor before starting cloud work" => "cursor_auth_required",
+            "Cursor account could not be verified" => "cursor_auth_unavailable",
+            "close Cursor sessions before changing the cloud login" => "cursor_auth_busy",
+            "finish active Codex work before signing in" => "codex_auth_busy",
             _ => "request_rejected",
         };
         (status, Json(json!({"error":error,"code":code}))).into_response()
@@ -185,6 +354,7 @@ struct Start {
     workspace: Option<String>,
     provider: Option<String>,
     workspace_name: Option<String>,
+    command_guard_enabled: Option<bool>,
 }
 
 async fn workspace(
@@ -302,6 +472,24 @@ async fn dashboard(State(manager): State<Arc<Manager>>) -> Json<Value> {
     Json(manager.dashboard())
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsQuery {
+    #[serde(default)]
+    range: crate::observability::metrics::Range,
+}
+async fn metrics(
+    State(manager): State<Arc<Manager>>,
+    Query(query): Query<MetricsQuery>,
+) -> Response {
+    match manager.observability.metrics.read(query.range).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error":"Metric history is unavailable. Check diagnostic storage; agents may still be working."
+        }))).into_response(),
+    }
+}
+
 async fn ready(State(manager): State<Arc<Manager>>) -> impl IntoResponse {
     let ready = manager.ready().await;
     (
@@ -374,7 +562,7 @@ async fn start(
             body.model,
             body.reasoning,
             (body.workspace, body.workspace_name),
-            body.provider,
+            (body.provider, body.command_guard_enabled),
         )
         .await?;
     Ok(accepted(&manager, &id, receipt))

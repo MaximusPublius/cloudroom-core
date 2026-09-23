@@ -69,12 +69,26 @@ pub(super) async fn models(handle: &Handle) -> io::Result<Vec<super::Model>> {
 
 pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     initialize(handle).await?;
+    if handle.command_guard_enabled {
+        let settings = handle
+            .call(
+                "config/read",
+                json!({"cwd":handle.repository,"includeLayers":false}),
+            )
+            .await?;
+        if settings["config"]["features"]["hooks"] == false {
+            return Err(io::Error::other(
+                "Codex hooks are disabled; enable them or start with command_guard_enabled: false",
+            ));
+        }
+    }
     let mut params = json!({"cwd":handle.repository,"model":handle.profile.model,"approvalPolicy":"never","sandbox":"danger-full-access","ephemeral":false});
     if let Some(reasoning) = &handle.reasoning {
         params["config"] = json!({"model_reasoning_effort":reasoning});
     }
     let method = if let Some(saved) = &handle.resume {
         params["threadId"] = json!(saved.id);
+        params["path"] = json!(saved.path);
         params["excludeTurns"] = json!(true);
         "thread/resume"
     } else {
@@ -235,25 +249,6 @@ pub(super) async fn rewind(handle: &Handle, input: &Value) -> io::Result<Value> 
 pub(super) async fn notice(handle: &Handle, text: &str) -> io::Result<()> {
     handle.call("thread/inject_items", json!({"threadId":handle.native()?,"items":[{"type":"message","role":"developer","content":[{"type":"input_text","text":text}]}]})).await?;
     Ok(())
-}
-
-pub(super) fn checkpoint(
-    previous: &Value,
-    data: &Value,
-    native: Option<&str>,
-) -> io::Result<Value> {
-    let offset = data["offset"]
-        .as_u64()
-        .ok_or_else(|| io::Error::other("missing native offset"))?;
-    if offset != previous["offset"].as_u64().unwrap_or(0) {
-        return Err(io::Error::other("native record offset mismatch"));
-    }
-    let length = native
-        .ok_or_else(|| io::Error::other("missing native record"))?
-        .len() as u64;
-    Ok(
-        json!({"offset":offset.checked_add(length).ok_or_else(||io::Error::other("native offset overflow"))?}),
-    )
 }
 
 pub(super) async fn interrupt(handle: &Handle, state: Progress) -> io::Result<()> {

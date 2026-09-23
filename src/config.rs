@@ -63,6 +63,8 @@ impl Config {
         let default_harness = match env::var("CLOUDROOM_HARNESS").as_deref().unwrap_or("codex") {
             "codex" => Kind::Codex,
             "pi" => Kind::Pi,
+            "cursor" => Kind::Cursor,
+            "claude-code" => Kind::Claude,
             _ => return Err(io::Error::other("unsupported CLOUDROOM_HARNESS")),
         };
         let account_home: PathBuf = required("CLOUDROOM_ACCOUNT_HOME")?.into();
@@ -90,6 +92,40 @@ impl Config {
                     },
                 );
             }
+        }
+        let claude = [
+            account_home.join(".local/bin/claude"),
+            PathBuf::from("/usr/local/bin/claude"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = claude.filter(|_| account_home.join(".claude").is_dir()) {
+            harnesses.insert(
+                Kind::Claude,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".claude"),
+                    model: "sonnet".into(),
+                    provider: None,
+                },
+            );
+        }
+        let cursor = [
+            account_home.join(".local/bin/cursor-agent"),
+            PathBuf::from("/usr/local/bin/cursor-agent"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = cursor.filter(|_| account_home.join(".cursor").is_dir()) {
+            harnesses.insert(
+                Kind::Cursor,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".cursor"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
         }
         Ok(Self {
             storage,

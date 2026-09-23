@@ -1,12 +1,13 @@
 mod children;
 mod outbox;
+pub mod teleport;
 pub use outbox::Journal;
 mod history;
 mod prompt;
 
 use crate::{
     config::Config,
-    observability::{Observability, Signal, elapsed_ms, now_ms},
+    observability::{Observability, Signal, elapsed_ms, metrics::AgentCounts, now_ms},
     runtime,
     workspace::storage::{Guard, Level, Snapshot},
 };
@@ -62,6 +63,8 @@ pub struct Receipt {
 #[derive(Default, Clone, Serialize)]
 pub struct Session {
     pub session_id: String,
+    #[serde(default)]
+    pub teleport_output: bool,
     pub harness: runtime::Kind,
     pub capabilities: Value,
     pub native_cursor: Value,
@@ -115,6 +118,32 @@ pub struct Session {
 }
 
 impl Session {
+    fn dashboard_state(&self) -> &'static str {
+        if self.storage_paused {
+            return "waiting";
+        }
+        match self.state.as_str() {
+            "starting" | "resuming" => "queued",
+            "starting_turn" | "running" | "interrupting" | "closing" => "working",
+            "idle" => match self.last_prompt_state.as_deref() {
+                Some("failed") => "failed",
+                Some("unknown" | "unknown_after_restart") => "unknown",
+                _ => "waiting",
+            },
+            "closed" => "stopped",
+            "failed" | "process_lost" => "failed",
+            _ => "unknown",
+        }
+    }
+
+    fn command_guard_enabled(&self) -> bool {
+        self.receipts
+            .values()
+            .find(|r| r.command == "start")
+            .and_then(|r| r.input["command_guard_enabled"].as_bool())
+            .unwrap_or(true)
+    }
+
     fn resume(&self) -> Option<runtime::Resume> {
         Some(runtime::Resume {
             id: self.native_id.clone()?,
@@ -182,18 +211,38 @@ struct Local {
 
 pub struct Manager {
     config: Config,
-    local: Mutex<Local>,
+    local: Arc<Mutex<Local>>,
     history: history::History,
     pub(crate) observability: Observability,
     pub(crate) storage: Guard,
     pub(crate) workspaces: crate::workspace::Workspaces,
     pub(crate) sync: crate::sync::Sync,
+    pub(crate) previews: Arc<crate::preview::Previews>,
     codex_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
+    claude_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
+    codex_auth: runtime::auth::CodexAuth,
+    claude_auth: Arc<runtime::claude_auth::ClaudeAuth>,
+    cursor_auth: runtime::cursor_auth::CursorAuth,
     stopping: AtomicBool,
     startups: Semaphore,
+    teleports: teleport::Transfers,
 }
 
 impl Local {
+    fn agent_counts(&self) -> AgentCounts {
+        let mut counts = AgentCounts::default();
+        for session in self.sessions.values() {
+            match session.dashboard_state() {
+                "working" => counts.working += 1,
+                "queued" => counts.queued += 1,
+                "waiting" => counts.waiting += 1,
+                "failed" => counts.failed += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
     fn finish_receipt(&mut self, id: &str, request: &str, state: &str) -> Result<()> {
         let mut receipt = self
             .sessions
@@ -226,6 +275,39 @@ impl Local {
     }
 
     fn apply(&mut self, record: &Record) -> io::Result<()> {
+        if record.kind == "teleport" {
+            let before = self.sequences.get(&record.session_id).map_or(0, Vec::len);
+            for data in std::iter::once(&record.data["receipt"]).chain(
+                record.data["prompts"]
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("invalid imported prompts"))?,
+            ) {
+                self.apply(&Record {
+                    kind: "receipt".into(),
+                    data: data.clone(),
+                    native: None,
+                    ..record.clone()
+                })?;
+            }
+            let session = self.sessions.get_mut(&record.session_id).unwrap();
+            session.native_id = Some(
+                record.data["native_id"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("missing imported identity"))?
+                    .into(),
+            );
+            session.native_path = Some(
+                record.data["native_path"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("missing imported history"))?
+                    .into(),
+            );
+            session.state = "suspended".into();
+            let sequences = self.sequences.entry(record.session_id.clone()).or_default();
+            sequences.truncate(before);
+            sequences.push(record.sequence);
+            return Ok(());
+        }
         let session = self
             .sessions
             .entry(record.session_id.clone())
@@ -235,6 +317,11 @@ impl Local {
                 ..Session::default()
             });
         session.last_sequence = record.sequence;
+        if matches!(record.kind.as_str(), "text_delta" | "thinking_delta")
+            && record.data["delta"].as_str().is_some_and(|s| !s.is_empty())
+        {
+            session.teleport_output = true;
+        }
         session.last_activity = record.timestamp_ms.or(session.last_activity);
         match record.kind.as_str() {
             "receipt" => {
@@ -520,8 +607,11 @@ impl Manager {
             if session.waiting_start().is_some() {
                 continue;
             }
-            let eligible =
-                session.can_resume() || session.startup_error.as_deref() == Some("startup_timeout");
+            let eligible = session.can_resume()
+                || session.startup_error.as_deref() == Some("startup_timeout")
+                || (session.state == "resuming"
+                    && !session.has_dispatched
+                    && session.native_path.is_some());
             for mut receipt in session.receipts.values().cloned() {
                 let terminal = matches!(
                     receipt.state.as_str(),
@@ -595,23 +685,119 @@ impl Manager {
         let storage = Guard::new(&config)?;
         let workspaces = crate::workspace::Workspaces::open(&config)?;
         let sync = crate::sync::Sync::open(&config)?;
+        let previews = crate::preview::Previews::open(&config)?;
         let history = history::History::new(&config)?;
-        let observability = Observability::start(&config, history.pool.clone());
+        let local = Arc::new(Mutex::new(local));
+        let registry = local.clone();
+        let observability = Observability::start(&config, history.pool.clone(), move || {
+            registry.lock().unwrap().agent_counts()
+        });
         Ok(Arc::new(Self {
             config,
-            local: Mutex::new(local),
+            local,
             history,
             observability,
             storage,
             workspaces,
             sync,
+            teleports: teleport::Transfers::default(),
+            previews,
             codex_models: tokio::sync::Mutex::new(None),
+            claude_models: tokio::sync::Mutex::new(None),
+            codex_auth: runtime::auth::CodexAuth::default(),
+            claude_auth: Arc::new(runtime::claude_auth::ClaudeAuth::default()),
+            cursor_auth: runtime::cursor_auth::CursorAuth::default(),
             stopping: AtomicBool::new(false),
             // Bound cold-start CPU contention, not the number of running sessions.
             startups: Semaphore::new(
                 std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
             ),
         }))
+    }
+
+    pub fn start_auth_monitor(&self) {
+        self.claude_auth.start(&self.config, &self.observability);
+    }
+
+    pub async fn codex_auth_status(&self) -> runtime::auth::Status {
+        self.codex_auth.status(&self.config).await
+    }
+
+    fn check_codex_login(&self) -> Result<()> {
+        if self.is_stopping() {
+            return Err(Error::Conflict("service is stopping"));
+        }
+        if self.storage.blocks() {
+            return Err(Error::Conflict("storage unsafe; new execution is blocked"));
+        }
+        if self.local.lock().unwrap().sessions.values().any(|s| {
+            s.harness == runtime::Kind::Codex
+                && (s.current_request.is_some()
+                    || (!s.queue_paused && !s.queue.is_empty())
+                    || matches!(s.state.as_str(), "starting" | "resuming" | "pending"))
+        }) {
+            return Err(Error::Conflict(
+                "finish active Codex work before signing in",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn codex_login(&self, request: String) -> Result<runtime::auth::Status> {
+        self.check_codex_login()?;
+        Ok(self.codex_auth.login(&self.config, request).await)
+    }
+
+    pub async fn import_codex_login(&self, credentials: Value) -> Result<runtime::auth::Status> {
+        self.check_codex_login()?;
+        Ok(self
+            .codex_auth
+            .import(&self.config, &self.storage, credentials)
+            .await)
+    }
+
+    pub async fn cancel_codex_login(&self, request: &str) -> runtime::auth::Status {
+        self.codex_auth.cancel(request).await
+    }
+
+    pub async fn cursor_auth_status(&self) -> runtime::auth::Status {
+        self.cursor_auth.status(&self.config, &self.storage).await
+    }
+    pub async fn cursor_account(
+        &self,
+        action: &str,
+        request: String,
+        key: Option<String>,
+    ) -> Result<runtime::auth::Status> {
+        if action == "cancel" {
+            return Ok(self.cursor_auth.cancel(&request).await);
+        }
+        if self.is_stopping() {
+            return Err(Error::Conflict("service is stopping"));
+        }
+        if self.storage.blocks() {
+            return Err(Error::Conflict("storage unsafe; new execution is blocked"));
+        }
+        if self.local.lock().unwrap().sessions.values().any(|session| {
+            session.harness == runtime::Kind::Cursor
+                && (session.handle.is_some()
+                    || session.current_request.is_some()
+                    || (!session.queue_paused && !session.queue.is_empty())
+                    || matches!(session.state.as_str(), "starting" | "resuming" | "pending"))
+        }) {
+            return Err(Error::Conflict(
+                "close Cursor sessions before changing the cloud login",
+            ));
+        }
+        Ok(if let Some(key) = key {
+            self.cursor_auth
+                .set_key(&self.config, &self.storage, key)
+                .await
+        } else {
+            self.cursor_auth
+                .login(&self.config, &self.storage, request)
+                .await
+        })
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -635,6 +821,7 @@ impl Manager {
 
     pub fn dashboard(&self) -> Value {
         let (sampled_at, resources) = self.observability.resources();
+        let storage = self.storage.snapshot();
         let local = self.local.lock().unwrap();
         let mut sessions: Vec<_> = local.sessions.values().collect();
         sessions.sort_unstable_by_key(|s| std::cmp::Reverse(s.last_sequence));
@@ -643,22 +830,7 @@ impl Manager {
             .iter()
             .take(1000)
             .map(|s| {
-                let state = if s.storage_paused {
-                    "waiting"
-                } else {
-                    match s.state.as_str() {
-                        "starting" | "resuming" => "queued",
-                        "starting_turn" | "running" | "interrupting" | "closing" => "working",
-                        "idle" => match s.last_prompt_state.as_deref() {
-                            Some("failed") => "failed",
-                            Some("unknown" | "unknown_after_restart") => "unknown",
-                            _ => "waiting",
-                        },
-                        "closed" => "stopped",
-                        "failed" | "process_lost" => "failed",
-                        _ => "unknown",
-                    }
-                };
+                let state = s.dashboard_state();
                 json!({"id":s.session_id,"title":format!("{:?} session",s.harness),
                 "repository":s.workspace.as_ref().map(|w| &w.path).unwrap_or(&self.config.repository).file_name().map(|n| n.to_string_lossy()),
                 "harness":s.harness,"model":s.model,"state":state,
@@ -667,22 +839,36 @@ impl Manager {
             })
             .collect();
         json!({"version":1,"sampledAt":sampled_at,
-            "runtime":{"ready":!self.is_stopping() && !self.storage.blocks() && local.journal.writable(),"version":env!("CARGO_PKG_VERSION"),
+            "runtime":{"ready":!self.is_stopping() && storage.level != Level::Blocked && local.journal.writable(),"version":env!("CARGO_PKG_VERSION"),
                 "configured":!self.config.harnesses.is_empty()},
-            "appConnectivity":"unknown","resources":resources,
+            "appConnectivity":"unknown",
+            "resources":{"cpu":resources["cpu"],"memory":resources["memory"],"disk":resources["disk"]},
+            "resourceBytes":{"memoryUsedBytes":resources["memoryUsedBytes"],"memoryTotalBytes":resources["memoryTotalBytes"],
+                "diskAvailableBytes":resources["diskAvailableBytes"],"diskTotalBytes":resources["diskTotalBytes"]},
+            "storage":storage,
+            "diskThresholds":self.config.storage.as_ref().map(|policy| json!({"warningBytes":policy.warning_bytes,"pauseBytes":policy.pause_bytes})),
             "onboarding":{"localConnected":null,"offlineTaskVerified":null},
             "capabilities":{"settings":true,"updates":false},
-            "sessionCount":sessions.len(),"sessions":summaries})
+            "sessionCount":sessions.len(),"agents":local.agent_counts(),"sessions":summaries})
     }
 
     async fn codex_models(&self) -> Result<Vec<runtime::Model>> {
-        let mut cached = self.codex_models.lock().await;
+        self.model_catalog(runtime::Kind::Codex).await
+    }
+
+    async fn model_catalog(&self, kind: runtime::Kind) -> Result<Vec<runtime::Model>> {
+        let cache = match kind {
+            runtime::Kind::Codex => &self.codex_models,
+            runtime::Kind::Claude => &self.claude_models,
+            _ => return Err(Error::Conflict("model catalog unavailable")),
+        };
+        let mut cached = cache.lock().await;
         if let Some((checked, models)) = &*cached
             && checked.elapsed() < Duration::from_secs(60)
         {
             return Ok(models.clone());
         }
-        let (result, exit) = runtime::codex_models(&self.config).await;
+        let (result, exit) = runtime::models(&self.config, kind).await;
         if let Some(runtime::Event::Exited {
             reason,
             expected,
@@ -691,7 +877,7 @@ impl Manager {
         }) = exit
         {
             self.observability
-                .agent_exit(None, runtime::Kind::Codex, reason, expected, details);
+                .agent_exit(None, kind, reason, expected, details);
         }
         let models = result.map_err(|_| Error::Conflict("model catalog unavailable"))?;
         *cached = Some((Instant::now(), models.clone()));
@@ -703,18 +889,32 @@ impl Manager {
         for (kind, profile) in &self.config.harnesses {
             let mut harness = json!({"id":kind,"model":profile.model,"provider":profile.provider});
             match kind {
-                runtime::Kind::Codex => {
-                    harness["models"] = match self.codex_models().await {
-                        Ok(models) => json!(models),
-                        Err(_) => Value::Null,
+                runtime::Kind::Codex | runtime::Kind::Claude => {
+                    harness["models"] = if self.storage.blocks() {
+                        Value::Null
+                    } else {
+                        match self.model_catalog(*kind).await {
+                            Ok(models) => json!(models),
+                            Err(_) => Value::Null,
+                        }
                     };
-                    harness["steer"] = json!(true);
+                    harness["steer"] = json!(*kind == runtime::Kind::Codex);
                     harness["compact"] = json!(true);
-                    harness["service_tier"] = json!(true);
+                    harness["service_tier"] = json!(*kind == runtime::Kind::Codex);
+                    harness["skill_mentions"] = json!(*kind == runtime::Kind::Claude);
                     harness["rewind"] = json!(true);
                     harness["attachments"] = json!({"images":true,"files":true});
                     harness["subagents"] = json!(true);
                     harness["usage"] = json!(true);
+                }
+                runtime::Kind::Cursor => {
+                    let capabilities = runtime::cursor::capabilities();
+                    for (key, value) in capabilities.as_object().unwrap() {
+                        harness[key] = value.clone();
+                    }
+                    harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
+                    harness["attachments"] = json!({"images":false,"files":true});
+                    harness["provider_selection"] = json!(false);
                 }
                 runtime::Kind::Pi => {
                     harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
@@ -730,8 +930,8 @@ impl Manager {
             }
             harnesses.push(harness);
         }
-        json!({"version":1,"repository":self.config.repository,"harnesses":harnesses,
-            "stop":true,"resume":true,"launch_settings":true,"prompt_reasoning":true,"workspaces":true,"sync":true,"direct_workspaces":true,
+        json!({"version":1,"repository":self.config.repository,"harnesses":harnesses,"previews":self.previews.enabled(),
+            "stop":true,"resume":true,"launch_settings":true,"prompt_reasoning":true,"workspaces":true,"sync":true,"direct_workspaces":true,"teleport":true,"command_guard":true,"codex_auth":true,"codex_auth_import":true,"cursor_auth":true,
             "structured_prompt":true,"queue_edit":true,"queue_cancel":true,"steer":true,"rewind":true,
             "attachments":true,"compact":true,"usage":true,"subagents":true})
     }
@@ -791,7 +991,12 @@ impl Manager {
         } else if let Some(saved) = session.resume()
             && let Some(profile) = self.config.harnesses.get(&session.harness)
         {
-            match runtime::check_resume_history(profile, &saved, self.config.storage.as_ref()) {
+            match runtime::check_resume_history(
+                session.harness,
+                profile,
+                &saved,
+                self.config.storage.as_ref(),
+            ) {
                 Ok(()) => (
                     "ready",
                     "Saved conversation is available; the native resume handshake is still required",
@@ -840,7 +1045,7 @@ impl Manager {
         model: Option<String>,
         reasoning: Option<String>,
         (workspace, workspace_name): (Option<String>, Option<String>),
-        provider: Option<String>,
+        (provider, command_guard_enabled): (Option<String>, Option<bool>),
     ) -> Result<(String, Receipt)> {
         let id = format!("cr_{request}");
         let kind = harness
@@ -858,6 +1063,9 @@ impl Manager {
         } else {
             json!({"harness":kind})
         };
+        if command_guard_enabled == Some(false) {
+            input["command_guard_enabled"] = json!(false);
+        }
         if let Some(model) = &model {
             input["model"] = json!(model);
         }
@@ -915,10 +1123,49 @@ impl Manager {
         if !self.config.harnesses.contains_key(&kind) {
             return Err(Error::Conflict("harness is not configured"));
         }
+        if kind == runtime::Kind::Claude {
+            match self
+                .claude_auth
+                .ready(&self.config, &self.observability)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Error::Conflict(
+                        "connect Claude Code before starting cloud work",
+                    ));
+                }
+                Err(_) => return Err(Error::Conflict("Claude account could not be verified")),
+            }
+        }
+        if kind == runtime::Kind::Cursor {
+            match self.cursor_auth_status().await.state {
+                "connected" => {}
+                "unavailable" => {
+                    return Err(Error::Conflict("Cursor account could not be verified"));
+                }
+                _ => return Err(Error::Conflict("connect Cursor before starting cloud work")),
+            }
+            if command_guard_enabled != Some(false) {
+                return Err(Error::Conflict(
+                    "Cursor Command Guard support is not verified",
+                ));
+            }
+        }
+        if kind == runtime::Kind::Codex {
+            match self.codex_auth_status().await.state {
+                "connected" => {}
+                "missing" | "waiting" | "expired" | "error" => {
+                    return Err(Error::Conflict("connect Codex before starting cloud work"));
+                }
+                "limited" => return Err(Error::Conflict("Codex usage limit reached")),
+                _ => return Err(Error::Conflict("Codex account could not be verified")),
+            }
+        }
         if let Some(reasoning) = &reasoning {
             let supported = match kind {
-                runtime::Kind::Codex => {
-                    let models = self.codex_models().await?;
+                runtime::Kind::Codex | runtime::Kind::Claude => {
+                    let models = self.model_catalog(kind).await?;
                     let selected = model
                         .as_ref()
                         .unwrap_or(&self.config.harnesses[&kind].model);
@@ -928,7 +1175,9 @@ impl Manager {
                         .ok_or(Error::Conflict("invalid model"))?;
                     entry.reasoning_levels.contains(reasoning)
                 }
-                runtime::Kind::Pi => runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str()),
+                runtime::Kind::Pi | runtime::Kind::Cursor => {
+                    runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str())
+                }
             };
             if !supported {
                 return Err(Error::Conflict("invalid reasoning effort"));
@@ -1026,9 +1275,10 @@ impl Manager {
                 failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
                 config.repository = session.workspace.as_ref().ok_or_else(|| io::Error::other("session workspace missing"))?.path.canonicalize()?;
                 let (kind, reasoning) = (session.harness, session.reasoning.clone());
+                let command_guard_enabled = session.command_guard_enabled();
                 // Claim before spawning: a crash after this point must not repeat uncertain execution.
                 local.append(&id, "state", json!({"state":"starting"}), None)?;
-                let (handle, events) = runtime::Handle::spawn(&config, kind, None)?;
+                let (handle, events) = runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled)?;
                 let handle = handle.with_reasoning(reasoning);
                 let pid = handle.pid();
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
@@ -1039,12 +1289,7 @@ impl Manager {
             let native = handle.start_session().await?;
             let mut local = self.local.lock().unwrap();
             self.remember_launch_reasoning(&mut local, &id, &handle)?;
-            local.append(
-                &id,
-                "native_identity",
-                json!({"id":native,"model":handle.model(),"provider":handle.provider(),"capabilities":handle.capabilities()}),
-                None,
-            )?;
+            local.append(&id, "native_identity", handle.native_identity(&native)?, None)?;
             if local.sessions[&id].handle.is_none() {
                 return Err(io::Error::other("harness exited during initialization"));
             }
@@ -1103,6 +1348,11 @@ impl Manager {
         let (kind, model) = {
             let local = self.local.lock().unwrap();
             let session = local.sessions.get(id).ok_or(Error::NotFound)?;
+            if session.harness == runtime::Kind::Cursor
+                && session.reasoning.as_deref() != Some(reasoning)
+            {
+                return Err(Error::Conflict("invalid reasoning effort"));
+            }
             let model = session.model.clone().or_else(|| {
                 self.config
                     .harnesses
@@ -1112,8 +1362,8 @@ impl Manager {
             (session.harness, model)
         };
         let supported = match kind {
-            runtime::Kind::Codex => {
-                let models = self.codex_models().await?;
+            runtime::Kind::Codex | runtime::Kind::Claude => {
+                let models = self.model_catalog(kind).await?;
                 let selected = model.ok_or(Error::Conflict("invalid model"))?;
                 models
                     .iter()
@@ -1123,7 +1373,9 @@ impl Manager {
                     .iter()
                     .any(|level| level == reasoning)
             }
-            runtime::Kind::Pi => runtime::PI_REASONING_LEVELS.contains(&reasoning),
+            runtime::Kind::Pi | runtime::Kind::Cursor => {
+                runtime::PI_REASONING_LEVELS.contains(&reasoning)
+            }
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));
@@ -1281,6 +1533,9 @@ impl Manager {
                     }
                 }
             }
+            if command == "steer" && session.harness == runtime::Kind::Claude {
+                return Err(Error::Conflict("Claude live steering is not supported"));
+            }
             if command == "steer"
                 && (!session.ready
                     || handle.is_none()
@@ -1289,6 +1544,11 @@ impl Manager {
                 return Err(Error::Conflict(
                     "steer target is no longer the active request",
                 ));
+            }
+            if matches!(command, "compact" | "rewind" | "steer")
+                && session.capabilities[command] == false
+            {
+                return Err(Error::Conflict("operation is unsupported by this harness"));
             }
             if command == "compact" {
                 if session.compacting {
@@ -1659,7 +1919,7 @@ impl Manager {
 
     fn rewind(self: Arc<Self>, id: String, request: String, input: Value, handle: runtime::Handle) {
         tokio::spawn(async move {
-            let result = handle.rewind(&input).await;
+            let result = self.rewind_native(&id, &request, &input, &handle).await;
             let mut local = self.local.lock().unwrap();
             if !local.sessions[&id]
                 .handle
@@ -1686,6 +1946,74 @@ impl Manager {
                 }
             }
         });
+    }
+
+    async fn rewind_native(
+        self: &Arc<Self>,
+        id: &str,
+        request: &str,
+        input: &Value,
+        handle: &runtime::Handle,
+    ) -> io::Result<Value> {
+        let mut config = self.config.clone();
+        {
+            let local = self.local.lock().unwrap();
+            config.repository = local.sessions[id]
+                .workspace
+                .as_ref()
+                .ok_or_else(|| io::Error::other("session workspace missing"))?
+                .path
+                .canonicalize()?;
+        }
+        let Some((replacement, events)) = handle.rewind_replacement(&config, input)? else {
+            return handle.rewind(input).await;
+        };
+        let result = async {
+            let native = replacement.start_session().await?;
+            let path = replacement.native_location()?;
+            handle.request_shutdown();
+            // Let the original recorder drain before changing its native-history cursor.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if self.local.lock().unwrap().sessions[id].handle.is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                io::Error::other("original harness did not finish recording before rewind")
+            })?;
+            {
+                let mut local = self.local.lock().unwrap();
+                if self.is_stopping()
+                    || local.sessions[id].rewind_request.as_deref() != Some(request)
+                {
+                    return Err(io::Error::other("rewind ownership changed"));
+                }
+                local.sessions.get_mut(id).unwrap().handle = Some(replacement.clone());
+                local.sessions.get_mut(id).unwrap().ready = true;
+                local.append(id, "harness", json!({"pid":replacement.pid()}), None)?;
+            }
+            self.record_native(
+                id,
+                &replacement,
+                runtime::Event::Record {
+                    kind: "rewind_ready",
+                    data: json!({"id":native,"path":path,"cursor":{"offset":0}}),
+                    native: None,
+                },
+            )
+            .map_err(|_| io::Error::other("could not persist replacement identity"))?;
+            self.watch_events(id.to_owned(), replacement.clone(), events);
+            Ok(json!({"id":native,"path":path}))
+        }
+        .await;
+        if result.is_err() {
+            replacement.request_shutdown();
+        }
+        result
     }
 
     /// Move a ready session to its next turn: dispatch the next queued prompt, wait
@@ -1865,16 +2193,32 @@ impl Manager {
                     .get(&kind)
                     .ok_or_else(|| io::Error::other("harness not configured"))?;
                 // Capture any final orphan writes after ownership reconciliation.
-                runtime::recover_records(profile, kind, &saved, self.config.storage.as_ref(), |event| {
-                    if let runtime::Event::Record { kind, data, native } = event {
-                        local.append(&id, kind, data, native)?;
-                    }
-                    Ok(())
-                })?;
+                runtime::recover_records(
+                    profile,
+                    kind,
+                    &saved,
+                    self.config.storage.as_ref(),
+                    |event| {
+                        if let runtime::Event::Record { kind, data, native } = event {
+                            local.append(&id, kind, data, native)?;
+                        }
+                        Ok(())
+                    },
+                )?;
                 saved.cursor = local.sessions[&id].native_cursor.clone();
                 let mut config = self.config.clone();
-                config.repository = local.sessions[&id].workspace.as_ref().ok_or_else(|| io::Error::other("session workspace missing"))?.path.canonicalize()?;
-                let (handle, events) = runtime::Handle::spawn(&config, kind, Some(saved))?;
+                config.repository = local.sessions[&id]
+                    .workspace
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("session workspace missing"))?
+                    .path
+                    .canonicalize()?;
+                let (handle, events) = runtime::Handle::spawn_guarded(
+                    &config,
+                    kind,
+                    Some(saved),
+                    local.sessions[&id].command_guard_enabled(),
+                )?;
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
                 local.append(&id, "harness", json!({"pid":handle.pid()}), None)?;
                 (handle, events, native)
@@ -1893,15 +2237,20 @@ impl Manager {
             local.append(
                 &id,
                 "native_identity",
-                json!({"id":native,"model":handle.model(),"provider":handle.provider(),"capabilities":handle.capabilities()}),
+                handle.native_identity(&native)?,
                 None,
             )?;
             local.append(&id, "state", json!({"state":"idle"}), None)?;
-            let retries: Vec<_> = local.sessions[&id].receipts.values()
+            let retries: Vec<_> = local.sessions[&id]
+                .receipts
+                .values()
                 .filter(|r| r.command == "resume" && r.state == "accepted")
-                .map(|r| r.request_id.clone()).collect();
+                .map(|r| r.request_id.clone())
+                .collect();
             for request in retries {
-                local.finish_receipt(&id, &request, "completed").map_err(|_| io::Error::other("cannot record resume outcome"))?;
+                local
+                    .finish_receipt(&id, &request, "completed")
+                    .map_err(|_| io::Error::other("cannot record resume outcome"))?;
             }
             if local.sessions[&id].storage_paused {
                 local.append(
@@ -1983,6 +2332,11 @@ impl Manager {
             return Ok(());
         }
         match event {
+            runtime::Event::Authentication { accepted } => {
+                if local.sessions[id].harness == runtime::Kind::Claude {
+                    self.claude_auth.request(accepted, &self.observability);
+                }
+            }
             runtime::Event::ChildRequest(child) => {
                 self.start_child(&mut local, id, handle, child)?;
             }
@@ -2091,6 +2445,13 @@ impl Manager {
                     expected,
                     details,
                 );
+                if expected && cleaned_up && local.sessions[id].rewind_request.is_some() {
+                    let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
+                    session.handle = None;
+                    session.ready = false;
+                    local.append(id, "harness", json!({"pid":null}), None)?;
+                    return Ok(());
+                }
                 let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
                 let restoring = session.state == "resuming"
                     && session.native_id.is_some()
@@ -2197,8 +2558,10 @@ impl Manager {
                             .collect();
                         let mut warnings = Vec::new();
                         for id in ids {
-                            let text = if snapshot.level == Level::Blocked {
-                                "Cloudroom: disk space is critically low or could not be measured. Work is paused until storage recovers. Your files and history are preserved."
+                            let text = if snapshot.reason == "measurement_unavailable" {
+                                "Cloudroom: disk space could not be measured. Work is paused until storage can be verified. Your files and history are preserved."
+                            } else if snapshot.level == Level::Blocked {
+                                "Cloudroom: disk space is critically low. Work is paused until storage recovers. Your files and history are preserved."
                             } else {
                                 "Cloudroom: disk space is running low. Work and sync continue. Remove disposable files or add storage; large writes may trigger an emergency pause."
                             };
@@ -2258,7 +2621,11 @@ impl Manager {
                                 let _ = local.append(
                                         &id,
                                         "storage_pause",
-                                        json!({"paused":true,"text":"Cloudroom: work paused because disk space is critically low or could not be measured. Your files and history are preserved."}),
+                                        json!({"paused":true,"reason":snapshot.reason,"text":if snapshot.reason == "measurement_unavailable" {
+                                            "Cloudroom: disk space could not be measured. Work is paused until storage can be verified."
+                                        } else {
+                                            "Cloudroom: work paused because disk space is critically low. Work resumes automatically when space recovers."
+                                        }}),
                                         None,
                                     );
                             }
@@ -2357,6 +2724,9 @@ impl Manager {
     }
 
     pub async fn shutdown(&self) {
+        self.codex_auth.shutdown();
+        self.claude_auth.shutdown().await;
+        self.cursor_auth.shutdown().await;
         let mut changed = self.subscribe();
         {
             let mut local = self.local.lock().unwrap();

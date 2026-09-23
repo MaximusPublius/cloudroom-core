@@ -5,7 +5,24 @@ export type Json =
   | string
   | Json[]
   | { [key: string]: Json };
-export type Harness = "codex" | "pi";
+export type Harness = "codex" | "pi" | "cursor" | "claude-code";
+export type CodexAuthStatus = {
+  state: "missing" | "waiting" | "connected" | "limited" | "unavailable" | "error" | "expired";
+  email: string | null; plan: string | null; message: string | null;
+  login_id: string | null; verification_url: string | null; user_code: string | null;
+};
+export type TeleportFile = { path: string; size: number; sha256: string; kind: "native" | "context" | "project" | "attachment"; executable: boolean; symlink?: boolean; origin?: string };
+export type TeleportManifest = {
+  request_id: string; harness: Exclude<Harness, "cursor" | "claude-code">; native_id: string; model: string; provider: string | null; reasoning: string | null;
+  workspace: string; workspace_name: string; files: TeleportFile[]; handoff: string;
+  service_tier?: string | null; command_guard_enabled?: boolean;
+  queued: (string | { text: string; reasoning?: string; service_tier?: string })[];
+};
+export type TeleportStatus = {
+  request_id: string; session_id: string | null; phase: "uploading" | "running" | "complete" | "cancelled";
+  output_started: boolean; error: string | null; workspace: string;
+  files: { index: number; offset: number; complete: boolean; path: string | null }[];
+};
 export type Workspace = { id: string; path: string; parent?: string };
 type Upload = { body: ReadableStream<Uint8Array>; length: number; contentType?: string };
 export type Receipt = {
@@ -37,6 +54,19 @@ export type Session = {
 };
 
 const rejectionMessages: Record<string, string> = {
+  cursor_auth_required: "Connect your Cursor account to use Cursor in Cloud. Your prompt is saved.",
+  cursor_auth_unavailable: "Could not verify the cloud Cursor account. Check the connection and try again.",
+  cursor_auth_busy: "Close Cursor sessions before changing the cloud login. Existing threads were not changed.",
+  cursor_guard_unsupported: "Cursor Command Guard support is not verified. This guarded start was blocked; no work ran. Explicitly disable Command Guard for a new session only if you accept running without it.",
+  teleport_rejected: "Teleport could not validate its saved conversation or files. The source is preserved. Check the transfer details and core logs before retrying.",
+  teleport_cancelled: "This transfer was cancelled. Local history is preserved.",
+  teleport_running: "Cloud execution already owns this transfer. Use Stop instead of Cancel.",
+  codex_auth_required: "Connect your ChatGPT subscription to use Codex in Cloud. Your prompt is saved.",
+  claude_auth_required: "On the cloud VM, run `claude auth login` as the agent account and choose your existing Claude subscription. Complete Claude's official sign-in, then retry this saved task. Do not paste login codes or tokens into Cloudroom.",
+  claude_auth_unavailable: "Could not verify the cloud Claude account. Check the CLI installation and native login, then retry.",
+  codex_auth_unavailable: "Could not verify the cloud Codex account. Check the connection and try again.",
+  codex_usage_limit: "Your Codex usage limit is reached. Wait for it to reset; signing in again will not reset it.",
+  codex_auth_busy: "Finish active Codex work before signing in. Running threads were not changed.",
   invalid_provider: "Select a valid inference provider for Pi.",
   invalid_model: "This model is unavailable on Cloud. Refresh the model selection.",
   invalid_reasoning_effort: "This reasoning level is unavailable for the cloud model. Select a supported level.",
@@ -51,7 +81,7 @@ const rejectionMessages: Record<string, string> = {
   attachment_permission_denied: "Cloud folder permission denied",
   attachment_too_large: "The attachment exceeds the Cloud size limit (10 MiB per image, 25 MiB per file).",
 };
-const transientRejections = new Set(["storage_blocked", "service_stopping", "model_catalog_unavailable"]);
+const transientRejections = new Set(["storage_blocked", "service_stopping", "model_catalog_unavailable", "codex_auth_unavailable", "claude_auth_unavailable", "cursor_auth_unavailable"]);
 
 export class CloudroomError extends Error {
   readonly status: number | null;
@@ -225,6 +255,24 @@ export class CloudroomClient {
     }
   }
 
+  async prepareTeleport(manifest: TeleportManifest): Promise<TeleportStatus> {
+    return await this.#json("/v1/teleports", manifest) as unknown as TeleportStatus;
+  }
+  async teleportStatus(id: string): Promise<TeleportStatus> {
+    return await this.#json(`/v1/teleports/${encodeURIComponent(id)}`) as unknown as TeleportStatus;
+  }
+  async activateTeleport(id: string, retryRequestId?: string): Promise<TeleportStatus> {
+    return await this.#json(`/v1/teleports/${encodeURIComponent(id)}/activate`, retryRequestId ? { retry_request_id: retryRequestId } : {}) as unknown as TeleportStatus;
+  }
+  async cancelTeleport(id: string): Promise<TeleportStatus> {
+    return await this.#json(`/v1/teleports/${encodeURIComponent(id)}/cancel`, {}) as unknown as TeleportStatus;
+  }
+  async uploadTeleport(id: string, index: number, offset: number, sha256: string, bytes: Uint8Array, size?: number): Promise<TeleportStatus> {
+    return await this.#json(`/v1/teleports/${encodeURIComponent(id)}/files/${index}?offset=${offset}&sha256=${encodeURIComponent(sha256)}${size === undefined ? "" : `&size=${size}`}`, undefined, undefined, {
+      body: new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }), length: bytes.length, contentType: "application/octet-stream",
+    }) as unknown as TeleportStatus;
+  }
+
   async #request(
     path: string,
     body?: Json,
@@ -361,6 +409,27 @@ export class CloudroomClient {
   dashboard(signal?: AbortSignal) {
     return this.#json("/v1/dashboard", undefined, signal);
   }
+  async codexAuth(action?: "login" | "cancel", id?: string, signal?: AbortSignal): Promise<CodexAuthStatus> {
+    const value = await this.#json(`/v1/accounts/codex${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? "") } : undefined, signal);
+    if (!["missing", "waiting", "connected", "limited", "unavailable", "error", "expired"].includes(String(value.state))) throw new CloudroomError("Invalid Codex account status");
+    const nullable = (key: string) => value[key] === null ? null : text(value[key]);
+    const result = { state: value.state as CodexAuthStatus["state"], email: nullable("email"), plan: nullable("plan"), message: nullable("message"), login_id: nullable("login_id"), verification_url: nullable("verification_url"), user_code: nullable("user_code") };
+    if (result.verification_url !== null && result.verification_url !== "https://auth.openai.com/codex/device") throw new CloudroomError("Unexpected Codex sign-in URL");
+    return result;
+  }
+
+  async cursorAuth(action?: "login" | "cancel" | "key", id?: string, apiKey?: string, signal?: AbortSignal): Promise<CodexAuthStatus> {
+    const value = await this.#json(`/v1/accounts/cursor${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "key" ? { api_key: apiKey } : {}) } : undefined, signal);
+    if (!["missing", "waiting", "connected", "limited", "unavailable", "error", "expired"].includes(String(value.state))) throw new CloudroomError("Invalid Cursor account status");
+    const nullable = (key: string) => value[key] === null ? null : text(value[key]);
+    const result = { state: value.state as CodexAuthStatus["state"], email: nullable("email"), plan: nullable("plan"), message: nullable("message"), login_id: nullable("login_id"), verification_url: nullable("verification_url"), user_code: nullable("user_code") };
+    if (result.verification_url !== null) {
+      const url = new URL(result.verification_url);
+      if (url.origin !== "https://cursor.com" || url.pathname !== "/loginDeepControl" || url.username || url.password) throw new CloudroomError("Unexpected Cursor sign-in URL");
+    }
+    return result;
+  }
+
   capabilities(signal?: AbortSignal) {
     return this.#json("/v1/capabilities", undefined, signal);
   }
@@ -377,8 +446,8 @@ export class CloudroomClient {
     }
   }
 
-  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string } = {}) {
-    if (harness !== "codex" && harness !== "pi")
+  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean } = {}) {
+    if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code")
       throw new CloudroomError("Unsupported Cloudroom harness");
     return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
   }
@@ -540,7 +609,7 @@ export class CloudroomClient {
     );
     if (
       value.session_id !== sessionId ||
-      (value.harness !== "codex" && value.harness !== "pi")
+      (value.harness !== "codex" && value.harness !== "pi" && value.harness !== "cursor" && value.harness !== "claude-code")
     ) {
       throw new CloudroomError(
         "Cloudroom session mismatch or unsupported harness",
