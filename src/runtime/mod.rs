@@ -13,14 +13,18 @@ use tokio::{process::Command, sync::mpsc};
 pub(crate) mod auth;
 mod claude;
 pub(crate) mod claude_auth;
+pub(crate) mod claude_login;
 mod claude_skills;
 mod codex;
 mod command_guard;
 pub(crate) mod cursor;
 pub(crate) mod cursor_auth;
+pub(crate) mod cursor_models;
 mod files;
+mod fx;
 pub(crate) mod linux;
 mod pi;
+pub(crate) mod pi_auth;
 mod process;
 
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
@@ -36,12 +40,35 @@ pub enum Kind {
     Cursor,
     #[serde(rename = "claude-code")]
     Claude,
+    Fx,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Model {
     pub model: String,
     pub reasoning_levels: Vec<String>,
+}
+
+/// One detailed answer for "can this catalog run this model at this effort?" (ADR 0123).
+pub fn supports(models: &[Model], model: &str, reasoning: &str) -> Result<(), String> {
+    let Some(entry) = models.iter().find(|entry| entry.model == model) else {
+        let offered: Vec<&str> = models.iter().map(|entry| entry.model.as_str()).collect();
+        return Err(format!(
+            "model {model} is not offered on this VM; offered models: {}",
+            offered.join(", ")
+        ));
+    };
+    if entry
+        .reasoning_levels
+        .iter()
+        .any(|level| level == reasoning)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "model {model} does not support {reasoning} effort on this VM; supported: {}",
+        entry.reasoning_levels.join(", ")
+    ))
 }
 
 pub const PI_REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
@@ -52,6 +79,19 @@ pub async fn claude_auth_ready(config: &Config) -> io::Result<bool> {
 
 pub async fn codex_models(config: &Config) -> (io::Result<Vec<Model>>, Option<Event>) {
     models(config, Kind::Codex).await
+}
+
+/// Prove the harness can answer with this exact model before Teleport moves anything.
+pub async fn probe(
+    config: &Config,
+    kind: Kind,
+    model: &str,
+    reasoning: Option<&str>,
+) -> io::Result<()> {
+    match kind {
+        Kind::Claude => claude::probe(config, model, reasoning).await,
+        _ => Ok(()),
+    }
 }
 
 pub async fn models(config: &Config, kind: Kind) -> (io::Result<Vec<Model>>, Option<Event>) {
@@ -115,6 +155,7 @@ pub enum Event {
     Finished {
         request: String,
         status: String,
+        error: Option<String>,
     },
     Compacted {
         status: String,
@@ -131,6 +172,8 @@ pub enum Event {
 /// Intentionally neither Serialize nor Debug: only Observability's private writer formats it.
 #[derive(Default)]
 pub struct ExitDetails {
+    /// Core-side error behind the exit reason (not harness output), shown to users (ADR 0123).
+    pub cause: Option<String>,
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub stderr_bytes: u64,
@@ -168,7 +211,7 @@ impl Progress {
             native_turn: self.native_turn.clone(),
         })
     }
-    fn finished(&mut self, status: &str) -> Option<Event> {
+    fn finished(&mut self, status: &str, error: Option<String>) -> Option<Event> {
         let request = self.request.clone()?;
         if self.finished {
             return None;
@@ -177,6 +220,7 @@ impl Progress {
         Some(Event::Finished {
             request,
             status: status.into(),
+            error,
         })
     }
 }
@@ -301,8 +345,24 @@ impl Handle {
                 None,
             ),
             Kind::Cursor => (
-                cursor::command(config, &profile, command_guard_enabled)?,
-                Box::new(cursor::Protocol::new(config, &profile, resume.as_ref())),
+                cursor::command(config, &profile)?,
+                Box::new(cursor::Protocol::new(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    cursor::CURSOR,
+                )),
+                None,
+                None,
+            ),
+            Kind::Fx => (
+                fx::command(config, &profile)?,
+                Box::new(cursor::Protocol::new(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    fx::FX,
+                )),
                 None,
                 None,
             ),
@@ -356,6 +416,9 @@ impl Handle {
     pub fn pid(&self) -> u32 {
         self.process.pid()
     }
+    pub fn process_count(&self) -> Option<usize> {
+        self.process.process_count()
+    }
     pub fn same_process(&self, other: &Self) -> bool {
         self.process.progress.same_channel(&other.process.progress)
     }
@@ -380,7 +443,7 @@ impl Handle {
         Ok(data)
     }
     pub fn capabilities(&self) -> Value {
-        if self.kind == Kind::Cursor {
+        if matches!(self.kind, Kind::Cursor | Kind::Fx) {
             return cursor::capabilities();
         }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
@@ -395,6 +458,7 @@ impl Handle {
             Kind::Pi => pi::start(&startup).await,
             Kind::Claude => claude::start(&startup).await,
             Kind::Cursor => cursor::start(&startup).await,
+            Kind::Fx => fx::start(&startup).await,
         }
     }
     /// Pi confirms the turn's thinking level before the prompt. Codex sends effort with turn/start.
@@ -414,7 +478,7 @@ impl Handle {
             Kind::Codex => codex::send(self, request, input).await,
             Kind::Pi => pi::send(self, request, input).await,
             Kind::Claude => claude::send(self, request, input).await,
-            Kind::Cursor => cursor::send(self, request, input).await,
+            Kind::Cursor | Kind::Fx => cursor::send(self, request, input).await,
         }
     }
     pub async fn steer(&self, request: &str, text: &str) -> io::Result<()> {
@@ -432,7 +496,7 @@ impl Handle {
                 io::ErrorKind::InvalidInput,
                 "Claude live steering is not supported",
             )),
-            Kind::Cursor => cursor::steer(self, request, text).await,
+            Kind::Cursor | Kind::Fx => cursor::steer(self, request, text).await,
         }
     }
     pub async fn compact(&self) -> io::Result<()> {
@@ -440,9 +504,9 @@ impl Handle {
             Kind::Codex => codex::compact(self).await,
             Kind::Pi => pi::compact(self).await,
             Kind::Claude => claude::compact(self).await,
-            Kind::Cursor => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Cursor ACP compaction is not supported",
+                "ACP compaction is not supported",
             )),
         }
     }
@@ -453,9 +517,9 @@ impl Handle {
             Kind::Claude => Err(io::Error::other(
                 "Claude rewind requires native process replacement",
             )),
-            Kind::Cursor => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Cursor ACP rewind is not supported",
+                "ACP rewind is not supported",
             )),
         }
     }
@@ -516,7 +580,7 @@ impl Handle {
             Kind::Codex => Ok(None),
             Kind::Pi => pi::usage(self).await,
             Kind::Claude => Ok(Some(self.process.progress.borrow().last_usage.clone())),
-            Kind::Cursor => Ok(None),
+            Kind::Cursor | Kind::Fx => Ok(None),
         }
     }
     pub async fn interrupt(&self, request: &str) -> io::Result<()> {
@@ -531,7 +595,7 @@ impl Handle {
             Kind::Codex => codex::interrupt(self, state).await,
             Kind::Pi => pi::interrupt(self, request).await,
             Kind::Claude => claude::interrupt(self, request).await,
-            Kind::Cursor => cursor::interrupt(self, state).await,
+            Kind::Cursor | Kind::Fx => cursor::interrupt(self, state).await,
         }
     }
     pub async fn system_message(&self, text: &str) -> io::Result<()> {
@@ -539,9 +603,9 @@ impl Handle {
             Kind::Codex => codex::notice(self, text).await,
             Kind::Pi => pi::notice(self, text).await,
             Kind::Claude => claude::notice(self, text).await,
-            Kind::Cursor => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Cursor ACP context-only notices are unavailable",
+                "ACP context-only notices are unavailable",
             )),
         }
     }
@@ -572,8 +636,11 @@ pub fn check_resume_history(
     saved: &Resume,
     policy: Option<&crate::workspace::storage::Policy>,
 ) -> io::Result<()> {
-    if kind == Kind::Cursor {
-        return cursor::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)));
+    let identity = policy.map(|p| (p.agent_uid, p.agent_gid));
+    match kind {
+        Kind::Cursor => return cursor::validate(profile, saved, identity),
+        Kind::Fx => return fx::validate(profile, saved, identity),
+        _ => {}
     }
     let file = files::open(
         &profile.home.join(if kind == Kind::Claude {
@@ -582,7 +649,7 @@ pub fn check_resume_history(
             "sessions"
         }),
         &saved.path,
-        policy.map(|p| (p.agent_uid, p.agent_gid)),
+        identity,
     )?;
     if file.metadata()?.len() == 0 {
         return Err(io::Error::new(
@@ -602,6 +669,8 @@ pub fn recover_records(
 ) -> io::Result<()> {
     match kind {
         Kind::Cursor => cursor::recover(profile, saved, policy, emit),
+        // fx keeps its own session files; Cloudroom stores the ACP stream only.
+        Kind::Fx => fx::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid))),
         Kind::Codex => codex::recover(
             profile,
             saved,
@@ -641,14 +710,21 @@ pub fn checkpoint(
         Kind::Codex | Kind::Claude => files::checkpoint(previous, data, native),
         Kind::Pi => pi::checkpoint(data, native),
         Kind::Cursor => cursor::checkpoint(previous, data, native),
+        Kind::Fx => Err(io::Error::other("fx has no native records")),
     }
 }
 
 pub(super) fn command(binary: &Path, config: &Config) -> Command {
+    // System tools come first; tools the agent installed itself follow (ADR 0119).
+    let mut path = std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin");
+    for folder in [".local/bin", ".cargo/bin", "go/bin"] {
+        path.push(":");
+        path.push(config.account_home.join(folder));
+    }
     let mut command = Command::new(binary);
     command
         .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", path)
         .env("HOME", &config.account_home)
         .env("LANG", "C.UTF-8")
         .current_dir(&config.repository)

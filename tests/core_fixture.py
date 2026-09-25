@@ -276,9 +276,12 @@ class ReplayTests(unittest.TestCase):
                 (self.repo / 'auth-state').write_text(mode)
                 self.start()
                 self.assertEqual(self.service.request('GET', '/v1/accounts/codex')['state'], expected)
-                if mode in ('offline', 'limited'):
+                if mode == 'offline':
                     self.assertEqual(self.service.request('POST', '/v1/accounts/codex/login', {'request_id': 'must-not-replace'}, 202)['state'], expected)
                     self.assertFalse((self.repo / 'auth-attempts').exists())
+                if mode == 'limited':
+                    # A limited account may switch to another subscription.
+                    self.assertEqual(self.service.request('POST', '/v1/accounts/codex/login', {'request_id': 'switch'}, 202)['state'], 'waiting')
                 self.service.stop()
         (self.repo / 'auth-state').write_text('missing')
         self.start()
@@ -376,14 +379,17 @@ class ReplayTests(unittest.TestCase):
                 responses.extend(next_event(stream) for _ in records)
             finally:
                 stream.close(); connection.close()
-        self.assertNotIn(marker, json.dumps(responses))
+            # Crash stderr tails are shown to the session owner (ADR 0123), bounded to 2000 bytes.
+            tails = [r['data']['stderr'] for r in records if r['data'].get('stderr')]
+            self.assertTrue(tails and tails[-1].endswith(marker) and len(tails[-1]) <= 2000)
+        self.assertNotIn(marker, json.dumps(responses[:2]))
         self.service.request('GET', '/v1/health')
         self.service.stop()
         self.assertEqual(private.stat().st_mode & 0o777, 0o700)
         for path in private.glob('*.jsonl'):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertLessEqual(path.stat().st_size, 1024 * 1024)
-        for path in [*self.state.glob('*.record'), *self.state.glob('diagnostics*.jsonl'), self.root / 'service.log']:
+        for path in [*self.state.glob('diagnostics*.jsonl'), self.root / 'service.log']:
             self.assertNotIn(marker, path.read_text())
         before = {p.name:p.read_bytes() for p in private.glob('*.jsonl')}
         private.chmod(0o755)  # An unsafe sink must lose diagnostics, not stop execution or leak text.
@@ -516,6 +522,13 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(data["onboarding"], {"localConnected": None, "offlineTaskVerified": None})
         for secret in ["SECRET-CANARY", "PRIVATE-TRANSCRIPT", str(self.root), self.env["CLOUDROOM_TOKEN"], "receipts", "native_path"]:
             self.assertNotIn(secret, json.dumps(data))
+        self.service.request("GET", "/v1/sessions", expected=401, token="wrong")
+        listed = self.service.request("GET", "/v1/sessions")
+        self.assertEqual((listed["total"], len(listed["sessions"])), (1001, 1000))
+        self.assertEqual({k: listed["sessions"][0][k] for k in ("session_id", "state", "queued")},
+                         {"session_id": "session-1000", "state": "closed", "queued": 0})
+        self.assertNotIn("SECRET-CANARY", json.dumps(listed))
+        self.assertNotIn("PRIVATE-TRANSCRIPT", json.dumps(listed))
         until(lambda: self.service.request("GET", "/v1/dashboard")["sampledAt"] is not None, "resource sampling", 15)
         sampled = self.service.request("GET", "/v1/dashboard")
         self.assertLessEqual(sampled["sampledAt"], int(time.time() * 1000))

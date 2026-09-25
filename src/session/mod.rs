@@ -2,8 +2,13 @@ mod children;
 mod outbox;
 pub mod teleport;
 pub use outbox::Journal;
+mod accounts;
+mod catalog;
+mod guard;
 mod history;
 mod prompt;
+mod sleep;
+mod state;
 
 use crate::{
     config::Config,
@@ -76,6 +81,8 @@ pub struct Session {
     pub current_request: Option<String>,
     pub current_turn: Option<String>,
     pub startup_error: Option<String>,
+    /// The detailed reason recorded with `startup_error`, shown to users verbatim.
+    pub startup_reason: Option<String>,
     #[serde(skip)]
     has_dispatched: bool,
     pub last_sequence: u64,
@@ -115,6 +122,14 @@ pub struct Session {
     // Last harness pid, so a later instance can reconcile ownership before resuming.
     #[serde(skip)]
     harness_pid: Option<u32>,
+    // The latest turn stopped on a subscription usage limit.
+    #[serde(skip)]
+    usage_limited: bool,
+    #[serde(skip)]
+    awake: Option<sleep::Awake>,
+    // The harness was asked to exit so this idle session can sleep.
+    #[serde(skip)]
+    releasing: bool,
 }
 
 impl Session {
@@ -131,6 +146,7 @@ impl Session {
                 _ => "waiting",
             },
             "closed" => "stopped",
+            "sleeping" => "sleeping",
             "failed" | "process_lost" => "failed",
             _ => "unknown",
         }
@@ -182,7 +198,7 @@ impl Session {
     fn interrupt_pending(&self) -> bool {
         self.receipts.values().any(|receipt| {
             matches!(receipt.command.as_str(), "interrupt" | "stop")
-                && matches!(receipt.state.as_str(), "accepted" | "delivered" | "unknown")
+                && matches!(receipt.state.as_str(), "accepted" | "delivered")
         })
     }
 }
@@ -191,13 +207,25 @@ impl Session {
 pub enum Error {
     NotFound,
     Conflict(&'static str),
-    Storage,
+    /// Carries the underlying cause so API clients can see why storage failed.
+    Storage(String),
 }
-impl From<io::Error> for Error {
-    fn from(_: io::Error) -> Self {
-        Self::Storage
+impl Error {
+    /// Human-readable cause for API bodies that report failures as data.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotFound => "session not found".into(),
+            Self::Conflict(message) => (*message).into(),
+            Self::Storage(detail) => format!("storage unavailable ({detail})"),
+        }
     }
 }
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+const JOURNAL_UNWRITABLE: &str = "session journal is not writable";
 type Result<T> = std::result::Result<T, Error>;
 
 struct Local {
@@ -210,7 +238,7 @@ struct Local {
 }
 
 pub struct Manager {
-    config: Config,
+    pub(crate) config: Config,
     local: Arc<Mutex<Local>>,
     history: history::History,
     pub(crate) observability: Observability,
@@ -218,361 +246,18 @@ pub struct Manager {
     pub(crate) workspaces: crate::workspace::Workspaces,
     pub(crate) sync: crate::sync::Sync,
     pub(crate) previews: Arc<crate::preview::Previews>,
+    pub(crate) mac: crate::mac::Mac,
+    pub(crate) secrets: crate::secrets::Secrets,
     codex_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
     claude_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
+    cursor_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
     codex_auth: runtime::auth::CodexAuth,
     claude_auth: Arc<runtime::claude_auth::ClaudeAuth>,
+    claude_login: runtime::claude_login::ClaudeLogin,
     cursor_auth: runtime::cursor_auth::CursorAuth,
     stopping: AtomicBool,
     startups: Semaphore,
     teleports: teleport::Transfers,
-}
-
-impl Local {
-    fn agent_counts(&self) -> AgentCounts {
-        let mut counts = AgentCounts::default();
-        for session in self.sessions.values() {
-            match session.dashboard_state() {
-                "working" => counts.working += 1,
-                "queued" => counts.queued += 1,
-                "waiting" => counts.waiting += 1,
-                "failed" => counts.failed += 1,
-                _ => {}
-            }
-        }
-        counts
-    }
-
-    fn finish_receipt(&mut self, id: &str, request: &str, state: &str) -> Result<()> {
-        let mut receipt = self
-            .sessions
-            .get(id)
-            .and_then(|s| s.receipts.get(request))
-            .cloned()
-            .ok_or(Error::NotFound)?;
-        if matches!(
-            receipt.state.as_str(),
-            "completed" | "interrupted" | "failed" | "unknown_after_restart"
-        ) || receipt.state == state
-        {
-            return Ok(());
-        }
-        receipt.state = state.into();
-        self.append(
-            id,
-            "receipt",
-            serde_json::to_value(receipt).map_err(io::Error::other)?,
-            None,
-        )?;
-        Ok(())
-    }
-
-    fn fail_pending(&mut self, id: &str) -> Result<()> {
-        for request in self.sessions[id].queue.clone() {
-            self.finish_receipt(id, &request, "failed")?;
-        }
-        Ok(())
-    }
-
-    fn apply(&mut self, record: &Record) -> io::Result<()> {
-        if record.kind == "teleport" {
-            let before = self.sequences.get(&record.session_id).map_or(0, Vec::len);
-            for data in std::iter::once(&record.data["receipt"]).chain(
-                record.data["prompts"]
-                    .as_array()
-                    .ok_or_else(|| io::Error::other("invalid imported prompts"))?,
-            ) {
-                self.apply(&Record {
-                    kind: "receipt".into(),
-                    data: data.clone(),
-                    native: None,
-                    ..record.clone()
-                })?;
-            }
-            let session = self.sessions.get_mut(&record.session_id).unwrap();
-            session.native_id = Some(
-                record.data["native_id"]
-                    .as_str()
-                    .ok_or_else(|| io::Error::other("missing imported identity"))?
-                    .into(),
-            );
-            session.native_path = Some(
-                record.data["native_path"]
-                    .as_str()
-                    .ok_or_else(|| io::Error::other("missing imported history"))?
-                    .into(),
-            );
-            session.state = "suspended".into();
-            let sequences = self.sequences.entry(record.session_id.clone()).or_default();
-            sequences.truncate(before);
-            sequences.push(record.sequence);
-            return Ok(());
-        }
-        let session = self
-            .sessions
-            .entry(record.session_id.clone())
-            .or_insert_with(|| Session {
-                session_id: record.session_id.clone(),
-                state: "starting".into(),
-                ..Session::default()
-            });
-        session.last_sequence = record.sequence;
-        if matches!(record.kind.as_str(), "text_delta" | "thinking_delta")
-            && record.data["delta"].as_str().is_some_and(|s| !s.is_empty())
-        {
-            session.teleport_output = true;
-        }
-        session.last_activity = record.timestamp_ms.or(session.last_activity);
-        match record.kind.as_str() {
-            "receipt" => {
-                let receipt = serde_json::from_value::<Receipt>(record.data.clone())?;
-                if receipt.command == "start" {
-                    session.parent_session =
-                        receipt.input["parent_session"].as_str().map(str::to_owned);
-                    if session.parent_session.is_some()
-                        && receipt.state == "accepted"
-                        && !session.receipts.contains_key(&receipt.request_id)
-                    {
-                        let task = Receipt {
-                            request_id: receipt.request_id.replacen("child_", "task_", 1),
-                            command: "prompt".into(),
-                            input: json!({"text":receipt.input["prompt"],"reasoning":receipt.input["reasoning"]}),
-                            state: "accepted".into(),
-                            model: None,
-                            provider: None,
-                            workspace: None,
-                            error: None,
-                        };
-                        prompt::apply(&mut session.prompts, &task);
-                        session.queue.push(task.request_id.clone());
-                        session.receipts.insert(task.request_id.clone(), task);
-                        session.state = "pending".into();
-                    }
-                    session.workspace = receipt.workspace.clone().or(session.workspace.clone());
-                    if receipt.state == "accepted"
-                        && !session.receipts.contains_key(&receipt.request_id)
-                    {
-                        session.state = "pending".into();
-                    }
-                    // Completing this receipt must not erase a default captured after it was accepted.
-                    if let Some(level) = receipt.input["reasoning"].as_str() {
-                        session.reasoning = Some(level.to_owned());
-                    }
-                    if receipt.model.is_some() {
-                        session.model = receipt.model.clone();
-                    }
-                    if receipt.provider.is_some() {
-                        session.provider = receipt.provider.clone();
-                    }
-                    session.harness = serde_json::from_value(
-                        receipt
-                            .input
-                            .get("harness")
-                            .cloned()
-                            .unwrap_or(json!("codex")),
-                    )?;
-                }
-                if receipt.state == "accepted"
-                    && !session.receipts.contains_key(&receipt.request_id)
-                {
-                    if receipt.command == "stop" {
-                        session.queue_paused = true;
-                    }
-                    if receipt.command == "resume" {
-                        session.queue_paused = false;
-                    }
-                }
-                if receipt.command == "close" {
-                    session.close_request = Some(receipt.request_id.clone());
-                }
-                if receipt.command == "prompt" {
-                    // Acceptance is also queue insertion: one fsynced record, including
-                    // legacy receipts whose separate enqueue write never finished.
-                    if receipt.state == "accepted"
-                        && !session.receipts.contains_key(&receipt.request_id)
-                    {
-                        session.queue.push(receipt.request_id.clone());
-                        session.recovery_attempted = false; // A new user request permits one recovery.
-                    }
-                    if !matches!(receipt.state.as_str(), "accepted" | "running" | "delivered") {
-                        session.queue.retain(|id| id != &receipt.request_id);
-                        session.last_prompt_state = Some(receipt.state.clone());
-                    }
-                    if matches!(receipt.state.as_str(), "completed" | "interrupted") {
-                        session.recovery_attempted = false; // Healthy progress permits a later recovery.
-                    }
-                }
-                if receipt.command == "cancel"
-                    && matches!(receipt.state.as_str(), "accepted" | "completed")
-                    && let Some(target) = receipt.input["target_request_id"].as_str()
-                {
-                    session.queue.retain(|id| id != target);
-                }
-                if receipt.command == "compact" {
-                    let terminal = matches!(
-                        receipt.state.as_str(),
-                        "completed"
-                            | "failed"
-                            | "interrupted"
-                            | "unknown"
-                            | "unknown_after_restart"
-                    );
-                    session.compacting = !terminal
-                        && matches!(
-                            receipt.state.as_str(),
-                            "accepted" | "delivered" | "running" | "unknown"
-                        );
-                    session.compact_request = (!terminal).then(|| receipt.request_id.clone());
-                }
-                if receipt.command == "rewind" && receipt.state == "accepted" {
-                    session.rewind_request = Some(receipt.request_id.clone());
-                    session.state = "rewinding".into();
-                }
-                prompt::apply(&mut session.prompts, &receipt);
-                session.receipts.insert(receipt.request_id.clone(), receipt);
-            }
-            "native_identity" => {
-                let id = record.data["id"]
-                    .as_str()
-                    .ok_or_else(|| io::Error::other("missing native identity"))?;
-                if session.native_id.as_deref().is_some_and(|old| old != id)
-                    && record.data["replaced"] != true
-                {
-                    return Err(io::Error::other("native identity changed"));
-                }
-                session.native_id = Some(id.into());
-                if let Some(capabilities) = record.data.get("capabilities") {
-                    session.capabilities = capabilities.clone();
-                }
-                if let Some(model) = record.data["model"].as_str() {
-                    session.model = Some(model.into());
-                }
-                if let Some(provider) = record.data["provider"].as_str() {
-                    session.provider = Some(provider.into());
-                }
-                if let Some(path) = record.data["path"].as_str() {
-                    session.native_path = Some(path.into());
-                }
-            }
-            "native_record" => {
-                session.native_cursor = runtime::checkpoint(
-                    session.harness,
-                    &session.native_cursor,
-                    &record.data,
-                    record.native.as_deref(),
-                )?;
-                session.native_offset = session.native_cursor["offset"].as_u64().unwrap_or(0);
-            }
-            "state" => {
-                session.state = record.data["state"].as_str().unwrap_or("unknown").into();
-                if session.state == "resuming" {
-                    session.recovery_attempted = true;
-                }
-                if let Some(error) = record.data["startup_error"].as_str() {
-                    session.startup_error = Some(error.into());
-                } else if record.data["reason"] == "native resume or process cleanup failed" {
-                    session.startup_error = Some("resume_failed".into());
-                } else if session.state == "idle" {
-                    session.startup_error = None;
-                }
-                session.current_request = record.data["request_id"].as_str().map(str::to_owned);
-                session.current_turn = record.data["turn_id"].as_str().map(str::to_owned);
-                // Dispatching a queued prompt removes it from the pending queue.
-                if session.state == "starting_turn"
-                    && let Some(request) = record.data["request_id"].as_str()
-                {
-                    session.has_dispatched = true;
-                    session.queue.retain(|id| id != request);
-                }
-            }
-            "enqueue" => {} // Legacy queue membership is already reconstructed from its receipt.
-            "harness" => {
-                session.harness_pid = record.data["pid"].as_u64().map(|pid| pid as u32);
-            }
-            "launch_reasoning" => {
-                if session.reasoning.is_none() {
-                    session.reasoning = record.data["reasoning"].as_str().map(str::to_owned);
-                }
-            }
-            "workspace" => session.workspace = Some(serde_json::from_value(record.data.clone())?),
-            "checkpoint" => session.checkpoint = Some(record.data.clone()),
-            "rewind" => {
-                if let Some(id) = record.data["id"].as_str() {
-                    session.native_id = Some(id.into());
-                }
-                if let Some(path) = record.data["path"].as_str() {
-                    session.native_path = Some(path.into());
-                }
-                session.native_cursor = record.data["cursor"].clone();
-                session.native_offset = session.native_cursor["offset"].as_u64().unwrap_or(0);
-                session.checkpoint = None;
-                session.rewind_request = None;
-                session.state = "idle".into();
-                if let Some(request) = record.data["request_id"].as_str()
-                    && let Some(receipt) = session.receipts.get_mut(request)
-                {
-                    receipt.state = "completed".into();
-                }
-                if let Some(replacement) = record.data.get("replacement").filter(|v| !v.is_null()) {
-                    let receipt: Receipt = serde_json::from_value(replacement.clone())?;
-                    if !session.receipts.contains_key(&receipt.request_id) {
-                        prompt::apply(&mut session.prompts, &receipt);
-                        session.queue.push(receipt.request_id.clone());
-                        session.receipts.insert(receipt.request_id.clone(), receipt);
-                    }
-                }
-            }
-            "rewind_failed" => {
-                session.rewind_request = None;
-                session.state = "idle".into();
-            }
-            "storage_warning" => session.storage_warned = true,
-            "storage_pause" => session.storage_paused = record.data["paused"] == true,
-            "storage_recovered" => {
-                session.storage_warned = false;
-                session.storage_paused = false;
-            }
-            _ => {}
-        }
-        self.sequences
-            .entry(record.session_id.clone())
-            .or_default()
-            .push(record.sequence);
-        Ok(())
-    }
-
-    fn append(
-        &mut self,
-        session: &str,
-        kind: &str,
-        data: Value,
-        native: Option<String>,
-    ) -> io::Result<Record> {
-        if kind == "native_record" {
-            let current = self
-                .sessions
-                .get(session)
-                .ok_or_else(|| io::Error::other("native record has no session"))?;
-            runtime::checkpoint(
-                current.harness,
-                &current.native_cursor,
-                &data,
-                native.as_deref(),
-            )?;
-        }
-        let record = Record {
-            sequence: self.journal.last() + 1,
-            session_id: session.into(),
-            kind: kind.into(),
-            timestamp_ms: Some(now_ms()),
-            data,
-            native,
-        };
-        self.journal.append(&serde_json::to_vec(&record)?)?;
-        self.apply(&record)?;
-        self.changed.send_replace(record.sequence);
-        Ok(record)
-    }
 }
 
 impl Manager {
@@ -637,7 +322,10 @@ impl Manager {
                     )?;
                 }
             }
-            if !matches!(session.state.as_str(), "closed" | "process_lost" | "failed") {
+            if !matches!(
+                session.state.as_str(),
+                "closed" | "process_lost" | "failed" | "sleeping"
+            ) {
                 local.append(
                     &session.session_id,
                     "state",
@@ -646,10 +334,12 @@ impl Manager {
                 )?;
             }
         }
+        // Native recovery runs helpers (Cursor capture) inside the agent cgroup, so prepare it first.
+        let storage = Guard::new(&config)?;
         for session in local.sessions.values().cloned().collect::<Vec<_>>() {
             if let Some(saved) = session.resume()
                 && let Some(profile) = config.harnesses.get(&session.harness)
-                && runtime::recover_records(
+                && let Err(error) = runtime::recover_records(
                     profile,
                     session.harness,
                     &saved,
@@ -661,12 +351,11 @@ impl Manager {
                         Ok(())
                     },
                 )
-                .is_err()
             {
                 local.append(
                     &session.session_id,
                     "native_history_unavailable",
-                    json!({"reason":"native history missing, changed or unreadable"}),
+                    json!({"reason":format!("native history missing, changed or unreadable: {error}")}),
                     None,
                 )?;
                 if session.can_resume() {
@@ -682,7 +371,6 @@ impl Manager {
                 }
             }
         }
-        let storage = Guard::new(&config)?;
         let workspaces = crate::workspace::Workspaces::open(&config)?;
         let sync = crate::sync::Sync::open(&config)?;
         let previews = crate::preview::Previews::open(&config)?;
@@ -702,10 +390,14 @@ impl Manager {
             sync,
             teleports: teleport::Transfers::default(),
             previews,
+            mac: crate::mac::Mac::default(),
+            secrets: crate::secrets::Secrets::default(),
             codex_models: tokio::sync::Mutex::new(None),
             claude_models: tokio::sync::Mutex::new(None),
+            cursor_models: tokio::sync::Mutex::new(None),
             codex_auth: runtime::auth::CodexAuth::default(),
             claude_auth: Arc::new(runtime::claude_auth::ClaudeAuth::default()),
+            claude_login: runtime::claude_login::ClaudeLogin::default(),
             cursor_auth: runtime::cursor_auth::CursorAuth::default(),
             stopping: AtomicBool::new(false),
             // Bound cold-start CPU contention, not the number of running sessions.
@@ -715,89 +407,25 @@ impl Manager {
         }))
     }
 
-    pub fn start_auth_monitor(&self) {
-        self.claude_auth.start(&self.config, &self.observability);
-    }
-
-    pub async fn codex_auth_status(&self) -> runtime::auth::Status {
-        self.codex_auth.status(&self.config).await
-    }
-
-    fn check_codex_login(&self) -> Result<()> {
-        if self.is_stopping() {
-            return Err(Error::Conflict("service is stopping"));
-        }
-        if self.storage.blocks() {
-            return Err(Error::Conflict("storage unsafe; new execution is blocked"));
-        }
-        if self.local.lock().unwrap().sessions.values().any(|s| {
-            s.harness == runtime::Kind::Codex
-                && (s.current_request.is_some()
-                    || (!s.queue_paused && !s.queue.is_empty())
-                    || matches!(s.state.as_str(), "starting" | "resuming" | "pending"))
-        }) {
-            return Err(Error::Conflict(
-                "finish active Codex work before signing in",
-            ));
-        }
-        Ok(())
-    }
-
-    pub async fn codex_login(&self, request: String) -> Result<runtime::auth::Status> {
-        self.check_codex_login()?;
-        Ok(self.codex_auth.login(&self.config, request).await)
-    }
-
-    pub async fn import_codex_login(&self, credentials: Value) -> Result<runtime::auth::Status> {
-        self.check_codex_login()?;
-        Ok(self
-            .codex_auth
-            .import(&self.config, &self.storage, credentials)
-            .await)
-    }
-
-    pub async fn cancel_codex_login(&self, request: &str) -> runtime::auth::Status {
-        self.codex_auth.cancel(request).await
-    }
-
-    pub async fn cursor_auth_status(&self) -> runtime::auth::Status {
-        self.cursor_auth.status(&self.config, &self.storage).await
-    }
-    pub async fn cursor_account(
-        &self,
-        action: &str,
-        request: String,
-        key: Option<String>,
-    ) -> Result<runtime::auth::Status> {
-        if action == "cancel" {
-            return Ok(self.cursor_auth.cancel(&request).await);
-        }
-        if self.is_stopping() {
-            return Err(Error::Conflict("service is stopping"));
-        }
-        if self.storage.blocks() {
-            return Err(Error::Conflict("storage unsafe; new execution is blocked"));
-        }
-        if self.local.lock().unwrap().sessions.values().any(|session| {
-            session.harness == runtime::Kind::Cursor
-                && (session.handle.is_some()
-                    || session.current_request.is_some()
-                    || (!session.queue_paused && !session.queue.is_empty())
-                    || matches!(session.state.as_str(), "starting" | "resuming" | "pending"))
-        }) {
-            return Err(Error::Conflict(
-                "close Cursor sessions before changing the cloud login",
-            ));
-        }
-        Ok(if let Some(key) = key {
-            self.cursor_auth
-                .set_key(&self.config, &self.storage, key)
-                .await
-        } else {
-            self.cursor_auth
-                .login(&self.config, &self.storage, request)
-                .await
+    /// The session whose live harness process is one of `pids`.
+    pub(crate) fn harness_session(&self, pids: &[u32]) -> Option<String> {
+        let local = self.local.lock().unwrap();
+        pids.iter().find_map(|pid| {
+            local
+                .sessions
+                .values()
+                .find(|s| s.handle.as_ref().is_some_and(|h| h.pid() == *pid))
+                .map(|s| s.session_id.clone())
         })
+    }
+
+    /// Appends a record that no harness produced, such as a secret request.
+    pub(crate) fn note(&self, session: &str, kind: &str, data: Value) -> io::Result<()> {
+        self.local
+            .lock()
+            .unwrap()
+            .append(session, kind, data, None)
+            .map(drop)
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -817,123 +445,6 @@ impl Manager {
             && !self.storage.blocks()
             && self.recording_available()
             && self.history.ready().await
-    }
-
-    pub fn dashboard(&self) -> Value {
-        let (sampled_at, resources) = self.observability.resources();
-        let storage = self.storage.snapshot();
-        let local = self.local.lock().unwrap();
-        let mut sessions: Vec<_> = local.sessions.values().collect();
-        sessions.sort_unstable_by_key(|s| std::cmp::Reverse(s.last_sequence));
-        // Only a safe summary leaves this endpoint, never receipts, prompts or native records.
-        let summaries: Vec<_> = sessions
-            .iter()
-            .take(1000)
-            .map(|s| {
-                let state = s.dashboard_state();
-                json!({"id":s.session_id,"title":format!("{:?} session",s.harness),
-                "repository":s.workspace.as_ref().map(|w| &w.path).unwrap_or(&self.config.repository).file_name().map(|n| n.to_string_lossy()),
-                "harness":s.harness,"model":s.model,"state":state,
-                "activity":if state == "waiting" { "waiting" } else { "unknown" },
-                "lastActivity":s.last_activity})
-            })
-            .collect();
-        json!({"version":1,"sampledAt":sampled_at,
-            "runtime":{"ready":!self.is_stopping() && storage.level != Level::Blocked && local.journal.writable(),"version":env!("CARGO_PKG_VERSION"),
-                "configured":!self.config.harnesses.is_empty()},
-            "appConnectivity":"unknown",
-            "resources":{"cpu":resources["cpu"],"memory":resources["memory"],"disk":resources["disk"]},
-            "resourceBytes":{"memoryUsedBytes":resources["memoryUsedBytes"],"memoryTotalBytes":resources["memoryTotalBytes"],
-                "diskAvailableBytes":resources["diskAvailableBytes"],"diskTotalBytes":resources["diskTotalBytes"]},
-            "storage":storage,
-            "diskThresholds":self.config.storage.as_ref().map(|policy| json!({"warningBytes":policy.warning_bytes,"pauseBytes":policy.pause_bytes})),
-            "onboarding":{"localConnected":null,"offlineTaskVerified":null},
-            "capabilities":{"settings":true,"updates":false},
-            "sessionCount":sessions.len(),"agents":local.agent_counts(),"sessions":summaries})
-    }
-
-    async fn codex_models(&self) -> Result<Vec<runtime::Model>> {
-        self.model_catalog(runtime::Kind::Codex).await
-    }
-
-    async fn model_catalog(&self, kind: runtime::Kind) -> Result<Vec<runtime::Model>> {
-        let cache = match kind {
-            runtime::Kind::Codex => &self.codex_models,
-            runtime::Kind::Claude => &self.claude_models,
-            _ => return Err(Error::Conflict("model catalog unavailable")),
-        };
-        let mut cached = cache.lock().await;
-        if let Some((checked, models)) = &*cached
-            && checked.elapsed() < Duration::from_secs(60)
-        {
-            return Ok(models.clone());
-        }
-        let (result, exit) = runtime::models(&self.config, kind).await;
-        if let Some(runtime::Event::Exited {
-            reason,
-            expected,
-            details,
-            ..
-        }) = exit
-        {
-            self.observability
-                .agent_exit(None, kind, reason, expected, details);
-        }
-        let models = result.map_err(|_| Error::Conflict("model catalog unavailable"))?;
-        *cached = Some((Instant::now(), models.clone()));
-        Ok(models)
-    }
-
-    pub async fn capabilities(&self) -> Value {
-        let mut harnesses = Vec::new();
-        for (kind, profile) in &self.config.harnesses {
-            let mut harness = json!({"id":kind,"model":profile.model,"provider":profile.provider});
-            match kind {
-                runtime::Kind::Codex | runtime::Kind::Claude => {
-                    harness["models"] = if self.storage.blocks() {
-                        Value::Null
-                    } else {
-                        match self.model_catalog(*kind).await {
-                            Ok(models) => json!(models),
-                            Err(_) => Value::Null,
-                        }
-                    };
-                    harness["steer"] = json!(*kind == runtime::Kind::Codex);
-                    harness["compact"] = json!(true);
-                    harness["service_tier"] = json!(*kind == runtime::Kind::Codex);
-                    harness["skill_mentions"] = json!(*kind == runtime::Kind::Claude);
-                    harness["rewind"] = json!(true);
-                    harness["attachments"] = json!({"images":true,"files":true});
-                    harness["subagents"] = json!(true);
-                    harness["usage"] = json!(true);
-                }
-                runtime::Kind::Cursor => {
-                    let capabilities = runtime::cursor::capabilities();
-                    for (key, value) in capabilities.as_object().unwrap() {
-                        harness[key] = value.clone();
-                    }
-                    harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
-                    harness["attachments"] = json!({"images":false,"files":true});
-                    harness["provider_selection"] = json!(false);
-                }
-                runtime::Kind::Pi => {
-                    harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
-                    harness["provider_selection"] = json!(true);
-                    harness["steer"] = json!(true);
-                    harness["compact"] = json!(true);
-                    harness["service_tier"] = json!(false);
-                    harness["rewind"] = json!(true);
-                    harness["attachments"] = json!({"images":true,"files":true});
-                    harness["subagents"] = json!(true);
-                    harness["usage"] = json!(true);
-                }
-            }
-            harnesses.push(harness);
-        }
-        json!({"version":1,"repository":self.config.repository,"harnesses":harnesses,"previews":self.previews.enabled(),
-            "stop":true,"resume":true,"launch_settings":true,"prompt_reasoning":true,"workspaces":true,"sync":true,"direct_workspaces":true,"teleport":true,"command_guard":true,"codex_auth":true,"codex_auth_import":true,"cursor_auth":true,
-            "structured_prompt":true,"queue_edit":true,"queue_cancel":true,"steer":true,"rewind":true,
-            "attachments":true,"compact":true,"usage":true,"subagents":true})
     }
 
     pub fn saving(&self) -> Value {
@@ -961,7 +472,7 @@ impl Manager {
         self.history
             .read(session, after)
             .await
-            .map_err(|_| Error::Storage)?
+            .map_err(|e| Error::Storage(format!("history database: {e}")))?
             .into_iter()
             .map(Record::for_client)
             .collect()
@@ -974,7 +485,7 @@ impl Manager {
         self.history
             .summary(id, None)
             .await
-            .map_err(|_| Error::Storage)?
+            .map_err(|e| Error::Storage(format!("history database: {e}")))?
             .0
             .ok_or(Error::NotFound)
     }
@@ -1038,6 +549,72 @@ impl Manager {
         }
     }
 
+    /// Account checks shared by new sessions and Teleport's preflight.
+    async fn harness_ready(self: &Arc<Self>, kind: runtime::Kind) -> Result<()> {
+        if kind == runtime::Kind::Claude {
+            match self
+                .claude_auth
+                .ready(&self.config, &self.observability)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Error::Conflict(
+                        "connect Claude Code before starting cloud work",
+                    ));
+                }
+                Err(_) => return Err(Error::Conflict("Claude account could not be verified")),
+            }
+        }
+        if kind == runtime::Kind::Cursor {
+            match self.cursor_auth_status().await.state {
+                "connected" => {}
+                "unavailable" => {
+                    return Err(Error::Conflict("Cursor account could not be verified"));
+                }
+                _ => return Err(Error::Conflict("connect Cursor before starting cloud work")),
+            }
+        }
+        if kind == runtime::Kind::Codex {
+            match self.codex_auth_status().await.state {
+                "connected" => {}
+                "missing" | "waiting" | "expired" | "error" => {
+                    return Err(Error::Conflict("connect Codex before starting cloud work"));
+                }
+                "limited" => return Err(Error::Conflict("Codex usage limit reached")),
+                _ => return Err(Error::Conflict("Codex account could not be verified")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Model and effort checks shared by new sessions and Teleport's preflight.
+    async fn execution_supported(
+        &self,
+        kind: runtime::Kind,
+        model: Option<&String>,
+        reasoning: &String,
+    ) -> Result<()> {
+        let supported = match kind {
+            runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
+                let models = self.model_catalog(kind).await?;
+                let selected = model.unwrap_or(&self.config.harnesses[&kind].model);
+                let entry = models
+                    .iter()
+                    .find(|entry| &entry.model == selected)
+                    .ok_or(Error::Conflict("invalid model"))?;
+                entry.reasoning_levels.contains(reasoning)
+            }
+            runtime::Kind::Pi | runtime::Kind::Fx => {
+                runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str())
+            }
+        };
+        if !supported {
+            return Err(Error::Conflict("invalid reasoning effort"));
+        }
+        Ok(())
+    }
+
     pub async fn start(
         self: &Arc<Self>,
         request: String,
@@ -1095,7 +672,7 @@ impl Manager {
                 .ok_or(Error::Conflict("session already exists"));
         }
         if !self.recording_available() {
-            return Err(Error::Storage);
+            return Err(Error::Storage(JOURNAL_UNWRITABLE.into()));
         }
         if self.storage.blocks() {
             return Err(Error::Conflict("storage unsafe; new execution is blocked"));
@@ -1108,7 +685,7 @@ impl Manager {
             .history
             .summary(&id, Some(&request))
             .await
-            .map_err(|_| Error::Storage)?;
+            .map_err(|e| Error::Storage(format!("history database: {e}")))?;
         if let Some(external) = external {
             if harness.is_some_and(|kind| kind != external.harness) {
                 return Err(Error::Conflict("request_id already has different content"));
@@ -1123,67 +700,18 @@ impl Manager {
         if !self.config.harnesses.contains_key(&kind) {
             return Err(Error::Conflict("harness is not configured"));
         }
-        if kind == runtime::Kind::Claude {
-            match self
-                .claude_auth
-                .ready(&self.config, &self.observability)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(Error::Conflict(
-                        "connect Claude Code before starting cloud work",
-                    ));
-                }
-                Err(_) => return Err(Error::Conflict("Claude account could not be verified")),
-            }
-        }
-        if kind == runtime::Kind::Cursor {
-            match self.cursor_auth_status().await.state {
-                "connected" => {}
-                "unavailable" => {
-                    return Err(Error::Conflict("Cursor account could not be verified"));
-                }
-                _ => return Err(Error::Conflict("connect Cursor before starting cloud work")),
-            }
-            if command_guard_enabled != Some(false) {
-                return Err(Error::Conflict(
-                    "Cursor Command Guard support is not verified",
-                ));
-            }
-        }
-        if kind == runtime::Kind::Codex {
-            match self.codex_auth_status().await.state {
-                "connected" => {}
-                "missing" | "waiting" | "expired" | "error" => {
-                    return Err(Error::Conflict("connect Codex before starting cloud work"));
-                }
-                "limited" => return Err(Error::Conflict("Codex usage limit reached")),
-                _ => return Err(Error::Conflict("Codex account could not be verified")),
-            }
-        }
+        self.harness_ready(kind).await?;
         if let Some(reasoning) = &reasoning {
-            let supported = match kind {
-                runtime::Kind::Codex | runtime::Kind::Claude => {
-                    let models = self.model_catalog(kind).await?;
-                    let selected = model
-                        .as_ref()
-                        .unwrap_or(&self.config.harnesses[&kind].model);
-                    let entry = models
-                        .iter()
-                        .find(|entry| &entry.model == selected)
-                        .ok_or(Error::Conflict("invalid model"))?;
-                    entry.reasoning_levels.contains(reasoning)
-                }
-                runtime::Kind::Pi | runtime::Kind::Cursor => {
-                    runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str())
-                }
-            };
-            if !supported {
-                return Err(Error::Conflict("invalid reasoning effort"));
-            }
+            self.execution_supported(kind, model.as_ref(), reasoning)
+                .await?;
         }
         let workspace = match workspace {
+            // Unregistered like legacy sessions, so no project folder is created.
+            Some(id) if id == crate::workspace::ROOT => crate::workspace::Workspace {
+                id: "legacy".into(),
+                path: self.workspaces.root().to_path_buf(),
+                parent: None,
+            },
             Some(id) => self
                 .workspaces
                 .resolve(&id, workspace_name.as_deref())
@@ -1294,6 +822,7 @@ impl Manager {
                 return Err(io::Error::other("harness exited during initialization"));
             }
             local.sessions.get_mut(&id).unwrap().ready = true;
+            local.sessions.get_mut(&id).unwrap().awaken();
             local.append(&id, "state", json!({"state":"idle"}), None)?;
             local
                 .finish_receipt(&id, &request, "completed")
@@ -1315,13 +844,19 @@ impl Manager {
             success: result.is_ok(),
             duration_ms: elapsed_ms(started),
         });
-        if result.is_err() {
+        if let Err(error) = &result {
+            let cause = error.to_string();
+            let reason = if cause == failure_reason {
+                cause
+            } else {
+                format!("{failure_reason}. Cause: {cause}")
+            };
             let mut local = self.local.lock().unwrap();
             let _ = local.finish_receipt(&id, &request, "failed");
             let _ = local.append(
                 &id,
                 "state",
-                json!({"state":"failed","reason":failure_reason}),
+                json!({"state":"failed","reason":reason}),
                 None,
             );
             let _ = local.fail_pending(&id);
@@ -1338,70 +873,6 @@ impl Manager {
             .sessions
             .get(id)
             .is_some_and(|session| session.receipts.contains_key(request))
-    }
-
-    /// Follow-up reasoning is checked against the launch model. Omitted reasoning stays on the launch default.
-    pub async fn check_prompt_reasoning(&self, id: &str, reasoning: Option<&str>) -> Result<()> {
-        let Some(reasoning) = reasoning else {
-            return Ok(());
-        };
-        let (kind, model) = {
-            let local = self.local.lock().unwrap();
-            let session = local.sessions.get(id).ok_or(Error::NotFound)?;
-            if session.harness == runtime::Kind::Cursor
-                && session.reasoning.as_deref() != Some(reasoning)
-            {
-                return Err(Error::Conflict("invalid reasoning effort"));
-            }
-            let model = session.model.clone().or_else(|| {
-                self.config
-                    .harnesses
-                    .get(&session.harness)
-                    .map(|profile| profile.model.clone())
-            });
-            (session.harness, model)
-        };
-        let supported = match kind {
-            runtime::Kind::Codex | runtime::Kind::Claude => {
-                let models = self.model_catalog(kind).await?;
-                let selected = model.ok_or(Error::Conflict("invalid model"))?;
-                models
-                    .iter()
-                    .find(|entry| entry.model == selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .reasoning_levels
-                    .iter()
-                    .any(|level| level == reasoning)
-            }
-            runtime::Kind::Pi | runtime::Kind::Cursor => {
-                runtime::PI_REASONING_LEVELS.contains(&reasoning)
-            }
-        };
-        if !supported {
-            return Err(Error::Conflict("invalid reasoning effort"));
-        }
-        Ok(())
-    }
-
-    pub fn check_prompt_service_tier(&self, id: &str, tier: Option<&str>) -> Result<()> {
-        let Some(tier) = tier else {
-            return Ok(());
-        };
-        if tier != "default" && tier != "fast" {
-            return Err(Error::Conflict("invalid service tier"));
-        }
-        let kind = self
-            .local
-            .lock()
-            .unwrap()
-            .sessions
-            .get(id)
-            .ok_or(Error::NotFound)?
-            .harness;
-        if kind != runtime::Kind::Codex && tier == "fast" {
-            return Err(Error::Conflict("invalid service tier"));
-        }
-        Ok(())
     }
 
     pub fn receipt(&self, id: &str, request: &str) -> Option<Receipt> {
@@ -1438,11 +909,21 @@ impl Manager {
                 return Ok(receipt);
             }
             if !local.journal.writable() {
-                return Err(Error::Storage);
+                return Err(Error::Storage(JOURNAL_UNWRITABLE.into()));
             }
             if self.is_stopping() {
                 return Err(Error::Conflict("service is stopping"));
             }
+            if command == "sleep" {
+                return self.request_sleep(&mut local, id, request);
+            }
+            if matches!(command, "compact" | "rewind") && session.state == "sleeping" {
+                self.schedule_resume(&mut local, id)?;
+                return Err(Error::Conflict(
+                    "this thread was asleep and is waking up; try again in a few seconds",
+                ));
+            }
+            let session = &local.sessions[id];
             if session.rewind_request.is_some() {
                 return Err(Error::Conflict("wait for the pending rewind"));
             }
@@ -1654,7 +1135,10 @@ impl Manager {
                     self.begin_turn(&mut local, id, &request)?;
                     Next::Deliver(handle.expect("ready harness"), request.clone())
                 }
-                "prompt" => Next::None,
+                "prompt" => {
+                    self.wake(&mut local, id)?;
+                    Next::None
+                }
                 "edit" | "cancel" | "attach" => {
                     local.finish_receipt(id, &request, "completed")?;
                     Next::None
@@ -1814,7 +1298,6 @@ impl Manager {
                 return;
             }
             if let Err(error) = &result
-                && error.kind() == io::ErrorKind::InvalidInput
                 && let Some(receipt) = local
                     .sessions
                     .get_mut(&id)
@@ -1869,7 +1352,6 @@ impl Manager {
                 return;
             }
             if let Err(error) = &result
-                && error.kind() == io::ErrorKind::InvalidInput
                 && let Some(receipt) = local
                     .sessions
                     .get_mut(&id)
@@ -1898,7 +1380,6 @@ impl Manager {
                 return;
             }
             if let Err(error) = &result
-                && error.kind() == io::ErrorKind::InvalidInput
                 && let Some(receipt) = local
                     .sessions
                     .get_mut(&id)
@@ -1941,7 +1422,14 @@ impl Manager {
                     let _ = local.finish_receipt(&id, &request, "failed");
                     let _ = local.append(&id, "rewind_failed", json!({"request_id":request}), None);
                 }
-                Err(_) => {
+                Err(error) => {
+                    if let Some(receipt) = local
+                        .sessions
+                        .get_mut(&id)
+                        .and_then(|session| session.receipts.get_mut(&request))
+                    {
+                        receipt.error = Some(error.to_string());
+                    }
                     let _ = local.finish_receipt(&id, &request, "unknown");
                 }
             }
@@ -1994,6 +1482,7 @@ impl Manager {
                 }
                 local.sessions.get_mut(id).unwrap().handle = Some(replacement.clone());
                 local.sessions.get_mut(id).unwrap().ready = true;
+                local.sessions.get_mut(id).unwrap().awaken();
                 local.append(id, "harness", json!({"pid":replacement.pid()}), None)?;
             }
             self.record_native(
@@ -2020,6 +1509,10 @@ impl Manager {
     /// out a pending interrupt, or return to idle. `turn_ended` bypasses the active
     /// turn guard when the just-finished turn is the reason for advancing.
     fn advance(self: &Arc<Self>, local: &mut Local, id: &str, turn_ended: bool) {
+        if local.sessions[id].state == "sleeping" {
+            let _ = self.wake(local, id);
+            return;
+        }
         let session = &local.sessions[id];
         if session.close_request.is_some()
             || session.rewind_request.is_some()
@@ -2114,6 +1607,7 @@ impl Manager {
     pub async fn restore_all(self: &Arc<Self>) -> io::Result<()> {
         runtime::reconcile(&self.config).await?;
         let mut local = self.local.lock().unwrap();
+        let now = now_ms();
         let ids: Vec<_> = local
             .sessions
             .values()
@@ -2121,8 +1615,12 @@ impl Manager {
             .map(|s| s.session_id.clone())
             .collect();
         for id in ids {
-            self.schedule_resume(&mut local, &id)
-                .map_err(|_| io::Error::other("cannot save recovery state"))?;
+            if local.sessions[&id].restores_awake(now) {
+                self.schedule_resume(&mut local, &id)
+                    .map_err(|_| io::Error::other("cannot save recovery state"))?;
+            } else if local.sessions[&id].state != "sleeping" {
+                local.append(&id, "state", json!({"state":"sleeping"}), None)?;
+            }
         }
         for session in local.sessions.values() {
             if let Some(request) = session.waiting_start() {
@@ -2234,6 +1732,7 @@ impl Manager {
                 return Err(io::Error::other("resumed harness exited"));
             }
             local.sessions.get_mut(&id).unwrap().ready = true;
+            local.sessions.get_mut(&id).unwrap().awaken();
             local.append(
                 &id,
                 "native_identity",
@@ -2292,14 +1791,15 @@ impl Manager {
                         "Native resume failed; inspect native history and protected local harness diagnostics for this session, then retry explicitly after correcting the cause.",
                     )
                 };
+                let lost = format!("{reason} Cause: {error}");
                 let _ = local.append(
                     &id,
                     "state",
-                    json!({"state":"process_lost","reason":reason,"startup_error":code}),
+                    json!({"state":"process_lost","reason":lost,"startup_error":code}),
                     None,
                 );
                 if code != "startup_timeout" {
-                    let _ = local.fail_pending(&id);
+                    let _ = local.fail_pending_because(&id, Some(&lost));
                 }
                 let retries: Vec<_> = local.sessions[&id]
                     .receipts
@@ -2415,7 +1915,11 @@ impl Manager {
                 let data = json!({"state":state,"request_id":request,"turn_id":native_turn});
                 local.append(id, "state", data, None)?;
             }
-            runtime::Event::Finished { request, status } => {
+            runtime::Event::Finished {
+                request,
+                status,
+                error,
+            } => {
                 if local.sessions[id].current_request.as_deref() == Some(&request) {
                     let session = &local.sessions[id];
                     let checkpoint = session
@@ -2427,7 +1931,7 @@ impl Manager {
                     }
                     self.clone().snapshot_usage(id.to_owned(), handle.clone());
                     if let Some(request) = local.sessions[id].current_request.clone() {
-                        local.finish_receipt(id, &request, &status)?;
+                        local.finish_receipt_with(id, &request, &status, error)?;
                     }
                     self.advance(&mut local, id, true);
                 }
@@ -2438,6 +1942,13 @@ impl Manager {
                 cleaned_up,
                 details,
             } => {
+                let exit = match (details.code, details.signal) {
+                    (Some(code), _) => format!("exit code {code}"),
+                    (None, Some(signal)) => format!("signal {signal}"),
+                    _ => "no exit status".into(),
+                };
+                let stderr = stderr_tail(details.stderr());
+                let cause = details.cause.clone();
                 let diagnostic_id = self.observability.agent_exit(
                     Some(id),
                     local.sessions[id].harness,
@@ -2452,7 +1963,12 @@ impl Manager {
                     local.append(id, "harness", json!({"pid":null}), None)?;
                     return Ok(());
                 }
+                let session = &local.sessions[id];
+                if session.releasing && cleaned_up && session.close_request.is_none() {
+                    return self.slept(&mut local, id);
+                }
                 let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
+                session.releasing = false;
                 let restoring = session.state == "resuming"
                     && session.native_id.is_some()
                     && session.native_path.is_some();
@@ -2491,6 +2007,10 @@ impl Manager {
                 if cleaned_up {
                     local.append(id, "harness", json!({"pid":null}), None)?;
                 }
+                let lost = match &cause {
+                    Some(cause) => format!("{reason}: {cause} ({exit})"),
+                    None => format!("{reason} ({exit})"),
+                };
                 let state = if expected && close.is_some() {
                     "closed"
                 } else if resumable && (self.is_stopping() || recover) {
@@ -2501,7 +2021,7 @@ impl Manager {
                 local.append(
                     id,
                     "state",
-                    json!({"state":state,"reason":reason,"diagnostic_id":diagnostic_id}),
+                    json!({"state":state,"reason":lost,"diagnostic_id":diagnostic_id,"stderr":(state == "process_lost" && !stderr.is_empty()).then_some(stderr)}),
                     None,
                 )?;
                 if let Some(request) = close {
@@ -2512,7 +2032,7 @@ impl Manager {
                     )?;
                 }
                 if state != "suspended" && !preserve_queue {
-                    local.fail_pending(id)?;
+                    local.fail_pending_because(id, Some(&lost))?;
                 }
                 if recover {
                     self.schedule_resume(&mut local, id)?;
@@ -2522,210 +2042,10 @@ impl Manager {
         Ok(())
     }
 
-    pub async fn check_storage(&self) -> Snapshot {
-        self.storage.refresh(&self.config, &self.workspaces).await
-    }
-
-    fn has_storage_warning(&self) -> bool {
-        self.local
-            .lock()
-            .unwrap()
-            .sessions
-            .values()
-            .any(|s| s.storage_warned && s.handle.is_some())
-    }
-
-    pub fn start_storage_guard(self: &Arc<Self>) {
-        if self.config.storage.is_none() {
-            return;
-        }
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let mut last_cleanup = Instant::now() - Duration::from_secs(60);
-            let mut was_blocked = manager.storage.blocks();
-            while !manager.is_stopping() {
-                let snapshot = manager.check_storage().await;
-                if snapshot.level != Level::Normal {
-                    let warnings = {
-                        let mut local = manager.local.lock().unwrap();
-                        let ids: Vec<_> = local
-                            .sessions
-                            .values()
-                            .filter(|s| {
-                                s.handle.is_some() && !s.storage_warned && s.native_id.is_some()
-                            })
-                            .map(|s| s.session_id.clone())
-                            .collect();
-                        let mut warnings = Vec::new();
-                        for id in ids {
-                            let text = if snapshot.reason == "measurement_unavailable" {
-                                "Cloudroom: disk space could not be measured. Work is paused until storage can be verified. Your files and history are preserved."
-                            } else if snapshot.level == Level::Blocked {
-                                "Cloudroom: disk space is critically low. Work is paused until storage recovers. Your files and history are preserved."
-                            } else {
-                                "Cloudroom: disk space is running low. Work and sync continue. Remove disposable files or add storage; large writes may trigger an emergency pause."
-                            };
-                            // Persist before delivery. A timed-out native notification is not blindly repeated.
-                            if local
-                                .append(
-                                    &id,
-                                    "storage_warning",
-                                    json!({"text":text,"reason":snapshot.reason}),
-                                    None,
-                                )
-                                .is_ok()
-                            {
-                                let s = &local.sessions[&id];
-                                warnings.push((id, s.handle.clone().unwrap(), text));
-                            }
-                        }
-                        warnings
-                    };
-                    let mut tasks = tokio::task::JoinSet::new();
-                    for (id, handle, text) in warnings {
-                        tasks.spawn(async move {
-                            (
-                                id,
-                                tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    handle.system_message(text),
-                                )
-                                .await
-                                .is_ok_and(|r| r.is_ok()),
-                            )
-                        });
-                    }
-                    while let Some(Ok((id, delivered))) = tasks.join_next().await {
-                        let _ = manager.local.lock().unwrap().append(
-                            &id,
-                            "storage_warning_delivery",
-                            json!({"confirmed":delivered,"meaning":"accepted_by_harness_not_model_consumption"}),
-                            None,
-                        );
-                    }
-                }
-                if snapshot.level == Level::Blocked {
-                    let handles: Vec<_> = manager
-                        .local
-                        .lock()
-                        .unwrap()
-                        .sessions
-                        .values()
-                        .filter_map(|s| s.handle.clone().map(|h| (s.session_id.clone(), h)))
-                        .collect();
-                    let mut all_paused = manager.storage.pause_writers(true).await.is_ok();
-                    for (id, handle) in handles {
-                        if handle.pause(true).await.is_ok() {
-                            let mut local = manager.local.lock().unwrap();
-                            if !local.sessions[&id].storage_paused {
-                                let _ = local.append(
-                                        &id,
-                                        "storage_pause",
-                                        json!({"paused":true,"reason":snapshot.reason,"text":if snapshot.reason == "measurement_unavailable" {
-                                            "Cloudroom: disk space could not be measured. Work is paused until storage can be verified."
-                                        } else {
-                                            "Cloudroom: work paused because disk space is critically low. Work resumes automatically when space recovers."
-                                        }}),
-                                        None,
-                                    );
-                            }
-                        } else {
-                            all_paused = false;
-                        }
-                    }
-                    if all_paused && last_cleanup.elapsed() >= Duration::from_secs(30) {
-                        let _ = manager.storage.clean().await;
-                        last_cleanup = Instant::now();
-                    }
-                    was_blocked = true;
-                } else if was_blocked
-                    || (snapshot.level == Level::Normal && manager.has_storage_warning())
-                {
-                    let writers_resumed = manager.storage.pause_writers(false).await.is_ok();
-                    let handles: Vec<_> = manager
-                        .local
-                        .lock()
-                        .unwrap()
-                        .sessions
-                        .values()
-                        .filter_map(|s| s.handle.clone().map(|h| (s.session_id.clone(), h)))
-                        .collect();
-                    for (id, handle) in handles {
-                        if handle.pause(false).await.is_ok() {
-                            let mut local = manager.local.lock().unwrap();
-                            let result = if snapshot.level == Level::Normal {
-                                local.append(&id, "storage_recovered", json!({"text":"Cloudroom: disk space has recovered. Work can continue."}), None)
-                            } else {
-                                local.append(&id, "storage_pause", json!({"paused":false,"text":"Cloudroom: work resumed. Disk space is still low."}), None)
-                            };
-                            if result.is_ok() {
-                                manager.advance(&mut local, &id, false);
-                            }
-                        }
-                    }
-                    // Resume only workloads this guard actually paused. Process-loss
-                    // recovery remains the separate lifecycle owner's responsibility.
-                    was_blocked = !writers_resumed;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
-
-    pub fn start_uploader(self: &Arc<Self>) {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let batch: io::Result<Vec<Record>> = {
-                    let local = manager.local.lock().unwrap();
-                    (local.journal.saved() + 1..=local.journal.last())
-                        .take(128)
-                        .map(|id| {
-                            serde_json::from_slice(&local.journal.read(id)?)
-                                .map_err(io::Error::other)
-                        })
-                        .collect()
-                };
-                match batch {
-                    Ok(batch) if !batch.is_empty() => {
-                        let started = Instant::now();
-                        let saved = manager.history.upload(&batch).await.is_ok();
-                        let mut local = manager.local.lock().unwrap();
-                        local.database_available = saved;
-                        let ack_failed = saved
-                            && local
-                                .journal
-                                .acknowledge(batch.last().unwrap().sequence)
-                                .is_err();
-                        manager.observability.record(Signal::HistoryUpload {
-                            records: batch.len(),
-                            pending_records: local.journal.last() - local.journal.saved(),
-                            success: saved,
-                            duration_ms: elapsed_ms(started),
-                        });
-                        if ack_failed {
-                            manager.observability.record(Signal::HistoryFault {
-                                operation: "acknowledge",
-                            });
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        manager.observability.record(Signal::HistoryFault {
-                            operation: "read_pending",
-                        });
-                        break;
-                    }
-                    _ => {}
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        });
-    }
-
     pub async fn shutdown(&self) {
         self.codex_auth.shutdown();
         self.claude_auth.shutdown().await;
+        self.claude_login.shutdown().await;
         self.cursor_auth.shutdown().await;
         let mut changed = self.subscribe();
         {
@@ -2768,4 +2088,14 @@ impl Manager {
             eprintln!("Cloudroom shutdown cleanup deadline reached");
         }
     }
+}
+
+/// Last lines of harness stderr, shown under unexpected exits so the cause is visible in chat (ADR 0123).
+fn stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(2000)..]);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(20)..].join("\n")
 }

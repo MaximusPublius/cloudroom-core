@@ -5,3 +5,4 @@ private/
 .env.*
 !.env.example
 __pycache__/
+/integrations/bb/dist/

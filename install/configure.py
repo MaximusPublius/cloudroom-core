@@ -43,6 +43,12 @@ def setup_storage(directory, service, agent):
             os.fchown(file.fileno(), service.pw_uid, service.pw_gid)
 
 
+def installed_version():
+    # The binary is the only version source (ADR 0120); output is "cloudroom VERSION (COMMIT)".
+    output = subprocess.run(['/usr/local/lib/cloudroom/cloudroom', '--version'], capture_output=True, text=True, check=True).stdout
+    return output.split()[1]
+
+
 def configure(data, directory=Path('/etc/cloudroom')):
     if os.geteuid() != 0:
         raise ValueError('Run as the provisioning administrator')
@@ -60,7 +66,7 @@ def configure(data, directory=Path('/etc/cloudroom')):
             or not (connection.hostname or connection.path)):
         raise ValueError('A PostgreSQL connection URL is required')
     _ = connection.port  # Reject malformed ports before writing protected configuration.
-    if (Path('/usr/local/lib/cloudroom/version').read_text().strip() != release):
+    if installed_version() != release:
         raise ValueError('The requested release does not match this template')
     service, agent = accounts()
     path = directory / 'core.env'

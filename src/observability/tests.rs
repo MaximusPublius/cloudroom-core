@@ -114,6 +114,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
             "harness process exited",
             false,
             ExitDetails {
+                cause: None,
                 code: Some(42),
                 signal: None,
                 stderr_bytes: marker.len() as u64,

@@ -245,10 +245,17 @@ fn receive(socket: &mut UnixStream) -> io::Result<File> {
         0
     };
     // These C layouts match msghdr/iovec/cmsghdr on the supported Linux/macOS targets.
-    let count = unsafe { recvmsg(socket.as_raw_fd(), &mut message, flags) };
-    if count < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // A child exiting (SIGCHLD) can interrupt the wait; retry instead of failing the session.
+    let count = loop {
+        let count = unsafe { recvmsg(socket.as_raw_fd(), &mut message, flags) };
+        if count >= 0 {
+            break count;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
     if rights.level == SOCKET_LEVEL && rights.kind == 1 && rights.fd >= 0 {
         // The private socket has exactly one trusted sender and one SCM_RIGHTS fd.
         let file = unsafe { File::from_raw_fd(rights.fd) };

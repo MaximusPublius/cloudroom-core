@@ -71,7 +71,8 @@ class SyncTests(unittest.TestCase):
         atomic_json(connection_file, self.connection)
         self.config.update(connectionFile=str(connection_file), binding=[self.connection['url'], None])
         atomic_json(self.client_state / 'config.json', self.config)
-        with patch('client.launch') as launch:
+        # An empty home keeps the developer's own MCP configuration out of this migration check.
+        with patch('client.launch') as launch, patch('client.Path.home', return_value=self.root.resolve()):
             configure(self.client_state, connection_file)
             self.assertEqual(launch.call_args_list[0].kwargs, {'stop': True})
             self.assertEqual(launch.call_count, 2)

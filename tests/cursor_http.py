@@ -69,7 +69,7 @@ class CursorAccounts(unittest.TestCase):
         body = {'request_id': request, **({'api_key': key} if key is not None else {})}
         return self.service.request('POST' if action else 'GET', '/v1/accounts/cursor' + ('/' + action if action else ''), body if action else None, expected=202 if action else 200)
 
-    def test_login_retry_cancel_restart_and_guard_fail_closed(self):
+    def test_login_retry_cancel_and_restart(self):
         from workspaces import WorkspaceTests
         self.service.stop()
         WorkspaceTests.database(self)
@@ -91,9 +91,6 @@ class CursorAccounts(unittest.TestCase):
         self.service.stop()
         self.service.start()
         self.assertEqual(self.account()['state'], 'connected')
-        error = self.service.request('POST', '/v1/sessions', {'request_id': 'guarded', 'harness': 'cursor'}, expected=409)
-        self.assertEqual(error['code'], 'cursor_guard_unsupported')
-        self.assertFalse(list(self.state.glob('*.record')), 'rejected start must not be accepted')
 
     def test_key_is_private_verified_and_never_recorded(self):
         self.assertEqual(self.account('key', key='invalid')['state'], 'error')

@@ -86,8 +86,12 @@ def capture(root, session_id):
     signal.alarm(0)
 
 
-def restore(root):
+def restore(root, cwd=None):
     """Read one complete native snapshot as JSONL; never overwrite an existing session."""
+    if cwd:
+        # Print-mode Cursor finds chats under chats/<md5 of the working folder>.
+        root = Path(root) / hashlib.md5(cwd.encode()).hexdigest()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root = Path(root).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix='.cloudroom-restore-', dir=root) as temporary:
         target = Path(temporary)
@@ -127,12 +131,18 @@ def restore(root):
         metadata = json.loads((target / 'meta.json').read_text())
         if metadata.get('schemaVersion') != 1:
             raise ValueError('unsupported metadata')
+        if cwd:
+            metadata['cwd'] = cwd
+            (target / 'meta.json').write_text(json.dumps(metadata))
         if (target / 'store.db').exists():
             with sqlite3.connect(f'file:{target / "store.db"}?mode=ro', uri=True) as database:
                 database.execute('PRAGMA trusted_schema=OFF')
                 if database.execute('PRAGMA quick_check').fetchone() != ('ok',):
                     raise ValueError('invalid restored database')
         destination = root / session_id
+        if (destination / 'meta.json').exists():
+            print(json.dumps({'session_id': session_id, 'path': str(destination)}))
+            return
         # mkdir is exclusive; no existing conversation is ever replaced.
         destination.mkdir(mode=0o700)
         for path in target.iterdir():
@@ -152,7 +162,7 @@ if __name__ == '__main__':
         if sys.argv[1] == 'capture':
             capture(sys.argv[2], sys.argv[3])
         elif sys.argv[1] == 'restore':
-            restore(sys.argv[2])
+            restore(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
         else:
             raise ValueError('unsupported operation')
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:

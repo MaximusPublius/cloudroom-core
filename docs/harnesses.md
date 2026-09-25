@@ -31,7 +31,11 @@ Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/t
 
 ### Native subscription login
 
-Use the user's existing Claude subscription. In a terminal on the VM, logged in as the configured agent account, run `claude auth login` and complete Anthropic's own flow. Verify with `claude auth status`. On managed VMs, an administrator can open that shell with `sudo -iu cloudroom-agent`; do not sign in as root or the protected core account. Keep credentials on the VM. Never paste login codes or tokens into Cloudroom or copy them from the laptop.
+Use **Connect Claude** with Cloud selected. Approve Anthropic's browser sign-in, then enter its one-time authorization code in the connection panel—not chat. Core forwards that code to the native CLI; Claude exchanges it and stores/renews credentials on the VM. Tokens never pass through the GUI or core API. Do not copy Mac credentials.
+
+The `claude_auth` capability exposes authenticated `GET /v1/accounts/claude` and `POST /v1/accounts/claude/{login,cancel,complete}`. Mutations take `request_id`; `complete` also takes `code` and OAuth `state`. Duplicate starts reuse the pending flow; cancellation targets its ID. The isolated, tool-free CLI process expires after ten minutes and produces no conversation records. Tested with Claude **2.1.280**. Upgrade core and GUI together.
+
+Terminal fallback: run `claude auth login` and `claude auth status` as the configured agent account (`sudo -iu cloudroom-agent` on managed VMs), never root or the protected core account.
 
 Create sessions with `"harness":"claude-code"`. Missing login returns `claude_auth_required` before acceptance; verification failures return `claude_auth_unavailable`. The GUI retains the task and offers **Retry start** after native login. This is login guidance, not an embedded OAuth flow or a live subscription-limit check.
 
@@ -53,11 +57,21 @@ The core advertises `codex_auth` and exposes authenticated `GET /v1/accounts/cod
 
 The core uses Codex's official device-code flow in the configured runtime user's home. Enable device-code login in ChatGPT security settings if OpenAI requires it. The app receives only account status and the temporary verification URL/code, never OAuth tokens. Login traffic is excluded from conversation and diagnostic records. A live account/usage check verifies ChatGPT access; limits and network errors stay distinct from missing authentication. Active Codex work blocks login changes.
 
-New Codex starts without authentication return `codex_auth_required` before acceptance. Clients keep the prompt and offer sign-in, then retry the same start ID. Already accepted work and running sessions are unchanged. Expired login attempts can be restarted; interruption never replays a task. Pi login is separate.
+New Codex starts without authentication return `codex_auth_required` before acceptance. Clients keep the prompt and offer sign-in, then retry the same start ID. Already accepted work and running sessions are unchanged. Expired login attempts can be restarted; interruption never replays a task.
 
 With `codex_auth_import`, authenticated `POST /v1/accounts/codex/import` accepts a file-backed ChatGPT login (64 KiB maximum). It creates `auth.json` only when absent, under the runtime user with mode `0600`, then verifies the account. Existing files, active work, and pending browser sign-ins are preserved. Retries never replace a login; tokens never enter responses or history.
 
 The desktop helper attempts this import before showing sign-in or starting Codex, and discovers logins added after pairing. `CODEX_HOME` is remembered; Keychain-only, missing, or unusable local logins fall back to **Connect Codex**. Import is not continuous credential sync or account switching. Old `auth-codex` sync requests still receive HTTP 410. Upgrade core and desktop together; existing cloud logins remain intact. Each native Codex manages renewal; cross-machine refresh conflicts still require live verification.
+
+## Cloud Pi logins
+
+With `pi_auth_import`, the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when the Mac file changes. VM logins always win. `!command` keys stay on the Mac because their secret managers are Mac-only. Keys set only as shell variables are not copied.
+
+`GET /v1/accounts/pi` lists provider names, never secrets. `POST /v1/accounts/pi/import` adds valid missing providers. `POST /v1/accounts/pi/key` with `{"provider","key"}` saves or replaces one API key; the CLI is `cloudroom cloud pi key PROVIDER`, reading the key from stdin. Copied OAuth logins refresh separately on each machine, so one side may need to sign in again.
+
+### Continue after a usage limit
+
+A Codex or Pi turn that fails on a subscription usage limit is recorded as `usage_limited`. A limited account may sign in with another ChatGPT account. After a successful sign-in, import, or authenticated `POST /v1/accounts/codex/switched` (for logins installed outside the core), the core verifies the account. If it is usable, the core restarts each quota-stopped session's harness so it loads the new login, then sends `keep working`. The response lists `continued` session IDs. Manually stopped, busy, or queued sessions are left alone; nothing is resent twice. Other idle Codex sessions keep their loaded login until their next restart.
 
 ## API and compatibility
 
@@ -81,8 +95,8 @@ New Codex, Pi and Claude runs include a small shell-command guard by default. Di
 for a session with `command_guard_enabled: false` in `POST /v1/sessions`; this
 choice survives resume and passes to Cloudroom-managed Pi and Claude children. The guard
 runs on the execution machine without the GUI. It never edits personal hooks or
-trusts unrelated Codex hooks. If native Codex hooks are explicitly disabled,
-guarded startup fails rather than re-enabling other hooks.
+trusts unrelated Codex hooks. It never blocks a harness from starting, and a
+guard error allows the command ([ADR 0114](../../docs/adr/0114-command-guard-never-blocks-work.md)).
 
 Rules cover root/home deletion, disk wipes, hosted repository deletion, and fork
 bombs. Blocks return a named reason to the agent. This is regex-based accident
@@ -97,15 +111,17 @@ byte-identical when preparing a release.
 
 ## Cursor implementation preview
 
-The core discovers `cursor-agent` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.cursor` home. Use `harness: "cursor"` in the API; the GUI provider remains `acp-cursor`. No new Cloudroom service environment variables are required. After upgrading core and the GUI, use **Settings → Cloudroom → Cursor → Manage connection**, or `room cloudroom cursor login --request-id ID` followed by `room cloudroom cursor status`. Browser login runs on the VM, with `NO_OPEN_BROWSER=1` confined to the Cursor login child. Credentials stay in the shared native account home.
+The core discovers `cursor-agent` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.cursor` home. Use `harness: "cursor"` in the API; the GUI provider remains `acp-cursor`. No new Cloudroom service environment variables are required. After upgrading core and the GUI, use **Settings → Cloudroom → Cursor → Manage connection**, or `cloudroom cloud cursor login --request-id ID` followed by `cloudroom cloud cursor status`. Browser login runs on the VM, with `NO_OPEN_BROWSER=1` confined to the Cursor login child. Credentials stay in the shared native account home.
 
-The authenticated account API exposes `GET /v1/accounts/cursor` and `POST /v1/accounts/cursor/{login,cancel,key}`. Mutations use `{ "request_id": "ID" }`; `/key` additionally takes `api_key`. Mutations return HTTP 202. An active login is reused, cancellation targets its request ID, and missing authentication rejects session creation before acceptance. Keys are verified with `--list-models` (`status` ignores API keys), saved privately as `.cursor/cloudroom-api-key`, and supplied through `CURSOR_API_KEY` only to Cursor children. The GUI clears its password field after submission; CLI key input uses `room cloudroom cursor key` through stdin, never a key argument. Neither login links nor keys enter conversation records or sync. Close live Cursor sessions before changing their login.
+The authenticated account API exposes `GET /v1/accounts/cursor` and `POST /v1/accounts/cursor/{login,cancel,key}`. Mutations use `{ "request_id": "ID" }`; `/key` additionally takes `api_key`. Mutations return HTTP 202. An active login is reused, cancellation targets its request ID, and missing authentication rejects session creation before acceptance. Keys are verified with `--list-models` (`status` ignores API keys), saved privately as `.cursor/cloudroom-api-key`, and supplied through `CURSOR_API_KEY` only to Cursor children. The GUI clears its password field after submission; CLI key input uses `cloudroom cloud cursor key` through stdin, never a key argument. Neither login links nor keys enter conversation records or sync. Close live Cursor sessions before changing their login.
 
-Cursor runs through ACP and shares the process driver, durable queue and history. Steering cancels the active ACP prompt and sends the correction in the same Cloudroom turn. Prompt dispatch is not completion. Reasoning is verified at launch and remains fixed for that session. Manual compaction, rewind, direct image inputs, independent subagent controls and context-only notices are not advertised.
+Cursor runs in print mode. Cursor's ACP mode only runs each model at its default reasoning, so `cursor-print.py` speaks the small ACP subset the adapter uses and runs one `cursor-agent -p --output-format stream-json --resume CHAT --model VARIANT` per prompt. It shares the process driver, durable queue and history. Steering and Stop end the running prompt, including its shell tools, and the chat resumes with the next message. Prompt dispatch is not completion.
 
-Guarded Cursor starts fail explicitly: permission callbacks do not cover already-allowed commands. Cursor `2026.09.18-9a7762b` ran native safety hooks in print mode but ignored the same hooks in ACP, even with project trust and explicit plugin loading. Unguarded execution requires an explicit `command_guard_enabled: false` request; the core never silently removes this protection.
+`cursor_models.rs` groups `--list-models` into model families with reasoning levels, named like the GUI picker (`auto` is `default`; the `cursor-` prefix is dropped). Capabilities advertise them, and launch resolves the family and level to the exact variant, e.g. `gpt-5.6-sol` + `xhigh` → `gpt-5.6-sol-xhigh`. Reasoning remains fixed for a session. Manual compaction, rewind, direct image inputs, independent subagent controls and context-only notices are not advertised.
 
-The adapter records bounded native SQLite snapshot chunks, including metadata and WAL-backed data. The Python helper uses SQLite backup with query-only SQL; read/write opening permits required WAL sidecars after Cursor exits. `cursor-history.py restore ROOT` accepts one complete snapshot's native JSONL on stdin, checks its digest, and refuses to replace an existing session. It restores native history, not workspace files or credentials.
+Cursor runs without Command Guard: its tested versions do not run native safety hooks for Cloudroom, so `command_guard_enabled` has no effect on Cursor sessions.
+
+Chats live at `.cursor/chats/<md5 of the working folder>/<chat ID>`. The adapter records bounded native SQLite snapshot chunks, including metadata and WAL-backed data. The Python helper uses SQLite backup with query-only SQL; read/write opening permits required WAL sidecars after Cursor exits. `cursor-history.py restore ROOT CWD` accepts one complete snapshot's native JSONL on stdin, checks its digest, writes it under `ROOT/<md5 of CWD>`, and never replaces an existing session. It restores native history, not workspace files or credentials.
 
 Initial sync discovery includes Cursor skills, global rules and the `notifications`, `hints`, and `suggestNextPrompt` preferences. Existing paired roots are preserved. Credentials, session stores, hooks, plugins and MCP configuration do not sync.
 

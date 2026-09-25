@@ -78,6 +78,16 @@ pub struct Manifest {
     pub queued: Vec<QueuedPrompt>,
 }
 
+/// What Teleport will run in the cloud: the source thread's exact harness, model and effort.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Check {
+    pub harness: runtime::Kind,
+    pub model: String,
+    pub reasoning: Option<String>,
+    pub service_tier: Option<String>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Transfer {
     manifest: Manifest,
@@ -183,10 +193,11 @@ impl Manager {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::NotFound
             } else {
-                Error::Storage
+                Error::Storage(format!("transfer manifest unreadable: {e}"))
             }
         })?;
-        serde_json::from_slice(&bytes).map_err(|_| Error::Storage)
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Storage(format!("transfer manifest is invalid JSON: {e}")))
     }
 
     fn transfer_save(&self, transfer: &Transfer) -> Result<()> {
@@ -236,6 +247,17 @@ impl Manager {
                 }
             })
         });
+        // The exact cause behind `error`, so the app never has to guess (ADR 0123).
+        let detail = session.and_then(|s| {
+            s.startup_reason.clone().or_else(|| {
+                let handoff = s.receipts.get(&format!("teleport_{id}_0"))?;
+                (handoff.state == "failed").then(|| {
+                    handoff.error.clone().unwrap_or_else(|| {
+                        "the handoff turn failed without an error message".into()
+                    })
+                })
+            })
+        });
         let directory = self.transfer_directory(id)?;
         let files: Vec<_> = transfer
             .manifest
@@ -258,8 +280,55 @@ impl Manager {
             json!({"request_id":id,"session_id":started.then_some(session_id),
             "phase":if complete {"complete"} else if started {"running"} else if transfer.cancelled {"cancelled"} else {"uploading"},
             "output_started":output,"files":files,
-            "error":error,"workspace":transfer.workspace.path}),
+            "error":error,"error_detail":detail,"workspace":transfer.workspace.path}),
         )
+    }
+
+    /// Answers "can the cloud continue this exact thread?" before the Mac stops anything.
+    /// Uses the same account and model rules as new sessions, plus one real request.
+    pub async fn teleport_check(self: &Arc<Self>, check: Check) -> Value {
+        let fail = |code: &str, error: String, models: Option<&[runtime::Model]>| json!({"ok":false,"code":code,"error":error,"models":models});
+        let harness = json!(check.harness);
+        let harness = harness.as_str().unwrap_or("agent");
+        if !self.config.harnesses.contains_key(&check.harness) {
+            let error = format!("{harness} is not set up on this VM");
+            return fail("harness_not_configured", error, None);
+        }
+        if let Err(error) = self.harness_ready(check.harness).await {
+            return fail("login_required", error.message(), None);
+        }
+        if check.service_tier.as_deref() == Some("fast") && check.harness != runtime::Kind::Codex {
+            let error = format!("Cloud {harness} has no Fast mode; turn Fast off, then Teleport");
+            return fail("setting_unavailable", error, None);
+        }
+        let reasoning = check.reasoning.as_deref();
+        if matches!(check.harness, runtime::Kind::Codex | runtime::Kind::Claude) {
+            let models = match self.model_catalog(check.harness).await {
+                Ok(models) => models,
+                Err(error) => return fail("models_unavailable", error.message(), None),
+            };
+            let supported = match reasoning {
+                Some(reasoning) => runtime::supports(&models, &check.model, reasoning),
+                None if models.iter().any(|entry| entry.model == check.model) => Ok(()),
+                None => Err(format!("model {} is not offered on this VM", check.model)),
+            };
+            if let Err(error) = supported {
+                return fail(
+                    "model_unavailable",
+                    format!("Cloud {harness}: {error}"),
+                    Some(&models),
+                );
+            }
+        } else if let Some(reasoning) = reasoning
+            && !runtime::PI_REASONING_LEVELS.contains(&reasoning)
+        {
+            let error = format!("Cloud {harness} does not support {reasoning} effort");
+            return fail("model_unavailable", error, None);
+        }
+        match runtime::probe(&self.config, check.harness, &check.model, reasoning).await {
+            Ok(()) => json!({"ok":true}),
+            Err(error) => fail("probe_failed", format!("Cloud {harness}: {error}"), None),
+        }
     }
 
     pub async fn teleport_prepare(self: &Arc<Self>, manifest: Manifest) -> Result<Value> {
@@ -277,10 +346,9 @@ impl Manager {
             Err(error) => return Err(error),
         }
         if self.is_stopping() || !self.recording_available() {
-            return Err(Error::Storage);
-        }
-        if !matches!(manifest.harness, runtime::Kind::Codex | runtime::Kind::Pi) {
-            return Err(Error::Conflict("Teleport supports Codex and Pi only"));
+            return Err(Error::Storage(
+                "service is stopping or the session journal is not writable".into(),
+            ));
         }
         if !self.config.harnesses.contains_key(&manifest.harness) {
             return Err(Error::Conflict("harness is not configured"));
@@ -296,7 +364,7 @@ impl Manager {
             .history
             .summary(&Self::transfer_session(&manifest.request_id), None)
             .await
-            .map_err(|_| Error::Storage)?
+            .map_err(|e| Error::Storage(format!("history database: {e}")))?
             .0
             .is_some()
         {
@@ -321,7 +389,10 @@ impl Manager {
             })
             .transpose()?;
         for input in settings {
-            if let Some(reasoning) = input["reasoning"].as_str() {
+            // Claude and Cursor validate reasoning in their own runtimes.
+            if let Some(reasoning) = input["reasoning"].as_str()
+                && matches!(manifest.harness, runtime::Kind::Codex | runtime::Kind::Pi)
+            {
                 let valid = codex_model.map_or_else(
                     || runtime::PI_REASONING_LEVELS.contains(&reasoning),
                     |model| {
@@ -382,7 +453,9 @@ impl Manager {
             return Err(Error::Conflict("transfer cancelled"));
         }
         if self.storage.blocks() || !self.recording_available() {
-            return Err(Error::Storage);
+            return Err(Error::Storage(
+                "disk protection is blocking writes or the session journal is not writable".into(),
+            ));
         }
         let mut entry = transfer
             .manifest
@@ -478,7 +551,7 @@ impl Manager {
                         error.kind(),
                         std::io::ErrorKind::StorageFull | std::io::ErrorKind::WouldBlock
                     ) {
-                        Error::Storage
+                        Error::Storage(format!("teleport upload could not be stored: {error}"))
                     } else {
                         Error::Conflict("teleport file validation failed")
                     }
@@ -549,10 +622,17 @@ impl Manager {
             let resume = session.queue_paused
                 || session.startup_error.is_some()
                 || session.receipts.contains_key(&resume_id);
-            if session.teleport_output
-                || (!resume
-                    && (session.current_request.is_some() || !session.queue.is_empty())
-                    && !session.receipts.contains_key(&prompt_id))
+            // After output, the handoff is done: Retry only revives a lost process.
+            if session.teleport_output {
+                drop(local);
+                if resume {
+                    self.command(&session_id, resume_id, "resume", json!({}))?;
+                }
+                return Ok(());
+            }
+            if !resume
+                && (session.current_request.is_some() || !session.queue.is_empty())
+                && !session.receipts.contains_key(&prompt_id)
             {
                 return Ok(());
             }
@@ -701,13 +781,16 @@ impl Manager {
         {
             let mut local = self.local.lock().unwrap();
             if self.is_stopping() || self.storage.blocks() {
-                return Err(Error::Storage);
+                return Err(Error::Storage(
+                    "service is stopping or disk protection is blocking writes".into(),
+                ));
             }
-            if local
-                .sessions
-                .values()
-                .any(|s| s.native_id.as_deref() == Some(&manifest.native_id))
-            {
+            // A closed session gave its conversation back (Teleport to Local).
+            if local.sessions.values().any(|s| {
+                s.native_id.as_deref() == Some(&manifest.native_id)
+                    && s.state != "closed"
+                    && s.close_request.is_none()
+            }) {
                 return Err(Error::Conflict(
                     "native conversation already belongs to a cloud session",
                 ));

@@ -62,6 +62,10 @@ impl Workload {
         }
         Ok(())
     }
+    pub fn process_count(&self) -> Option<usize> {
+        let procs = fs::read_to_string(self.directory.join("cgroup.procs")).ok()?;
+        Some(procs.lines().filter(|line| !line.is_empty()).count())
+    }
     pub fn terminate(&self) -> io::Result<()> {
         // The directory is created exclusively by this Runtime, never supplied by a client.
         fs::write(self.directory.join("cgroup.kill"), "1")

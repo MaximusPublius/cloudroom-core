@@ -49,10 +49,7 @@ pub(super) fn command(
         ]);
         command
     };
-    // Setting this even to ~/.claude relocates ~/.claude.json and hides native user settings.
-    if profile.home != config.account_home.join(".claude") {
-        command.env("CLAUDE_CONFIG_DIR", &profile.home);
-    }
+    profile_env(&mut command, config, profile);
     command
         .args([
             "-p",
@@ -99,19 +96,79 @@ pub(super) fn command(
     Ok((command, id))
 }
 
+/// The one-year token from `claude setup-token` (ADR 0121), then the user's plan on line two.
+/// Only core can read this file.
+pub(super) fn token_path(config: &Config) -> PathBuf {
+    config.state_dir.join("claude-oauth-token")
+}
+
+pub(super) fn profile_env(command: &mut Command, config: &Config, profile: &HarnessConfig) {
+    // Setting this even to ~/.claude relocates ~/.claude.json and hides native user settings.
+    if profile.home != config.account_home.join(".claude") {
+        command.env("CLAUDE_CONFIG_DIR", &profile.home);
+    }
+    if let Ok(saved) = fs::read_to_string(token_path(config)) {
+        let mut lines = saved.lines().map(str::trim);
+        if let Some(token) = lines.next().filter(|s| !s.is_empty()) {
+            command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
+        // Without the plan, Claude hides plan-only models such as Opus 1M.
+        if let Some(plan) = lines.next().filter(|s| !s.is_empty()) {
+            command.env("CLAUDE_CODE_SUBSCRIPTION_TYPE", plan);
+        }
+    }
+}
+
 pub(super) async fn auth_ready(config: &Config) -> io::Result<bool> {
+    let (code, value) = run_json(config, &["auth", "status", "--json"], 10).await?;
+    match (code, value["loggedIn"].as_bool()) {
+        (Some(0), Some(true)) => Ok(true),
+        (Some(1), Some(false)) => Ok(false),
+        _ => Err(io::Error::other("invalid Claude account response")),
+    }
+}
+
+/// One tiny real request with the exact model and effort. `auth status` can report
+/// "logged in" for a token Anthropic rejects, so Teleport verifies with inference.
+pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>) -> io::Result<()> {
+    let mut args = vec![
+        "-p",
+        "--model",
+        model,
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--tools",
+        "",
+    ];
+    if let Some(effort) = reasoning.filter(|effort| *effort != "none") {
+        args.extend(["--effort", effort]);
+    }
+    args.push("Reply with exactly: OK");
+    let (_, value) = run_json(config, &args, 40).await?;
+    if value["is_error"] == false {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "Claude rejected a test request with model {model}: {}",
+        result_error(&value)
+    )))
+}
+
+/// Run the configured Claude CLI as the agent and parse its single JSON reply.
+async fn run_json(
+    config: &Config,
+    args: &[&str],
+    seconds: u64,
+) -> io::Result<(Option<i32>, Value)> {
     use tokio::io::AsyncReadExt;
     let profile = config
         .harnesses
         .get(&super::Kind::Claude)
         .ok_or_else(|| io::Error::other("Claude is not configured"))?;
     let mut command = super::command(&profile.binary, config);
-    if profile.home != config.account_home.join(".claude") {
-        command.env("CLAUDE_CONFIG_DIR", &profile.home);
-    }
-    command
-        .args(["auth", "status", "--json"])
-        .stderr(std::process::Stdio::null());
+    profile_env(&mut command, config, profile);
+    command.args(args).stderr(std::process::Stdio::null());
     let group = config
         .storage
         .as_ref()
@@ -123,22 +180,18 @@ pub(super) async fn auth_ready(config: &Config) -> io::Result<bool> {
         .transpose()?;
     let mut child = command.spawn()?;
     let mut stdout = child.stdout.take().unwrap().take(65537);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).await?;
         if bytes.len() > 65536 {
-            return Err(io::Error::other("Claude account response too large"));
+            return Err(io::Error::other("Claude response too large"));
         }
-        let value: Value = serde_json::from_slice(&bytes)?;
-        let status = child.wait().await?;
-        match (status.code(), value["loggedIn"].as_bool()) {
-            (Some(0), Some(true)) => Ok(true),
-            (Some(1), Some(false)) => Ok(false),
-            _ => Err(io::Error::other("invalid Claude account response")),
-        }
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| io::Error::other("Claude returned an unreadable response"))?;
+        Ok((child.wait().await?.code(), value))
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Claude account check timed out"))
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Claude did not answer in time"))
     .and_then(|r| r);
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -193,14 +246,8 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     let info = initialize(handle).await?;
     if let Some(reasoning) = &handle.reasoning {
         let models = model_catalog(&info)?;
-        if !models.iter().any(|model| {
-            model.model == handle.profile.model && model.reasoning_levels.contains(reasoning)
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Claude model does not support the selected effort",
-            ));
-        }
+        super::supports(&models, &handle.profile.model, reasoning)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         if reasoning != "none" {
             handle
                 .call(
@@ -448,7 +495,7 @@ pub(super) struct Protocol {
     active: Option<(String, String)>,
     users: HashMap<String, UserCall>,
     children: HashMap<String, ChildCall>,
-    reply: Option<(u64, Value, bool)>,
+    reply: Option<(u64, Value, Option<String>)>,
     pending_frames: Vec<Value>,
     interrupting: bool,
     compacted: bool,
@@ -659,7 +706,11 @@ impl Adapter for Protocol {
                     self.reply = Some((
                         id,
                         response["response"].clone(),
-                        response["subtype"] != "success",
+                        (response["subtype"] != "success").then(|| {
+                            response["error"]
+                                .as_str()
+                                .map_or_else(|| response.to_string(), str::to_owned)
+                        }),
                     ));
                 }
             }
@@ -703,7 +754,11 @@ impl Adapter for Protocol {
                     Some("queued" | "rejected" | "cancelled")
                 )
             {
-                self.reply = Some((call.id, Value::Null, value["state"] != "queued"));
+                self.reply = Some((
+                    call.id,
+                    Value::Null,
+                    (value["state"] != "queued").then(|| format!("command was {}", value["state"])),
+                ));
             }
             if value["state"] == "started" && self.active.as_ref().is_some_and(|(id, _)| id == wire)
             {
@@ -871,7 +926,12 @@ impl Adapter for Protocol {
                 if let Some(call) = self.users.remove(*id) {
                     if call.kind == "bootstrap" {
                         self.bootstrapped = value["is_error"] != true;
-                        self.reply = Some((call.id, Value::Null, !self.bootstrapped));
+                        self.reply = Some((
+                            call.id,
+                            Value::Null,
+                            (!self.bootstrapped)
+                                .then(|| format!("bootstrap failed: {}", value["result"])),
+                        ));
                     }
                     if call.kind == "compact" {
                         events.push(Event::Compacted {
@@ -907,7 +967,8 @@ impl Adapter for Protocol {
                 {
                     events.push(Event::Authentication { accepted: true });
                 }
-                events.extend(state.finished(status));
+                let error = (status == "failed").then(|| result_error(value));
+                events.extend(state.finished(status, error));
                 self.active = None;
                 self.children.clear();
             }
@@ -926,10 +987,10 @@ impl Adapter for Protocol {
         self.reply.as_ref().map(|(id, value, error)| {
             (
                 *id,
-                if *error {
+                if let Some(error) = error {
                     Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "Claude rejected the command; see saved history",
+                        format!("Claude rejected the command: {error}"),
                     ))
                 } else {
                     Ok(value.clone())
@@ -983,6 +1044,24 @@ impl Adapter for Protocol {
     }
 }
 
+/// Claude's own words for a failed turn, so receipts show the real cause (ADR 0123).
+fn result_error(value: &Value) -> String {
+    let errors: Vec<&str> = value["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    match value["result"].as_str().filter(|text| !text.is_empty()) {
+        Some(text) => text.to_owned(),
+        None if !errors.is_empty() => errors.join("; "),
+        None => format!(
+            "Claude turn failed ({})",
+            value["subtype"].as_str().unwrap_or("no error details")
+        ),
+    }
+}
+
 fn usage(value: &Value) -> Value {
     let mut input = 0u64;
     let mut output = 0u64;
@@ -998,7 +1077,8 @@ fn usage(value: &Value) -> Value {
         output += model["outputTokens"].as_u64().unwrap_or(0);
         read += model["cacheReadInputTokens"].as_u64().unwrap_or(0);
         write += model["cacheCreationInputTokens"].as_u64().unwrap_or(0);
-        window = window.or(model["contextWindow"].as_u64());
+        // Helper models (such as Haiku) share this map; the conversation model has the largest window.
+        window = window.max(model["contextWindow"].as_u64());
     }
     let last = &value["usage"];
     let used = last["input_tokens"].as_u64().unwrap_or(0)

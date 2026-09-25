@@ -45,7 +45,7 @@ struct State {
     recorded: Option<Instant>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Probe {
     credentials: Credentials,
     reason: &'static str,
@@ -127,9 +127,9 @@ impl ClaudeAuth {
                     },
                 },
             };
+            let changed = check.is_none_or(|(_, previous)| previous != probe);
             *check = Some((Instant::now(), probe));
             let mut state = self.state.lock().unwrap();
-            let changed = state.credentials != probe.credentials;
             state.credentials = probe.credentials;
             Self::record(&mut state, diagnostics, changed, probe.reason);
             probe

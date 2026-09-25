@@ -142,6 +142,7 @@ impl Process {
             let mut deadline = None;
             let mut output_closed = false;
             let mut close_pending = false;
+            let mut cause = None;
             let reason = loop {
                 let mut bounded = (&mut output).take((MAX_LINE + 1 - line.len()) as u64);
                 tokio::select! {
@@ -188,7 +189,7 @@ impl Process {
                         if line.len() > MAX_LINE || !line.ends_with(b"\n") { break "invalid or oversized harness frame"; }
                         let raw = match String::from_utf8(std::mem::take(&mut line)) { Ok(s) => s, Err(_) => break "invalid harness UTF-8" };
                         let value: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => break "malformed harness JSON" };
-                        let records = match adapter.receive(&value, raw, &mut state) { Ok(r) => r, Err(_) => break "invalid native state" };
+                        let records = match adapter.receive(&value, raw, &mut state) { Ok(r) => r, Err(e) => { cause = Some(e.to_string()); break "invalid native state" } };
                         progress.send_replace(state.clone());
                         let mut disconnected = false;
                         for record in records { if events.send(record).await.is_err() { disconnected = true; break; } }
@@ -202,7 +203,7 @@ impl Process {
                         if let Some((id, result)) = adapter.response(&value) && let Some(reply) = pending.remove(&id) { let _ = reply.send(result); }
                     }
                     _ = tick.tick() => {
-                        let records = match adapter.capture() { Ok(r) => r, Err(_) => break "native history capture failed" };
+                        let records = match adapter.capture() { Ok(r) => r, Err(e) => { cause = Some(e.to_string()); break "native history capture failed" } };
                         let mut disconnected = false;
                         for record in records { if events.send(record).await.is_err() { disconnected = true; break; } }
                         if disconnected { break "recording owner disconnected"; }
@@ -241,12 +242,14 @@ impl Process {
                             tick.tick().await;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         reason = "native history capture failed at exit";
+                        cause = Some(error.to_string());
                         break;
                     }
                 }
             }
+            details.cause = cause;
             if !cleaned_up {
                 reason = "workload exit unconfirmed; refusing replacement";
             }
@@ -275,6 +278,10 @@ impl Process {
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+    /// Processes in this harness's workload, including background jobs. None without containment.
+    pub fn process_count(&self) -> Option<usize> {
+        self.group.as_ref()?.process_count()
     }
     pub async fn call(
         &self,

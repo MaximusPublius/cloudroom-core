@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Skills/settings sync and one-way Codex login import. Project files never sync."""
+"""Skills/settings sync, one-way MCP server copy, and one-way Codex and Pi login import. Project files never sync."""
 import argparse
 import fcntl
 import hashlib
@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from files import Conflict, Tree, atomic_json, excluded
+from files import MCP, Conflict, Tree, atomic_json, excluded
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -80,7 +80,7 @@ class Remote:
 
 
 def configuration_roots(roots):
-    return [r for r in roots if r['tree']['kind'] in {'skills', 'codex', 'pi', 'claude', 'cursor'}]
+    return [r for r in roots if r['tree']['kind'] in {'skills', 'codex', 'pi', 'claude', 'cursor', *MCP}]
 
 
 def import_codex(config, connection, folder):
@@ -131,13 +131,50 @@ def import_codex(config, connection, folder):
         return status
 
 
+def import_pi(config, connection, folder):
+    """Copy Pi provider logins the VM lacks. VM logins always win; Mac-only `!command` keys stay here."""
+    home = config.get('piHome') or os.environ.get('PI_CODING_AGENT_DIR') or Path.home() / '.pi/agent'
+    try:
+        fd = os.open(Path(home).expanduser() / 'auth.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+                return None
+            raw = source.read(256 * 1024 + 1)
+        logins = json.loads(raw) if len(raw) <= 256 * 1024 else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(logins, dict):
+        return None
+    attempt = {'binding': [connection['url'].rstrip('/'), (connection.get('account') or {}).get('id')],
+               'fingerprint': hashlib.sha256(raw).hexdigest()}
+    receipt = Path(folder) / 'pi-import.json'
+    if receipt.exists() and private_json(receipt) == attempt:
+        return None
+    remote = Remote(connection, config.get('device', ''))
+    if not remote.json('/v1/capabilities').get('pi_auth_import'):
+        return None
+    saved = set(remote.json('/v1/accounts/pi')['providers'])
+    missing = {name: entry for name, entry in logins.items()
+               if name not in saved and isinstance(entry, dict) and not str(entry.get('key', '')).startswith('!')}
+    result = remote.json('/v1/accounts/pi/import', missing) if missing else {'providers': sorted(saved), 'added': []}
+    atomic_json(receipt, attempt)
+    return result
+
+
 def cycle(config, connection, state_dir):
     remote = Remote(connection, config['device'])
     try:
         import_codex(config, connection, state_dir)
     except (OSError, Conflict, ValueError, KeyError, TypeError):
         pass  # Login recovery must not stop independent skills/settings sync.
+    try:
+        import_pi(config, connection, state_dir)
+    except (OSError, Conflict, ValueError, KeyError, TypeError):
+        pass
     roots = configuration_roots(config['roots'])
+    if any(r['tree']['kind'] in MCP for r in roots) and not remote.json('/v1/capabilities').get('mcp_sync'):
+        roots = [r for r in roots if r['tree']['kind'] not in MCP]  # Older cores reject unknown roots.
     remote.json('/v1/sync', {'device': config['device']})
     details = {}
     for root in roots:
@@ -156,14 +193,17 @@ def cycle(config, connection, state_dir):
                     continue
                 left, right = local['files'].get(path), cloud['files'].get(path)
                 a, b, old = (left or {}).get('tag'), (right or {}).get('tag'), base.get(path)
+                push = tree.kind in MCP  # Mac to VM only: never edit the Mac's agent configuration.
                 if a == b:
                     base[path] = a
                     continue
-                if a != old and b != old:
+                if push and a in {None, old}:
+                    continue
+                if a != old and b != old and not push:
                     conflicts.append(path)
                     continue
                 try:
-                    if b == old:
+                    if b == old or push:
                         if left:
                             with tree.snapshot(path) as (entry, data):
                                 if entry['tag'] != a:
@@ -232,6 +272,9 @@ def discover(home):
             roots.append({'id': 'rules-cursor', 'tree': {'root': str((path / 'rules').resolve()), 'kind': 'skills'}})
         if identity != 'shared' and (path / filename).is_file():
             roots.append({'id': 'settings-' + identity, 'tree': {'root': str(path.resolve()), 'kind': identity, 'filename': filename}})
+    for identity, path, filename in [('codex', codex, 'config.toml'), ('claude', home, '.claude.json'), ('cursor', home / '.cursor', 'mcp.json')]:
+        if (path / filename).is_file():
+            roots.append({'id': 'mcp-' + identity, 'tree': {'root': str(path.resolve()), 'kind': 'mcp-toml' if filename.endswith('.toml') else 'mcp-json', 'filename': filename}})
     return roots
 
 
@@ -285,6 +328,8 @@ def configure(folder, connection_file, activate=True):
             launch(folder, stop=True)
         # Keep old repository baselines and recovery copies on disk, but never use them again.
         roots = configuration_roots(old['roots']) if old else discover(Path.home())
+        # Existing installs keep their roots; only add MCP roots introduced later.
+        roots += [r for r in discover(Path.home()) if old and r['tree']['kind'] in MCP and r['id'] not in {x['id'] for x in roots}]
         for name in ['client.py', 'files.py']:
             source, target = Path(__file__).parent / name, folder / name
             if source.resolve() != target.resolve():
@@ -292,7 +337,9 @@ def configure(folder, connection_file, activate=True):
                 shutil.copyfile(source, temporary); temporary.chmod(0o600); temporary.replace(target)
         legacy_home = next((r['tree']['root'] for r in (old or {}).get('roots', []) if r['id'] == 'auth-codex'), None)
         codex_home = os.environ.get('CODEX_HOME') or (old or {}).get('codexHome') or legacy_home or Path.home() / '.codex'
-        config = {'device': old['device'] if old else uuid.uuid4().hex, 'connectionFile': str(connection_file), 'binding': binding, 'roots': roots, 'codexHome': str(Path(codex_home).expanduser().resolve())}
+        pi_home = os.environ.get('PI_CODING_AGENT_DIR') or (old or {}).get('piHome') or Path.home() / '.pi/agent'
+        config = {'device': old['device'] if old else uuid.uuid4().hex, 'connectionFile': str(connection_file), 'binding': binding, 'roots': roots,
+                  'codexHome': str(Path(codex_home).expanduser().resolve()), 'piHome': str(Path(pi_home).expanduser().resolve())}
         atomic_json(folder / 'config.json', config)
         if activate:
             launch(folder)
@@ -301,7 +348,7 @@ def configure(folder, connection_file, activate=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['configure', 'run', 'once', 'auth', 'status', 'stop'])
+    parser.add_argument('command', choices=['configure', 'run', 'once', 'auth', 'pi-auth', 'status', 'stop'])
     parser.add_argument('directory', type=Path)
     parser.add_argument('--connection', type=Path)
     parser.add_argument('--no-start', action='store_true', help='Prepare configuration without installing a background job')
@@ -310,11 +357,11 @@ def main():
         result = configure(args.directory, args.connection, not args.no_start)
     elif args.command in {'run', 'once'}:
         result = run(args.directory, args.command == 'once')
-    elif args.command == 'auth':
+    elif args.command in {'auth', 'pi-auth'}:
         config_path = args.directory / 'config.json'
         config = private_json(config_path) if config_path.exists() else {}
         connection = load_connection(config) if config else private_json(args.connection)
-        result = import_codex(config, connection, args.directory)
+        result = (import_codex if args.command == 'auth' else import_pi)(config, connection, args.directory)
     elif args.command == 'stop':
         launch(args.directory.resolve(), stop=True)
         result = {'state': 'offline'}

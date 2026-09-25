@@ -12,6 +12,9 @@ use std::{
 use tokio::{io::AsyncWriteExt, process::Command};
 use tokio_stream::StreamExt;
 
+/// Reserved workspace ID for sessions that start in the workspace root itself.
+pub const ROOT: &str = "root";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Workspace {
     pub id: String,
@@ -290,6 +293,22 @@ impl Workspaces {
     ) -> io::Result<String> {
         self.ensure_directory(workspace).await?;
         let (root, relative) = match native {
+            // Claude resumes by ID only from the project folder named after the cwd.
+            Some((profile, crate::runtime::Kind::Claude, native_id)) => (
+                profile.home.join("projects"),
+                format!(
+                    "{}/{native_id}.jsonl",
+                    workspace
+                        .path
+                        .to_string_lossy()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                        .collect::<String>()
+                ),
+            ),
+            Some((profile, crate::runtime::Kind::Cursor, _)) => {
+                (profile.home.join("chats"), format!(".teleport-{id}.jsonl"))
+            }
             Some((profile, _, _)) => (
                 profile.home.join("sessions"),
                 format!("teleport/{id}/{}", entry.path),
@@ -334,10 +353,16 @@ impl Workspaces {
         let output = child.wait_with_output().await?;
         let installed = file_result(output)?;
         result?;
-        installed["path"]
+        let path = installed["path"]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| io::Error::other("transfer path missing"))
+            .ok_or_else(|| io::Error::other("transfer path missing"))?;
+        match native {
+            Some((profile, crate::runtime::Kind::Cursor, _)) => {
+                restore_cursor(&profile.home.join("chats"), &path, workspace, guard).await
+            }
+            _ => Ok(path),
+        }
     }
 
     pub async fn attach(
@@ -434,6 +459,44 @@ fn file_result(output: std::process::Output) -> io::Result<serde_json::Value> {
         });
     }
     Ok(result)
+}
+
+/// Unpack a teleported Cursor snapshot into chats/<md5 of the workspace>/<chat ID>.
+async fn restore_cursor(
+    root: &Path,
+    snapshot: &str,
+    workspace: &Workspace,
+    guard: &storage::Guard,
+) -> io::Result<String> {
+    let mut command = Command::new("python3");
+    command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .args([
+            "-I",
+            "-c",
+            include_str!("../runtime/cursor-history.py"),
+            "restore",
+        ])
+        .arg(root)
+        .arg(&workspace.path)
+        .stdin(fs::File::open(snapshot)?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let (child, _workload) = guard.spawn_writer(&mut command)?;
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Cursor session restore failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let restored: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    restored["path"]
+        .as_str()
+        .map(|path| format!("{path}/meta.json"))
+        .ok_or_else(|| io::Error::other("Cursor session restore returned no path"))
 }
 
 pub fn transfer_destination(

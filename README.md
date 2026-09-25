@@ -1,19 +1,33 @@
 # Cloudroom core
 
-A pre-release Rust service for running coding harnesses and preserving their session history.
-One Cargo package; one service per Linux VM. Harnesses make their own inference calls.
-No Cloudroom account or managed-hosting service is required.
+A self-hostable Rust service that runs coding agents on your own Linux VM and saves their session history.
+Supports Codex, Claude Code, Pi, and Cursor. Agents make their own model calls with your own logins.
+One Cargo package; one service per VM. No Cloudroom account or hosted service is required.
 
 ![Cloudroom core architecture: session management, agent runtime, workspace management, storage, and app integrations](docs/architecture.png)
 
 *Architecture design. Some components and integrations shown are planned, not yet implemented.*
 
-Start with the [Ubuntu 24.04 setup guide](docs/setup.md) to build from source and run your first agent through the API.
+## Get started
 
-## macOS GUI beta
+- [Install on Ubuntu 24.04](docs/setup.md) with one script, or build from source.
+- [HTTP API reference](docs/api.md): every endpoint, event, and error code.
+- [Linux builds](https://github.com/davidondrej/cloudroom-core/releases): CI-tested binaries for each release.
 
-[Download the Cloudroom GUI](https://github.com/davidondrej/cloudroom-installer/releases/tag/gui-v0.43.1-beta) for Apple Silicon Macs (M1 or newer) running macOS 13+.
-This beta is not notarized by Apple; see the release page for installation instructions.
+## Security
+
+- Agents run as a separate Linux user with no admin rights. The core removes every Linux privilege before an agent starts, so `sudo` does not work.
+- Agents start with an empty environment. They cannot read the core's token, database password, or history files.
+- Every API request needs a secret token; the installer generates a random 256-bit one. The API listens only on localhost unless you opt in behind an HTTPS proxy.
+- History is saved to PostgreSQL outside the VM, over TLS with full certificate checks. Agents call model providers directly.
+- Command Guard blocks a few catastrophic commands, such as deleting a home folder or formatting a disk.
+
+Agents run without approval prompts and share one Linux user, so use one VM per trusted user.
+See [cloudroom.dev/security](https://www.cloudroom.dev/security). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+## Desktop app
+
+[Download the Cloudroom GUI beta](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs, with a Linux alpha.
 Downloads are public, but hosted cloud access remains invite-only. The core does not require the GUI.
 
 ## Build and test
@@ -36,8 +50,8 @@ The service never applies migrations. Keep database and core credentials server-
 
 ## Contributing
 
-Contributions and pull requests are welcome from day one. Open an issue to discuss larger changes.
-Development happens in a private monorepo; accepted contributions are included in future public snapshots.
+Issues and pull requests are welcome. Open an issue first for larger changes.
+Accepted changes ship in the next release. Each release's notes list what changed.
 
-This is a development snapshot, not a claim that all planned features are complete.
+This is pre-release software, not a claim that all planned features are complete.
 Licensed under [Apache 2.0](LICENSE).

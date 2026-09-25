@@ -65,6 +65,7 @@ impl Config {
             "pi" => Kind::Pi,
             "cursor" => Kind::Cursor,
             "claude-code" => Kind::Claude,
+            "fx" => Kind::Fx,
             _ => return Err(io::Error::other("unsupported CLOUDROOM_HARNESS")),
         };
         let account_home: PathBuf = required("CLOUDROOM_ACCOUNT_HOME")?.into();
@@ -122,6 +123,23 @@ impl Config {
                 HarnessConfig {
                     binary,
                     home: account_home.join(".cursor"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
+        }
+        let fx = [
+            account_home.join(".local/bin/fx"),
+            PathBuf::from("/usr/local/bin/fx"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = fx.filter(|_| account_home.join(".fx").is_dir()) {
+            harnesses.insert(
+                Kind::Fx,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".fx"),
                     model: "default".into(),
                     provider: None,
                 },

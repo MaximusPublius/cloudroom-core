@@ -82,23 +82,23 @@ pub struct Previews {
     core_port: u16,
 }
 #[derive(Debug)]
-pub struct Failure(StatusCode, &'static str);
+pub struct Failure(StatusCode, String);
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
         (self.0, Json(json!({"error":self.1}))).into_response()
     }
 }
 impl From<io::Error> for Failure {
-    fn from(_: io::Error) -> Self {
+    fn from(error: io::Error) -> Self {
         Self(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Preview storage unavailable; inspect the protected core configuration",
+            format!("Preview storage unavailable: {error}"),
         )
     }
 }
 type Result<T> = std::result::Result<T, Failure>;
 fn conflict(message: &'static str) -> Failure {
-    Failure(StatusCode::CONFLICT, message)
+    Failure(StatusCode::CONFLICT, message.into())
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -183,6 +183,17 @@ impl Previews {
             core_port: config.listen.port(),
         }))
     }
+    /// Mac access shares the preview pairing and agent identity.
+    pub(crate) fn agent(&self) -> Option<(PathBuf, u32)> {
+        self.setup
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| (s.socket.with_file_name("mac.sock"), s.agent_uid))
+    }
+    pub(crate) fn paired(&self, device: &str) -> bool {
+        self.saved.lock().unwrap().devices.contains_key(device)
+    }
     pub fn enabled(&self) -> bool {
         self.setup.lock().unwrap().is_some()
     }
@@ -230,8 +241,13 @@ impl Previews {
             TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
         )
         .await
-        .map_err(|_| conflict("The cloud server did not accept a connection"))?
-        .map_err(|_| conflict("The cloud server is not listening on IPv4 loopback"))?;
+        .map_err(|_| conflict("The cloud server did not accept a connection within 2 seconds"))?
+        .map_err(|error| {
+            Failure(
+                StatusCode::CONFLICT,
+                format!("The cloud server is not listening on 127.0.0.1:{port}: {error}"),
+            )
+        })?;
         let mut saved = self.saved.lock().unwrap();
         if !saved.previews.contains_key(&port) {
             let mut next = saved.clone();
@@ -267,10 +283,10 @@ impl Previews {
     pub fn view(&self, port: u16) -> Result<Value> {
         self.setup()?;
         let saved = self.saved.lock().unwrap();
-        let entry = saved
-            .previews
-            .get(&port)
-            .ok_or(Failure(StatusCode::NOT_FOUND, "Preview is not registered"))?;
+        let entry = saved.previews.get(&port).ok_or(Failure(
+            StatusCode::NOT_FOUND,
+            "Preview is not registered".into(),
+        ))?;
         let reports = self.reports.lock().unwrap();
         let active = reports.values().filter(|(at, r)| {
             r.port == port
@@ -417,19 +433,20 @@ impl Previews {
 }
 
 #[derive(Clone, Copy)]
-struct Peer(Option<u32>);
+pub(crate) struct Peer(pub(crate) Option<u32>, pub(crate) Option<i32>);
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, UnixListener>>
     for Peer
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, UnixListener>) -> Self {
-        Self(stream.io().peer_cred().ok().map(|c| c.uid()))
+        let cred = stream.io().peer_cred().ok();
+        Self(cred.map(|c| c.uid()), cred.and_then(|c| c.pid()))
     }
 }
 fn local_auth(previews: &Previews, peer: Peer) -> Result<()> {
     if peer.0 != Some(previews.setup()?.agent_uid) {
         return Err(Failure(
             StatusCode::FORBIDDEN,
-            "Only the VM agent account may request local previews",
+            "Only the VM agent account may request local previews".into(),
         ));
     }
     Ok(())

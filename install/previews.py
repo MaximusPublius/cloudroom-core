@@ -101,12 +101,14 @@ Match all
         else:
             atomic(lookup, previous_lookup, mode=0o755)
         raise ValueError('SSH validation/reload failed; previous configuration restored') from None
-    skill = subprocess.check_output([str(binary), '--preview-skill'], text=True)
-    for base in ['.agents', '.codex', '.pi/agent', '.claude']:
-        command = ['sudo', '-u', agent.pw_name, 'python3', '-c',
-                   'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True,exist_ok=True); f=p/"SKILL.md"; data=sys.stdin.read(); f.write_text(data) if not f.exists() else None',
-                   str(Path(agent.pw_dir) / base / 'skills/cloud-preview')]
-        subprocess.run(command, input=skill, text=True, check=True)
+    # Mac access (ADR 0113) and secret requests share the preview pairing's agent socket, so their skills install here too.
+    for name, flag in [('cloud-preview', '--preview-skill'), ('cloud-mac', '--mac-skill'), ('cloud-secrets', '--secrets-skill')]:
+        skill = subprocess.check_output([str(binary), flag], text=True)
+        for base in ['.agents', '.codex', '.pi/agent', '.claude']:
+            command = ['sudo', '-u', agent.pw_name, 'python3', '-c',
+                       'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(parents=True,exist_ok=True); f=p/"SKILL.md"; data=sys.stdin.read(); f.write_text(data) if not f.exists() else None',
+                       str(Path(agent.pw_dir) / base / 'skills' / name)]
+            subprocess.run(command, input=skill, text=True, check=True)
     link = Path('/usr/local/bin/cloudroom')
     if not link.exists() and not link.is_symlink():
         link.symlink_to(binary)

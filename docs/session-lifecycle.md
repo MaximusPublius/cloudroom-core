@@ -20,12 +20,19 @@ Runtime closes Codex's stdin, allowing native cleanup, and continues collecting 
 
 Service shutdown signals all harnesses before waiting. Session recording and best-effort diagnostics get a five-second budget. HTTP draining ends after six seconds even if a peer stops reading. Shutdown is distinct from client disconnect, which never stops execution.
 
+## Sleep idle sessions
+
+- After 30 minutes without activity ([ADR 0031](../../docs/adr/0031-automatic-box-pause-and-resume.md)), Core stops the session's harness process and marks it `sleeping`. History stays on disk. A running turn, queued work, busy child sessions, pending interrupts, or new background processes in its workload keep it awake. Unprotected local runs cannot see background processes.
+- `POST /v1/sessions/{id}/sleep` (same body as close) asks for sleep now. It applies once a running turn or interrupt settles. The GUI sends Stop, then Sleep, on Archive.
+- The next prompt, Teleport update, or `resume` of a paused queue resumes the same native conversation, then delivers the work. Compact or rewind on a sleeping session wakes it and returns 409; retry once it is idle.
+- Restart relaunches only sessions with queued work or activity in the last 30 minutes. Other resumable sessions stay or become `sleeping`, so a reboot does not refill memory.
+
 ## Queued prompts and restart
 
 - A prompt that arrives while a turn is running is saved locally, then acknowledged with an `accepted` receipt. Queued prompts run in acceptance order, one turn at a time. Retrying a request ID returns its receipt; different content for the same ID is rejected.
 - Acceptance and queue membership come from one fsynced receipt. Old separate `enqueue` records remain readable without duplicate delivery, including a crash between the old two writes.
 - Interrupt stops the current turn only; queued prompts continue afterwards. Close prevents further delivery and marks unrun queued receipts `failed`.
-- Normal service shutdown leaves eligible sessions `suspended`. Both normal and abrupt restarts resume the same saved Codex conversation. Deliberately closed sessions stay closed; historical `process_lost`/`failed` sessions are not automatically reopened.
+- Normal service shutdown leaves eligible sessions `suspended`. Both normal and abrupt restarts resume the same saved Codex conversation, now or when work arrives (see sleep above). Deliberately closed sessions stay closed; historical `process_lost`/`failed` sessions are not automatically reopened.
 - If a pending start's harness is no longer configured, that start and its unrun queued prompts fail with a recorded reason. Other sessions and history remain available. Restore configuration and use a new start request ID; retrying the failed ID does not launch or replay work.
 - An unexpected harness exit gets one recovery attempt after confirmed cleanup. A new user request or completed/interrupted turn permits a later attempt. Failed native resumes become `process_lost`; there is no restart loop or fresh-conversation fallback. Timeouts during native resume preserve unrun queued receipts, including across service restarts; other failures settle them as `failed`.
 - New and restored harnesses share a startup queue. At most half the available logical CPUs (minimum one) initialize concurrently; this does not cap running sessions. Startup RPCs allow 120 seconds instead of the ordinary 30-second deadline, and retain storage-pause-aware timing. A normal shutdown while waiting for or performing recovery leaves the saved conversation resumable.

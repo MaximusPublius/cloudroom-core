@@ -80,7 +80,9 @@ async fn both_harnesses_obey_request_and_shutdown_contract() {
                         assert!(!started);
                         started = true;
                     }
-                    Event::Finished { request, status } => {
+                    Event::Finished {
+                        request, status, ..
+                    } => {
                         assert!(started);
                         assert_eq!((request.as_str(), status.as_str()), ("first", "completed"));
                         return;
@@ -148,7 +150,9 @@ async fn pi_waits_through_retry_and_preserves_tool_snapshots() {
                             .to_owned(),
                     );
                 }
-                Event::Finished { request, status } => {
+                Event::Finished {
+                    request, status, ..
+                } => {
                     assert_eq!(request, "retry");
                     assert_eq!(status, "completed");
                     return;
@@ -193,6 +197,7 @@ async fn pi_handles_no_run_dialogs_rejection_and_failure() {
                     Event::Finished {
                         request,
                         status: outcome,
+                        ..
                     } => {
                         assert_eq!(request, text);
                         assert_eq!(outcome, status);

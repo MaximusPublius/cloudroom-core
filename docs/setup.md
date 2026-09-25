@@ -6,6 +6,19 @@ Use a **fresh VM for one trusted user**, with sudo access, systemd, cgroup v2, a
 
 Agents run without approval prompts and share their account's files. Do not give that account sudo or access to a Docker socket.
 
+## Quick install
+
+On an x86_64 VM, one script does most of the manual setup below, using the newest CI-tested release instead of a source build:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/davidondrej/cloudroom-core/main/install/install.sh -o install.sh
+sudo bash install.sh
+```
+
+It asks for your PostgreSQL URL without showing it, checks the download's checksum, creates both accounts, writes `/etc/cloudroom/core.env` with a new token, and starts the service. It never prints the token or runs SQL. When it finishes, it prints the two remaining steps: apply the database schema and sign in to a harness. Use `--version X.Y.Z` to pick a release. It refuses to run over an existing installation.
+
+To build from source instead, follow the manual steps below.
+
 ## 1. Install tools and build
 
 Run these commands in an SSH terminal on the VM, as your administrator account:
@@ -172,7 +185,7 @@ A failed readiness check usually means the database, TLS certificate, migrations
 
 ## Cloud folders
 
-Send `"workspace":"PROJECT_ID"` and optional `"workspace_name":"project-name"` with `POST /v1/sessions`. The core creates an empty directory under `/code` and starts the harness. Repeated workspace IDs reuse their recorded directory; name collisions never overwrite another folder. No Git repository, local source folder, archive upload, or sync worker is required. The agent can clone a repository or install dependencies after starting.
+Send `"workspace":"PROJECT_ID"` and optional `"workspace_name":"project-name"` with `POST /v1/sessions`. The core creates an empty directory under `/code` and starts the harness. Repeated workspace IDs reuse their recorded directory; name collisions never overwrite another folder. No Git repository, local source folder, archive upload, or sync worker is required. The agent can clone a repository or install dependencies after starting. Send `"workspace":"root"` to start in `/code` itself, outside any project folder.
 
 `GET /v1/workspaces/PROJECT_ID` returns the mapping; `GET /v1/sessions/SESSION_ID/workspace` returns the actual directory and Git metadata, which may be null. `/code` belongs to the unprivileged agent; the installer prepares it. Existing folders, nested mappings, session IDs, and history remain intact. No new environment variable or SQL migration is required.
 

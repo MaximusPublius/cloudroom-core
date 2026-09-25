@@ -221,7 +221,7 @@ impl Rpc {
             if exhausted { "limited" } else { "connected" },
             if exhausted {
                 Some(
-                    "Your Codex usage limit is reached. Wait for it to reset; signing in again will not reset it.",
+                    "Your Codex usage limit is reached. Sign in with another ChatGPT account to keep working, or wait for it to reset.",
                 )
             } else {
                 None
@@ -248,6 +248,8 @@ struct State {
     status: Status,
     checked: Option<Instant>,
     login: Option<Login>,
+    // A completed sign-in the session manager has not yet acted on.
+    switched: bool,
 }
 pub struct CodexAuth {
     state: AsyncMutex<State>,
@@ -260,6 +262,7 @@ impl Default for CodexAuth {
                 status: Status::new("missing", None),
                 checked: None,
                 login: None,
+                switched: false,
             }),
             process: Mutex::new(None),
         }
@@ -286,7 +289,9 @@ impl CodexAuth {
             let disconnected = login.rpc.completed.has_changed().is_err();
             if let Some(result) = completed.filter(|v| v["id"].as_str() == Some(&login.native_id)) {
                 state.status = if result["success"] == true {
-                    login.rpc.probe().await.unwrap_or_else(failure)
+                    let status = login.rpc.probe().await.unwrap_or_else(failure);
+                    state.switched = status.state == "connected";
+                    status
                 } else {
                     Status::new("error", Some("Sign-in was not completed. Try again."))
                 };
@@ -317,6 +322,12 @@ impl CodexAuth {
     pub async fn status(&self, config: &Config) -> Status {
         Self::inspect(&mut *self.state.lock().await, config, false).await
     }
+    pub async fn verify(&self, config: &Config) -> Status {
+        Self::inspect(&mut *self.state.lock().await, config, true).await
+    }
+    pub async fn take_switched(&self) -> bool {
+        std::mem::take(&mut self.state.lock().await.switched)
+    }
     pub(crate) async fn import(&self, config: &Config, storage: &Guard, value: Value) -> Status {
         let mut state = self.state.lock().await;
         let current = Self::inspect(&mut state, config, true).await;
@@ -330,7 +341,11 @@ impl CodexAuth {
             );
         };
         match import_file(config, storage, credentials).await {
-            Ok(_) => Self::inspect(&mut state, config, true).await,
+            Ok(_) => {
+                let status = Self::inspect(&mut state, config, true).await;
+                state.switched = status.state == "connected";
+                status
+            }
             Err(_) => Status::new(
                 "unavailable",
                 Some("Could not copy the saved Codex login. Check cloud storage and try again."),
@@ -340,8 +355,7 @@ impl CodexAuth {
     pub async fn login(&self, config: &Config, request: String) -> Status {
         let mut state = self.state.lock().await;
         let current = Self::inspect(&mut state, config, true).await;
-        if state.login.is_some() || matches!(current.state, "connected" | "limited" | "unavailable")
-        {
+        if state.login.is_some() || matches!(current.state, "connected" | "unavailable") {
             return current;
         }
         let attempt = async {

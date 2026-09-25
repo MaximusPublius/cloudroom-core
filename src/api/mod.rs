@@ -22,14 +22,22 @@ use tokio_stream::wrappers::ReceiverStream;
 pub fn router(manager: Arc<Manager>, token: String) -> Router {
     Router::new()
         .merge(crate::preview::routes())
+        .merge(crate::mac::routes())
+        .merge(crate::secrets::routes())
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/accounts/cursor", get(cursor_auth))
         .route("/v1/accounts/cursor/{action}", post(cursor_account))
+        .route("/v1/accounts/claude", get(claude_auth))
+        .route("/v1/accounts/claude/{action}", post(claude_account))
+        .route("/v1/accounts/pi", get(pi_auth))
+        .route("/v1/accounts/pi/import", post(pi_import))
+        .route("/v1/accounts/pi/key", post(pi_key))
         .route("/v1/accounts/codex", get(codex_auth))
         .route("/v1/accounts/codex/login", post(codex_login))
         .route("/v1/accounts/codex/import", post(codex_import))
+        .route("/v1/accounts/codex/switched", post(codex_switched))
         .route("/v1/accounts/codex/cancel", post(codex_cancel))
         .route("/v1/workspaces/{id}", get(workspace))
         .route("/v1/settings", get(crate::sync::settings))
@@ -47,6 +55,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
             "/v1/teleports",
             post(teleport_prepare).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
+        .route("/v1/teleports/check", post(teleport_check))
         .route("/v1/teleports/{id}", get(teleport_status))
         .route("/v1/teleports/{id}/activate", post(teleport_activate))
         .route("/v1/teleports/{id}/cancel", post(teleport_cancel))
@@ -54,7 +63,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
             "/v1/teleports/{id}/files/{index}",
             post(teleport_upload).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
-        .route("/v1/sessions", post(start))
+        .route("/v1/sessions", post(start).get(list_sessions))
         .route("/v1/sessions/{id}", get(status))
         .route("/v1/sessions/{id}/workspace", get(session_workspace))
         .route("/v1/sessions/{id}/recovery", get(recovery))
@@ -70,6 +79,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         )
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop))
+        .route("/v1/sessions/{id}/sleep", post(sleep))
         .route("/v1/sessions/{id}/resume", post(resume))
         .route("/v1/sessions/{id}/close", post(close))
         .route("/v1/sessions/{id}/events", get(events))
@@ -117,6 +127,111 @@ async fn cursor_account(
     ))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeAccountRequest {
+    request_id: String,
+    code: Option<String>,
+    state: Option<String>,
+    token: Option<String>,
+    plan: Option<String>,
+}
+async fn claude_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
+    Json(manager.claude_auth_status().await)
+}
+async fn claude_account(
+    State(manager): State<Arc<Manager>>,
+    Path(action): Path<String>,
+    Json(input): Json<ClaudeAccountRequest>,
+) -> Result<(StatusCode, Json<crate::runtime::auth::Status>)> {
+    crate::workspace::valid_id(&input.request_id)
+        .map_err(|_| session::Error::Conflict("invalid request ID"))?;
+    let valid = |value: &Option<String>, max: usize| {
+        value.as_ref().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= max
+                && s.bytes().all(|c| c.is_ascii_graphic())
+                && !s.starts_with("sk-ant-")
+        })
+    };
+    let token = input.token.as_ref().is_some_and(|s| {
+        s.starts_with("sk-ant-oat")
+            && s.len() <= 1024
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    });
+    if !matches!(action.as_str(), "login" | "cancel" | "complete" | "token")
+        || (action == "complete" && (!valid(&input.code, 2048) || !valid(&input.state, 512)))
+        || (action != "complete" && (input.code.is_some() || input.state.is_some()))
+        || (action == "token") != token
+        || (action != "token" && input.token.is_some())
+        || (action != "token" && input.plan.is_some())
+        || input.plan.as_ref().is_some_and(|s| {
+            s.is_empty() || s.len() > 32 || !s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+        })
+    {
+        return Err(session::Error::Conflict("invalid Claude sign-in request"));
+    }
+    let (code, state) = if action == "token" {
+        (input.token, input.plan)
+    } else {
+        (input.code, input.state)
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .claude_account(&action, input.request_id, code, state)
+                .await?,
+        ),
+    ))
+}
+
+fn pi_error(error: std::io::Error) -> session::Error {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        session::Error::Conflict("invalid Pi login")
+    } else {
+        error.into()
+    }
+}
+async fn pi_auth(State(manager): State<Arc<Manager>>) -> Result<Json<Value>> {
+    let result = crate::runtime::pi_auth::providers(&manager.config, &manager.storage).await;
+    Ok(Json(result.map_err(pi_error)?))
+}
+async fn pi_import(
+    State(manager): State<Arc<Manager>>,
+    Json(credentials): Json<Value>,
+) -> Result<Json<Value>> {
+    if manager.is_stopping() {
+        return Err(session::Error::Conflict("service is stopping"));
+    }
+    let result =
+        crate::runtime::pi_auth::import(&manager.config, &manager.storage, credentials).await;
+    Ok(Json(result.map_err(pi_error)?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PiKey {
+    provider: String,
+    key: String,
+}
+async fn pi_key(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<PiKey>,
+) -> Result<Json<Value>> {
+    if manager.is_stopping() {
+        return Err(session::Error::Conflict("service is stopping"));
+    }
+    let result = crate::runtime::pi_auth::set_key(
+        &manager.config,
+        &manager.storage,
+        input.provider,
+        input.key,
+    )
+    .await;
+    Ok(Json(result.map_err(pi_error)?))
+}
+
 async fn codex_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
     Json(manager.codex_auth_status().await)
 }
@@ -137,6 +252,10 @@ async fn codex_import(
 ) -> Result<Json<crate::runtime::auth::Status>> {
     Ok(Json(manager.import_codex_login(credentials).await?))
 }
+async fn codex_switched(State(manager): State<Arc<Manager>>) -> Json<Value> {
+    let (status, continued) = manager.codex_switched().await;
+    Json(json!({"account":status,"continued":continued}))
+}
 async fn codex_cancel(
     State(manager): State<Arc<Manager>>,
     Json(input): Json<RequestId>,
@@ -155,6 +274,15 @@ async fn teleport_prepare(
         StatusCode::ACCEPTED,
         Json(manager.teleport_prepare(manifest).await?),
     ))
+}
+async fn teleport_check(
+    State(manager): State<Arc<Manager>>,
+    Json(check): Json<session::teleport::Check>,
+) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(manager.teleport_check(check).await),
+    )
 }
 async fn teleport_status(
     State(manager): State<Arc<Manager>>,
@@ -262,7 +390,7 @@ async fn authenticate(State(token): State<Arc<String>>, request: Request, next: 
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|supplied| supplied == token.as_str());
+        .is_some_and(|supplied| same_token(supplied, token.as_str()));
     let mut response = if authorized {
         next.run(request).await
     } else {
@@ -279,15 +407,32 @@ async fn authenticate(State(token): State<Arc<String>>, request: Request, next: 
     response
 }
 
+/// Compares every byte, so response timing does not reveal how much of the token matched.
+fn same_token(supplied: &str, expected: &str) -> bool {
+    let (supplied, expected) = (supplied.as_bytes(), expected.as_bytes());
+    let difference = supplied
+        .iter()
+        .zip(expected)
+        .fold(0, |difference, (a, b)| difference | (a ^ b));
+    supplied.len() == expected.len() && std::hint::black_box(difference) == 0
+}
+
 impl IntoResponse for session::Error {
     fn into_response(self) -> Response {
         let (status, error) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "session not found"),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
-            Self::Storage => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "storage unavailable; retry with the same request_id",
-            ),
+            Self::Storage(detail) => {
+                eprintln!("storage unavailable: {detail}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": format!("storage unavailable ({detail}); retry with the same request_id"),
+                        "code": "storage_unavailable",
+                    })),
+                )
+                    .into_response();
+            }
         };
         let code = match error {
             "invalid model" => "invalid_model",
@@ -326,7 +471,6 @@ impl IntoResponse for session::Error {
             "Claude live steering is not supported" => "unsupported_command",
             "Codex usage limit reached" => "codex_usage_limit",
             "Codex account could not be verified" => "codex_auth_unavailable",
-            "Cursor Command Guard support is not verified" => "cursor_guard_unsupported",
             "connect Cursor before starting cloud work" => "cursor_auth_required",
             "Cursor account could not be verified" => "cursor_auth_unavailable",
             "close Cursor sessions before changing the cloud login" => "cursor_auth_busy",
@@ -367,9 +511,9 @@ async fn workspace(
             StatusCode::NOT_FOUND,
             Json(json!({"error":"workspace not found"})),
         ),
-        Err(_) => (
+        Err(error) => (
             StatusCode::CONFLICT,
-            Json(json!({"error":"workspace unavailable"})),
+            Json(json!({"error":format!("workspace unavailable: {error}")})),
         ),
     }
 }
@@ -472,6 +616,10 @@ async fn dashboard(State(manager): State<Arc<Manager>>) -> Json<Value> {
     Json(manager.dashboard())
 }
 
+async fn list_sessions(State(manager): State<Arc<Manager>>) -> Json<Value> {
+    Json(manager.list_sessions())
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetricsQuery {
@@ -523,6 +671,16 @@ async fn resume(
 ) -> Result<impl IntoResponse> {
     key(&body.request_id)?;
     let receipt = manager.command(&id, body.request_id, "resume", json!({}))?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn sleep(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<RequestId>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    let receipt = manager.command(&id, body.request_id, "sleep", json!({}))?;
     Ok(accepted(&manager, &id, receipt))
 }
 
@@ -800,7 +958,9 @@ async fn attach(
         return Err(session::Error::Conflict("workspace mapping unavailable"));
     }
     if !manager.recording_available() {
-        return Err(session::Error::Storage);
+        return Err(session::Error::Storage(
+            "session journal is not writable".into(),
+        ));
     }
     if manager.is_stopping() || manager.storage.blocks() {
         return Err(session::Error::Conflict(
@@ -820,7 +980,7 @@ async fn attach(
         .await
         .map_err(|error| {
             eprintln!(
-                "attachment upload failed: session={id} request={} kind={:?} errno={:?}",
+                "attachment upload failed: session={id} request={} kind={:?} errno={:?}: {error}",
                 query.request_id,
                 error.kind(),
                 error.raw_os_error()

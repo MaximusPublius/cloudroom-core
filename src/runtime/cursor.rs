@@ -4,18 +4,38 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, BufReader, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{Receiver, TryRecvError, sync_channel},
     time::Duration,
 };
 use tokio::process::Command;
 
 const HISTORY: &str = include_str!("cursor-history.py");
+const DRIVER: &str = include_str!("cursor-print.py");
 const PLAIN_CHAT: &str = "Ask the user questions in plain chat. Do not use structured question or plan-approval tools. Never infer the user's answer or approval.";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
+
+/// What differs between ACP harnesses that share this protocol.
+#[derive(Clone, Copy)]
+pub(super) struct Flavor {
+    pub harness: &'static str,
+    pub name: &'static str,
+    pub sessions: &'static str,
+    pub meta: &'static str,
+    pub valid_id: fn(&str) -> bool,
+    pub capture: bool,
+}
+pub(super) const CURSOR: Flavor = Flavor {
+    harness: "cursor",
+    name: "Cursor",
+    sessions: "chats",
+    meta: "meta.json",
+    valid_id,
+    capture: true,
+};
 
 pub(crate) fn capabilities() -> Value {
     json!({"resume":true,"interrupt":true,"system_notice":false,"interactive_dialogs":false,
@@ -23,28 +43,25 @@ pub(crate) fn capabilities() -> Value {
         "service_tier":false,"subagents":false,"usage":false,"command_guard":false})
 }
 
-pub(super) fn command(
-    config: &Config,
-    profile: &HarnessConfig,
-    guard: bool,
-) -> io::Result<Command> {
+pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Command> {
     if profile.home.canonicalize()? != config.account_home.join(".cursor").canonicalize()? {
         return Err(invalid(
             "Cursor home must belong to the configured agent account",
         ));
     }
-    if guard {
-        return Err(invalid(
-            "Cursor Command Guard support is not verified; guarded starts are blocked",
-        ));
-    }
-    let mut command = child_command(&profile.binary, config);
+    let mut command = child_command(std::path::Path::new("python3"), config);
     super::cursor_auth::apply_key(&mut command, config)?;
-    command.args(["--disable-auto-update", "acp"]);
+    command.args(["-I", "-c", DRIVER]).arg(&profile.binary);
     Ok(command)
 }
 
 pub(super) async fn start(handle: &Handle) -> io::Result<String> {
+    let (id, session) = open(handle, "Cursor").await?;
+    select_model(handle, &id, &session).await?;
+    Ok(id)
+}
+
+pub(super) async fn open(handle: &Handle, name: &str) -> io::Result<(String, Value)> {
     let init = handle
         .call(
             "initialize",
@@ -54,9 +71,9 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
         )
         .await?;
     if init["protocolVersion"] != 1 || init["agentCapabilities"]["loadSession"] != true {
-        return Err(io::Error::other(
-            "Cursor ACP session loading is unavailable",
-        ));
+        return Err(io::Error::other(format!(
+            "{name} ACP session loading is unavailable"
+        )));
     }
     let mut params = json!({"cwd":handle.repository,"mcpServers":[]});
     let method = if let Some(saved) = &handle.resume {
@@ -68,10 +85,11 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     let session = handle.call(method, params).await?;
     let id = handle.native()?;
     if handle.resume.as_ref().is_some_and(|saved| saved.id != id) {
-        return Err(io::Error::other("Cursor resumed a different session"));
+        return Err(io::Error::other(format!(
+            "{name} resumed a different session"
+        )));
     }
-    select_model(handle, &id, &session).await?;
-    Ok(id)
+    Ok((id, session))
 }
 
 async fn select_model(handle: &Handle, id: &str, session: &Value) -> io::Result<()> {
@@ -82,36 +100,14 @@ async fn select_model(handle: &Handle, id: &str, session: &Value) -> io::Result<
     let catalog = session["models"]["availableModels"]
         .as_array()
         .ok_or_else(|| io::Error::other("Cursor model catalog unavailable"))?;
-    let selected = catalog
-        .iter()
-        .filter_map(|model| model["modelId"].as_str())
-        .find(|model| *model == requested || model.split('[').next() == Some(requested))
-        .ok_or_else(|| invalid("Cursor model is unavailable for this account"))?;
-    let mut selected = selected.to_owned();
-    if let Some(level) = &handle.reasoning {
-        let (family, parameters) = selected
-            .split_once('[')
-            .ok_or_else(|| invalid("Cursor model parameters unavailable"))?;
-        let mut fields: Vec<String> = parameters
-            .trim_end_matches(']')
-            .split(',')
-            .filter(|field| !field.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if let Some(field) = fields.iter_mut().find(|field| {
-            ["effort=", "reasoning=", "reasoning_effort="]
-                .iter()
-                .any(|prefix| field.starts_with(prefix))
-        }) {
-            let key = field.split_once('=').unwrap().0;
-            *field = format!("{key}={level}");
-            selected = format!("{family}[{}]", fields.join(","));
-        } else if level != "none" {
-            return Err(invalid(
-                "Cursor model does not expose the requested reasoning level",
-            ));
-        }
-    }
+    let ids = catalog.iter().filter_map(|model| model["modelId"].as_str());
+    let reasoning = handle.reasoning.as_deref();
+    let selected = super::cursor_models::resolve(ids, requested, reasoning).ok_or_else(|| {
+        invalid(&format!(
+            "Cursor offers no {} variant of {requested} for this account",
+            reasoning.unwrap_or("default")
+        ))
+    })?;
     let result = handle
         .call(
             "session/set_config_option",
@@ -126,7 +122,7 @@ async fn select_model(handle: &Handle, id: &str, session: &Value) -> io::Result<
     Ok(())
 }
 
-fn option_value<'a>(state: &'a Value, name: &str) -> Option<&'a str> {
+pub(super) fn option_value<'a>(state: &'a Value, name: &str) -> Option<&'a str> {
     state["configOptions"]
         .as_array()?
         .iter()
@@ -179,7 +175,7 @@ pub(super) async fn interrupt(handle: &Handle, state: Progress) -> io::Result<()
             state
                 .request
                 .as_deref()
-                .ok_or_else(|| invalid("No active Cursor turn"))?,
+                .ok_or_else(|| invalid("No active ACP turn"))?,
         )
         .await?;
     Ok(())
@@ -212,22 +208,37 @@ pub(super) fn validate(
     saved: &Resume,
     identity: super::files::Identity,
 ) -> io::Result<()> {
-    let expected = profile
-        .home
-        .join("acp-sessions")
-        .join(&saved.id)
-        .join("meta.json");
-    if saved.path != expected || !valid_id(&saved.id) {
-        return Err(io::Error::other(
-            "Cursor native path does not match its session",
-        ));
-    }
-    let file = super::files::open(&profile.home.join("acp-sessions"), &saved.path, identity)?;
+    chat_root(&profile.home, &saved.id, &saved.path)?;
+    let file = super::files::open(&profile.home.join("chats"), &saved.path, identity)?;
     let value: Value = serde_json::from_reader(file.take(super::process::MAX_LINE as u64))?;
     if value["schemaVersion"] != 1 || !value["cwd"].is_string() {
         return Err(io::Error::other("Unsupported Cursor native metadata"));
     }
     Ok(())
+}
+
+/// Print-mode chats live at chats/<md5 of the working folder>/<chat ID>/meta.json.
+fn chat_root(home: &Path, id: &str, path: &Path) -> io::Result<PathBuf> {
+    let root = path.parent().and_then(Path::parent).filter(|root| {
+        root.parent() == Some(home.join("chats").as_path())
+            && root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.len() == 32
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                })
+    });
+    match root {
+        Some(root) if valid_id(id) && root.join(id).join("meta.json") == path => {
+            Ok(root.to_owned())
+        }
+        _ => Err(io::Error::other(
+            "Cursor native path does not match its session",
+        )),
+    }
 }
 
 fn valid_id(id: &str) -> bool {
@@ -242,6 +253,7 @@ fn valid_id(id: &str) -> bool {
 }
 
 pub(super) struct Protocol {
+    flavor: Flavor,
     home: PathBuf,
     expected: Option<String>,
     opening: Option<u64>,
@@ -259,8 +271,14 @@ pub(super) struct Protocol {
     thinking: String,
 }
 impl Protocol {
-    pub fn new(config: &Config, profile: &HarnessConfig, resume: Option<&Resume>) -> Self {
+    pub fn new(
+        config: &Config,
+        profile: &HarnessConfig,
+        resume: Option<&Resume>,
+        flavor: Flavor,
+    ) -> Self {
         Self {
+            flavor,
             home: profile.home.clone(),
             expected: resume.map(|saved| saved.id.clone()),
             opening: None,
@@ -291,8 +309,8 @@ impl Protocol {
             ("reasoning", std::mem::take(&mut self.thinking)),
         ] {
             if !text.is_empty() {
-                events.push(self.record("item_completed", json!({"harness":"cursor","request_id":state.request,
-                    "item_id":format!("cursor:{}:{}", self.message, kind),"item_type":kind,"text":text})));
+                events.push(self.record("item_completed", json!({"harness":self.flavor.harness,"request_id":state.request,
+                    "item_id":format!("{}:{}:{}", self.flavor.harness, self.message, kind),"item_type":kind,"text":text})));
             }
         }
         self.message += 1;
@@ -303,9 +321,10 @@ impl Adapter for Protocol {
         if matches!(method, "cloudroom/steer" | "session/cancel")
             && (self.prompt.is_none() || self.restart.is_some() || self.cancel.is_some())
         {
-            return Err(invalid(
-                "Cursor turn has ended or an interrupt is already pending",
-            ));
+            return Err(invalid(&format!(
+                "{} turn has ended or an interrupt is already pending",
+                self.flavor.name
+            )));
         }
         Ok(())
     }
@@ -344,30 +363,47 @@ impl Adapter for Protocol {
             let id = value["result"]["sessionId"]
                 .as_str()
                 .or(self.expected.as_deref())
-                .ok_or_else(|| io::Error::other("Missing Cursor session identity"))?
+                .ok_or_else(|| {
+                    io::Error::other(format!("Missing {} session identity", self.flavor.name))
+                })?
                 .to_owned();
-            if !valid_id(&id)
+            if !(self.flavor.valid_id)(&id)
                 || self
                     .expected
                     .as_ref()
                     .is_some_and(|expected| expected != &id)
             {
-                return Err(io::Error::other("Cursor native identity changed"));
+                return Err(io::Error::other(format!(
+                    "{} native identity changed",
+                    self.flavor.name
+                )));
             }
+            let path = if self.flavor.capture {
+                // The Cursor print driver reports where Cursor keeps this chat.
+                let path = PathBuf::from(
+                    value["result"]["path"]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("Missing Cursor chat location"))?,
+                );
+                self.capture.root = chat_root(&self.home, &id, &path)?;
+                self.capture.id = Some(id.clone());
+                path
+            } else {
+                self.home
+                    .join(self.flavor.sessions)
+                    .join(&id)
+                    .join(self.flavor.meta)
+            };
             self.expected = Some(id.clone());
             state.native = Some(id.clone());
-            self.capture.id = Some(id.clone());
-            self.capture.dirty = true;
-            events.push(self.record(
-                "native_identity",
-                json!({"id":id,"path":self.home.join("acp-sessions").join(&id).join("meta.json")}),
-            ));
+            events.push(self.record("native_identity", json!({"id":id,"path":path})));
         }
         if value["method"] == "session/update" && self.prompt.is_some() {
             if value["params"]["sessionId"].as_str() != state.native.as_deref() {
-                return Err(io::Error::other(
-                    "Cursor event belongs to a different session",
-                ));
+                return Err(io::Error::other(format!(
+                    "{} event belongs to a different session",
+                    self.flavor.name
+                )));
             }
             let update = &value["params"]["update"];
             let kind = update["sessionUpdate"].as_str().unwrap_or("");
@@ -386,36 +422,36 @@ impl Adapter for Protocol {
                     } else {
                         "agentMessage"
                     };
-                    let item_id = format!("cursor:{}:{}", self.message, item_type);
+                    let item_id = format!("{}:{}:{}", self.flavor.harness, self.message, item_type);
                     let empty = if thinking {
                         self.thinking.is_empty()
                     } else {
                         self.text.is_empty()
                     };
                     if empty {
-                        events.push(self.record("item_started", json!({"harness":"cursor","request_id":state.request,"item_id":item_id,"item_type":item_type})));
+                        events.push(self.record("item_started", json!({"harness":self.flavor.harness,"request_id":state.request,"item_id":item_id,"item_type":item_type})));
                     }
                     if thinking {
                         self.thinking.push_str(text);
                     } else {
                         self.text.push_str(text);
                     }
-                    events.push(self.record(if thinking { "thinking_delta" } else { "text_delta" }, json!({"harness":"cursor","request_id":state.request,"item_id":item_id,"delta":text})));
+                    events.push(self.record(if thinking { "thinking_delta" } else { "text_delta" }, json!({"harness":self.flavor.harness,"request_id":state.request,"item_id":item_id,"delta":text})));
                 }
                 "tool_call" | "tool_call_update" => {
                     if kind == "tool_call" {
                         self.finish_message(state, &mut events);
                     }
-                    let id = update["toolCallId"]
-                        .as_str()
-                        .ok_or_else(|| io::Error::other("Missing Cursor tool identity"))?;
+                    let id = update["toolCallId"].as_str().ok_or_else(|| {
+                        io::Error::other(format!("Missing {} tool identity", self.flavor.name))
+                    })?;
                     let stored = self.tools.entry(id.into()).or_insert_with(|| json!({}));
                     if let Some(fields) = update.as_object() {
                         for (key, value) in fields {
                             stored[key] = value.clone();
                         }
                     }
-                    let data = json!({"harness":"cursor","request_id":state.request,"item_id":id,"tool":stored});
+                    let data = json!({"harness":self.flavor.harness,"request_id":state.request,"item_id":id,"tool":stored});
                     let complete = matches!(
                         update["status"].as_str(),
                         Some("completed" | "failed" | "cancelled")
@@ -522,7 +558,7 @@ impl Adapter for Protocol {
                 0,
                 Event::Record {
                     kind: "native_event",
-                    data: json!({"harness":"cursor","request_id":state.request}),
+                    data: json!({"harness":self.flavor.harness,"request_id":state.request}),
                     native: Some(raw),
                 },
             );
@@ -541,10 +577,15 @@ impl Adapter for Protocol {
             .or_else(|| value["id"].as_u64())?;
         Some((
             id,
-            if value.get("error").is_some() {
-                Err(invalid(
-                    "Cursor rejected the operation; inspect native history",
-                ))
+            if let Some(error) = value.get("error") {
+                Err(invalid(&format!(
+                    "{} rejected the operation (code {}): {}",
+                    self.flavor.name,
+                    error["code"],
+                    error["message"]
+                        .as_str()
+                        .unwrap_or("no error message returned")
+                )))
             } else {
                 Ok(value["result"].clone())
             },
@@ -558,7 +599,11 @@ impl Adapter for Protocol {
         if !self.capture.pending()
             && let Some((request, status)) = self.terminal.take()
         {
-            events.push(Event::Finished { request, status });
+            events.push(Event::Finished {
+                request,
+                status,
+                error: None,
+            });
         }
         Ok(events)
     }
@@ -592,7 +637,7 @@ impl Capture {
     fn new(profile: &HarnessConfig, policy: Option<crate::workspace::storage::Policy>) -> Self {
         Self {
             policy,
-            root: profile.home.join("acp-sessions"),
+            root: profile.home.join("chats"),
             id: None,
             dirty: false,
             worker: None,
@@ -708,6 +753,7 @@ pub(super) fn recover(
         policy.map(|policy| (policy.agent_uid, policy.agent_gid)),
     )?;
     let mut capture = Capture::new(profile, policy.cloned());
+    capture.root = chat_root(&profile.home, &saved.id, &saved.path)?;
     capture.id = Some(saved.id.clone());
     capture.dirty = true;
     while capture.pending() {

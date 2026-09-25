@@ -13,6 +13,7 @@ pub(crate) struct AgentCounts {
     pub working: usize,
     pub queued: usize,
     pub waiting: usize,
+    pub sleeping: usize,
     pub failed: usize,
 }
 
@@ -101,6 +102,7 @@ impl History {
                             'working', (latest.record#>>'{agents,working}')::bigint,
                             'queued', (latest.record#>>'{agents,queued}')::bigint,
                             'waiting', (latest.record#>>'{agents,waiting}')::bigint,
+                            'sleeping', (latest.record#>>'{agents,sleeping}')::bigint,
                             'failed', (latest.record#>>'{agents,failed}')::bigint
                         ) ELSE NULL END
                 )::text FROM buckets

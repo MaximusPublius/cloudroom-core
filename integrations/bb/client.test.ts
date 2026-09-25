@@ -64,7 +64,7 @@ test("routes Cursor account operations and rejects off-domain login links", asyn
   }
 });
 
-test("reports allowlisted rejections, keeps temporary conflicts retryable, and never exposes response bodies", async (t) => {
+test("reports allowlisted rejections, keeps temporary conflicts retryable, and shows unknown core errors", async (t) => {
   let body: unknown;
   const service = await fixture((_req, res) => sendJson(res, body, 409));
   t.after(() => service.close());
@@ -88,7 +88,9 @@ test("reports allowlisted rejections, keeps temporary conflicts retryable, and n
       assert.equal(error.status, 409);
       assert.equal(error.code, code);
       assert.equal(error.retryable, retryable);
-      assert(!error.message.includes("SECRET-CANARY"));
+      // Allowlisted codes keep their friendly text; unknown rejections show the core's own error (ADR 0123).
+      const shown = code === null && typeof (value as { error?: unknown }).error === "string";
+      assert.equal(error.message.includes("SECRET-CANARY"), shown);
       return true;
     });
   }
@@ -213,7 +215,7 @@ test("rejects each authentication layer independently and replays through the ga
   const url = `http://127.0.0.1:${address.port}`;
   for (const [token, gate, status] of [["test-token", undefined, 403], ["test-token", "wrong-gate", 403], ["wrong-core", gateToken, 401]] as const) {
     const client = new CloudroomClient({ url, token, gateToken: gate });
-    const rejected = (error: unknown) => error instanceof CloudroomError && error.status === status && error.message === "Cloudroom authentication failed";
+    const rejected = (error: unknown) => error instanceof CloudroomError && error.status === status && error.message === `Cloudroom authentication failed (HTTP ${status})`;
     await assert.rejects(client.ready(), rejected);
     await assert.rejects(client.start("rejected"), rejected);
     await assert.rejects(async () => {

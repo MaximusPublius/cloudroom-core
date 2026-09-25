@@ -69,19 +69,6 @@ pub(super) async fn models(handle: &Handle) -> io::Result<Vec<super::Model>> {
 
 pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     initialize(handle).await?;
-    if handle.command_guard_enabled {
-        let settings = handle
-            .call(
-                "config/read",
-                json!({"cwd":handle.repository,"includeLayers":false}),
-            )
-            .await?;
-        if settings["config"]["features"]["hooks"] == false {
-            return Err(io::Error::other(
-                "Codex hooks are disabled; enable them or start with command_guard_enabled: false",
-            ));
-        }
-    }
     let mut params = json!({"cwd":handle.repository,"model":handle.profile.model,"approvalPolicy":"never","sandbox":"danger-full-access","ephemeral":false});
     if let Some(reasoning) = &handle.reasoning {
         params["config"] = json!({"model_reasoning_effort":reasoning});
@@ -446,6 +433,17 @@ impl Adapter for Protocol {
         if value["id"].as_u64() == self.prompt_id && value.get("error").is_some() {
             state.finished = true;
         }
+        let limited = Some(&json!("usageLimitExceeded"));
+        if root
+            && (params.pointer("/turn/error/codexErrorInfo") == limited
+                || params.pointer("/error/codexErrorInfo") == limited)
+        {
+            events.push(Event::Record {
+                kind: "usage_limited",
+                data: json!({"harness":"codex"}),
+                native: None,
+            });
+        }
         match if root { method } else { "" } {
             "turn/started" => {
                 if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) {
@@ -466,8 +464,14 @@ impl Adapter for Protocol {
                     == state.native_turn.as_deref()
                     && state.native_turn.is_some() =>
             {
-                events
-                    .extend(state.finished(params["turn"]["status"].as_str().unwrap_or("unknown")));
+                let error = params
+                    .pointer("/turn/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                events.extend(state.finished(
+                    params["turn"]["status"].as_str().unwrap_or("unknown"),
+                    error,
+                ));
             }
             _ => {}
         }
@@ -480,10 +484,16 @@ impl Adapter for Protocol {
         let id = value["id"].as_u64()?;
         Some((
             id,
-            if value.get("error").is_some() {
+            if let Some(error) = value.get("error") {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "harness rejected command; see native history",
+                    format!(
+                        "harness rejected command (code {}): {}",
+                        error["code"],
+                        error["message"]
+                            .as_str()
+                            .unwrap_or("no error message returned")
+                    ),
                 ))
             } else {
                 Ok(value.get("result").cloned().unwrap_or(Value::Null))

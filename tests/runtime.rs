@@ -289,6 +289,7 @@ async fn turn_notifications_survive_both_rpc_reply_orders() {
                     runtime::Event::Finished {
                         request: id,
                         status,
+                        ..
                     } => {
                         assert_eq!(started.as_deref(), Some(id.as_str()));
                         assert_eq!(status, "completed");

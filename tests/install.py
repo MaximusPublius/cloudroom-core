@@ -29,21 +29,17 @@ class InstallerTests(unittest.TestCase):
         environment.start(); self.addCleanup(environment.stop)
         os.environ.pop('CLOUDROOM_LISTEN', None)
         os.environ.pop('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP', None)
-        for name, path in [('CODE_ROOT', self.root / 'code'), ('CACHE_ROOT', self.root / 'cache')]:
+        for name, path in [('CODE_ROOT', self.root / 'code'), ('CACHE_ROOT', self.root / 'cache'),
+                           ('installed_version', lambda: 'test')]:
             setting = patch.object(installer, name, path)
             setting.start(); self.addCleanup(setting.stop)
-        read_text = Path.read_text
-
-        def read(path, *args, **kwargs):
-            return 'test' if str(path) == '/usr/local/lib/cloudroom/version' else read_text(path, *args, **kwargs)
-
         for target, value in [
             ('os.geteuid', lambda: 0), ('os.chown', lambda *args: None), ('os.fchown', lambda *args: None),
             ('os.getgrouplist', lambda name, gid: [gid]),
             ('pwd.getpwnam', lambda name: SimpleNamespace(pw_uid=1001 if name == 'cloudroom-agent' else 1000,
                                                         pw_gid=1001 if name == 'cloudroom-agent' else 1000,
                                                         pw_dir=str(self.root / name))),
-            ('subprocess.run', lambda args, **kwargs: self.calls.append(args)), ('pathlib.Path.read_text', read),
+            ('subprocess.run', lambda args, **kwargs: self.calls.append(args)),
         ]:
             p = patch(target, value); p.start(); self.addCleanup(p.stop)
 

@@ -62,24 +62,41 @@ fn now() -> u64 {
         .as_secs()
 }
 type Result<T> = std::result::Result<T, Failure>;
-pub struct Failure(StatusCode);
+/// Status plus the underlying cause; an empty cause shows only the generic message.
+pub struct Failure(StatusCode, String);
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error":if self.0 == StatusCode::CONFLICT { "sync conflict; originals preserved" } else { "sync unavailable; check setup, paths, and storage" }}))).into_response()
+        let base = if self.0 == StatusCode::CONFLICT {
+            "sync conflict; originals preserved"
+        } else {
+            "sync unavailable; check setup, paths, and storage"
+        };
+        let error = if self.1.is_empty() {
+            base.to_owned()
+        } else {
+            format!("{base} ({})", self.1)
+        };
+        (self.0, Json(json!({"error":error}))).into_response()
     }
 }
 impl From<io::Error> for Failure {
-    fn from(_: io::Error) -> Self {
-        Self(StatusCode::SERVICE_UNAVAILABLE)
+    fn from(error: io::Error) -> Self {
+        Self(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
     }
 }
 impl From<serde_json::Error> for Failure {
-    fn from(_: serde_json::Error) -> Self {
-        Self(StatusCode::SERVICE_UNAVAILABLE)
+    fn from(error: serde_json::Error) -> Self {
+        Self(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("invalid JSON: {error}"),
+        )
     }
 }
+fn failure(status: StatusCode, cause: &str) -> Failure {
+    Failure(status, cause.into())
+}
 fn conflict() -> Failure {
-    Failure(StatusCode::CONFLICT)
+    failure(StatusCode::CONFLICT, "")
 }
 
 impl Sync {
@@ -155,7 +172,14 @@ impl Sync {
                 Some("settings.json"),
             ),
             "settings-claude" => (home.join(".claude"), "claude", Some("settings.json")),
-            _ => return Err(Failure(StatusCode::GONE)),
+            "mcp-codex" => (
+                profile(runtime::Kind::Codex, ".codex"),
+                "mcp-toml",
+                Some("config.toml"),
+            ),
+            "mcp-claude" => (home.clone(), "mcp-json", Some(".claude.json")),
+            "mcp-cursor" => (home.join(".cursor"), "mcp-json", Some("mcp.json")),
+            _ => return Err(failure(StatusCode::GONE, "unknown sync root")),
         };
         Ok(json!({"root":root,"kind":kind,"filename":filename}))
     }
@@ -204,7 +228,10 @@ pub async fn check_in(
 ) -> Result<Json<Value>> {
     valid_id(&input.device)?;
     if !manager.recording_available() || manager.is_stopping() {
-        return Err(Failure(StatusCode::SERVICE_UNAVAILABLE));
+        return Err(failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service is stopping or the session journal is not writable",
+        ));
     }
     let _guard = manager.sync.gate.lock().await;
     let mut settings = manager.sync.settings.lock().unwrap();
@@ -213,7 +240,10 @@ pub async fn check_in(
     }
     // Refuse old workers before they can interpret an empty cloud folder as deletions.
     if !input.repositories.is_empty() {
-        return Err(Failure(StatusCode::GONE));
+        return Err(failure(
+            StatusCode::GONE,
+            "this sync worker is outdated; update Cloudroom",
+        ));
     }
     if settings.device.is_none() {
         let next = Settings {
@@ -263,7 +293,10 @@ async fn run(
     let _gate = guard.sync.gate.lock().await;
     manager.sync.check_device(&input.device)?;
     if manager.is_stopping() || manager.storage.blocks() || !manager.recording_available() {
-        return Err(Failure(StatusCode::SERVICE_UNAVAILABLE));
+        return Err(failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service is stopping, disk protection is blocking writes, or the session journal is not writable",
+        ));
     }
     let mut tree = manager.sync.tree(&id)?;
     let initialize = op == "scan"
@@ -305,10 +338,13 @@ async fn run(
     let mut bytes = 0u64;
     let mut chunks = body.into_data_stream();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|_| Failure(StatusCode::BAD_REQUEST))?;
+        let chunk = chunk.map_err(|error| Failure(StatusCode::BAD_REQUEST, error.to_string()))?;
         bytes += chunk.len() as u64;
         if bytes > 4 * 1024 * 1024 * 1024 {
-            return Err(Failure(StatusCode::PAYLOAD_TOO_LARGE));
+            return Err(failure(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload exceeds 4 GiB",
+            ));
         }
         stdin.write_all(&chunk).await?;
     }
@@ -321,12 +357,19 @@ async fn run(
         return Err(if value["error"] == "conflict" {
             conflict()
         } else {
-            Failure(StatusCode::SERVICE_UNAVAILABLE)
+            Failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("sync worker failed: {}", value["error"]),
+            )
         });
     }
     if op != "read" {
-        if !child.wait().await?.success() {
-            return Err(Failure(StatusCode::SERVICE_UNAVAILABLE));
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(Failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("sync worker exited with {status}"),
+            ));
         }
         if op == "scan" {
             if initialize {

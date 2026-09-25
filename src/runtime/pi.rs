@@ -537,7 +537,7 @@ impl Adapter for Protocol {
                     "unknown"
                 }
                 .to_owned();
-                events.extend(s.finished(&status));
+                events.extend(s.finished(&status, None));
             }
         }
         if t == "response"
@@ -556,6 +556,17 @@ impl Adapter for Protocol {
             }
             "message_end" if v["message"]["role"] == "assistant" => {
                 s.last_usage = v["message"]["usage"].clone();
+                if v["message"]["stopReason"] == "error"
+                    && v["message"]["errorMessage"]
+                        .as_str()
+                        .is_some_and(|m| m.to_ascii_lowercase().contains("usage limit"))
+                {
+                    events.push(Event::Record {
+                        kind: "usage_limited",
+                        data: json!({"harness":"pi"}),
+                        native: None,
+                    });
+                }
                 s.status = match v["message"]["stopReason"].as_str() {
                     Some("aborted") => "interrupted",
                     Some("error" | "length") => "failed",
@@ -592,7 +603,11 @@ impl Adapter for Protocol {
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Pi rejected command; see native history",
+                    format!(
+                        "Pi rejected the {} command: {}",
+                        v["command"].as_str().unwrap_or("unknown"),
+                        v["error"].as_str().unwrap_or("no error message returned")
+                    ),
                 ))
             },
         ))
