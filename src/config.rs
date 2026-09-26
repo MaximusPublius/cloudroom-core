@@ -22,7 +22,6 @@ pub struct Config {
     pub account_home: PathBuf,
     pub default_harness: Kind,
     pub harnesses: BTreeMap<Kind, HarnessConfig>,
-    pub max_harnesses: usize,
     pub storage: Option<crate::workspace::storage::Policy>,
 }
 
@@ -38,21 +37,35 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:9840".into())
             .parse()
             .map_err(|_| io::Error::other("invalid CLOUDROOM_LISTEN"))?;
-        let storage = if env::var("CLOUDROOM_UNPROTECTED_TEST_MODE").as_deref() == Ok("1") {
+        let unprotected_test_mode =
+            env::var("CLOUDROOM_UNPROTECTED_TEST_MODE").as_deref() == Ok("1");
+        if !listen.ip().is_loopback() {
+            if unprotected_test_mode {
+                return Err(io::Error::other(
+                    "CLOUDROOM_UNPROTECTED_TEST_MODE requires a loopback listener",
+                ));
+            }
+            if env::var("CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP").as_deref() != Ok("1") {
+                return Err(io::Error::other(
+                    "Cloudroom serves plaintext HTTP; non-loopback listening requires \
+                     CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP=1. Restrict backend access to an HTTPS \
+                     proxy over a protected connection; this setting does not enable TLS.",
+                ));
+            }
+        }
+        let storage = if unprotected_test_mode {
             None
         } else {
             Some(crate::workspace::storage::Policy::load(&PathBuf::from(
                 required("CLOUDROOM_STORAGE_POLICY")?,
             ))?)
         };
-        if !listen.ip().is_loopback() && storage.is_none() {
-            return Err(io::Error::other(
-                "public binding requires protected deployment behind HTTPS",
-            ));
-        }
         let default_harness = match env::var("CLOUDROOM_HARNESS").as_deref().unwrap_or("codex") {
             "codex" => Kind::Codex,
             "pi" => Kind::Pi,
+            "cursor" => Kind::Cursor,
+            "claude-code" => Kind::Claude,
+            "fx" => Kind::Fx,
             _ => return Err(io::Error::other("unsupported CLOUDROOM_HARNESS")),
         };
         let account_home: PathBuf = required("CLOUDROOM_ACCOUNT_HOME")?.into();
@@ -81,6 +94,57 @@ impl Config {
                 );
             }
         }
+        let claude = [
+            account_home.join(".local/bin/claude"),
+            PathBuf::from("/usr/local/bin/claude"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = claude.filter(|_| account_home.join(".claude").is_dir()) {
+            harnesses.insert(
+                Kind::Claude,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".claude"),
+                    model: "sonnet".into(),
+                    provider: None,
+                },
+            );
+        }
+        let cursor = [
+            account_home.join(".local/bin/cursor-agent"),
+            PathBuf::from("/usr/local/bin/cursor-agent"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = cursor.filter(|_| account_home.join(".cursor").is_dir()) {
+            harnesses.insert(
+                Kind::Cursor,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".cursor"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
+        }
+        let fx = [
+            account_home.join(".local/bin/fx"),
+            PathBuf::from("/usr/local/bin/fx"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = fx.filter(|_| account_home.join(".fx").is_dir()) {
+            harnesses.insert(
+                Kind::Fx,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".fx"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
+        }
         Ok(Self {
             storage,
             default_harness,
@@ -96,12 +160,6 @@ impl Config {
             allow_insecure_database: env::var("CLOUDROOM_ALLOW_INSECURE_DATABASE").as_deref()
                 == Ok("1"),
             account_home,
-            max_harnesses: env::var("CLOUDROOM_MAX_HARNESSES")
-                .unwrap_or_else(|_| "2".into())
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| io::Error::other("CLOUDROOM_MAX_HARNESSES must be positive"))?,
         })
     }
 }

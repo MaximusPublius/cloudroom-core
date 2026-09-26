@@ -62,6 +62,10 @@ impl Workload {
         }
         Ok(())
     }
+    pub fn process_count(&self) -> Option<usize> {
+        let procs = fs::read_to_string(self.directory.join("cgroup.procs")).ok()?;
+        Some(procs.lines().filter(|line| !line.is_empty()).count())
+    }
     pub fn terminate(&self) -> io::Result<()> {
         // The directory is created exclusively by this Runtime, never supplied by a client.
         fs::write(self.directory.join("cgroup.kill"), "1")
@@ -145,8 +149,9 @@ pub(crate) fn as_agent(_: &mut Command, _: u32, _: u32, _: Option<&Path>) -> io:
 pub(super) async fn reply<T>(
     mut result: tokio::sync::oneshot::Receiver<T>,
     mut paused: watch::Receiver<bool>,
+    timeout: Duration,
 ) -> io::Result<T> {
-    let mut remaining = Duration::from_secs(30);
+    let mut remaining = timeout;
     loop {
         if *paused.borrow() {
             tokio::select! {
@@ -157,7 +162,7 @@ pub(super) async fn reply<T>(
             let start = tokio::time::Instant::now();
             tokio::select! {
                 value = &mut result => return value.map_err(|_| io::Error::other("harness response lost; outcome uncertain")),
-                _ = tokio::time::sleep(remaining) => return Err(io::Error::other("harness response timed out; outcome uncertain")),
+                _ = tokio::time::sleep(remaining) => return Err(io::Error::new(io::ErrorKind::TimedOut, "harness response timed out; outcome uncertain")),
                 changed = paused.changed() => if changed.is_err() { return Err(io::Error::other("workload owner lost")); },
             }
             remaining = remaining.saturating_sub(start.elapsed());

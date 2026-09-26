@@ -1,9 +1,48 @@
 pub mod api;
 pub mod config;
+pub mod mac;
 mod observability;
+pub mod preview;
 pub mod runtime;
+pub mod secrets;
 pub mod session;
+pub mod sync;
 pub mod workspace;
+
+/// Bumped by `tools/release-core.py` on every release (ADR 0120).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The git commit this binary was built from, set by `build.rs`.
+pub const COMMIT: &str = env!("CLOUDROOM_COMMIT");
+/// Features `/v1/capabilities` always reports. Release pins record this list, so CI can
+/// check that new VMs support everything the app uses.
+pub const FEATURES: &[&str] = &[
+    "stop",
+    "resume",
+    "launch_settings",
+    "prompt_reasoning",
+    "workspaces",
+    "sync",
+    "mcp_sync",
+    "direct_workspaces",
+    "root_workspace",
+    "teleport",
+    "command_guard",
+    "codex_auth",
+    "codex_auth_import",
+    "cursor_auth",
+    "claude_auth",
+    "pi_auth_import",
+    "structured_prompt",
+    "queue_edit",
+    "queue_cancel",
+    "steer",
+    "rewind",
+    "attachments",
+    "compact",
+    "usage",
+    "subagents",
+    "session_list",
+];
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {
     use std::{future::IntoFuture, time::Duration};
@@ -13,13 +52,20 @@ pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error:
         profile.home = profile.home.canonicalize()?;
         profile.binary = profile.binary.canonicalize()?;
     }
+    // A bind failure must not mutate saved sessions or claim their recovery.
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let manager = session::Manager::open(config.clone())?;
     manager.check_storage().await;
     // Reconcile previous workloads before the API or storage guard can start work.
     manager.restore_all().await?;
+    manager.previews.listen().await?;
+    if let Err(error) = mac::listen(&manager).await {
+        eprintln!("Mac access unavailable: {error}");
+    }
     manager.start_storage_guard();
+    manager.start_idle_sleeper();
     manager.start_uploader();
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    manager.start_auth_monitor();
     eprintln!("Cloudroom listening on {}", listener.local_addr()?);
     let shutdown = manager.clone();
     let mut changed = manager.subscribe();

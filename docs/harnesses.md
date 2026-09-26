@@ -4,7 +4,7 @@ Cloudroom owns processes, durable requests/queues, recording, replay and recover
 
 ## Configure
 
-Existing Codex environment variables still work. `CLOUDROOM_HARNESS` selects the default (`codex` when omitted). Configure either or both adapters:
+Existing Codex environment variables still work. `CLOUDROOM_HARNESS` selects the default (`codex` when omitted). Configure the required adapters:
 
 - Codex: `CLOUDROOM_CODEX_BINARY`, `CLOUDROOM_CODEX_HOME`, `CLOUDROOM_CODEX_MODEL`.
 - Pi: `CLOUDROOM_PI_BINARY`, `CLOUDROOM_PI_HOME`, `CLOUDROOM_PI_MODEL`, `CLOUDROOM_PI_PROVIDER`.
@@ -23,7 +23,55 @@ CLOUDROOM_PI_MODEL=gpt-6-astra
 
 Use the official `@earendil-works/pi-coding-agent` **0.85.1**, with its supported Node runtime on `/usr/local/bin:/usr/bin:/bin`. Provision the harness and its account credentials separately; the core does not install packages or perform login. Adapter startup verifies the resolved model/provider, native identity, and bundled context extension. Protocol compatibility must be tested before upgrading Pi.
 
-Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/telemetry are disabled through Pi's process flags. Existing Pi settings/resources and explicit project-trust decisions still apply. Prepare trusted packages before service startup. The account directory is separate from Cloudroom's protected state directory. Every configured harness home must be on the quota-protected filesystem, just like the workspace. Neither API/database tokens nor administrative environment variables are inherited by either harness. Pi credentials are available to that agent account; this is not isolation of inference credentials from its own tools.
+Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/telemetry are disabled through Pi's process flags. Existing Pi settings/resources and explicit project-trust decisions still apply. Prepare trusted packages before service startup. The account directory is separate from Cloudroom's protected state directory. Every configured harness home must share the monitored filesystem with the workspace. Neither API/database tokens nor administrative environment variables are inherited by either harness. Pi credentials are available to that agent account; this is not isolation of inference credentials from its own tools.
+
+## Claude Code
+
+`src/runtime/claude.rs` integrates the native CLI through stream JSON, without an SDK bridge. Core discovers `CLOUDROOM_ACCOUNT_HOME/.local/bin/claude`, then `/usr/local/bin/claude`, when the account's `.claude` directory exists. Prepare both before restarting core. No Claude-specific service variables are needed. Core resolves the executable path at startup: restart it safely after upgrading the CLI to use the new binary and model catalog. Opus 5.5 requires Claude Code **2.1.280+**. The default model is `sonnet`; session creation can select another native model. `CLOUDROOM_HARNESS=claude-code` selects Claude as the default harness.
+
+### Native subscription login
+
+Use **Connect Claude** with Cloud selected. Approve Anthropic's browser sign-in, then enter its one-time authorization code in the connection panel—not chat. Core forwards that code to the native CLI; Claude exchanges it and stores/renews credentials on the VM. Tokens never pass through the GUI or core API. Do not copy Mac credentials.
+
+The `claude_auth` capability exposes authenticated `GET /v1/accounts/claude` and `POST /v1/accounts/claude/{login,cancel,complete}`. Mutations take `request_id`; `complete` also takes `code` and OAuth `state`. Duplicate starts reuse the pending flow; cancellation targets its ID. The isolated, tool-free CLI process expires after ten minutes and produces no conversation records. Tested with Claude **2.1.280**. Upgrade core and GUI together.
+
+Terminal fallback: run `claude auth login` and `claude auth status` as the configured agent account (`sudo -iu cloudroom-agent` on managed VMs), never root or the protected core account.
+
+Create sessions with `"harness":"claude-code"`. Missing login returns `claude_auth_required` before acceptance; verification failures return `claude_auth_unavailable`. The GUI retains the task and offers **Retry start** after native login. This is login guidance, not an embedded OAuth flow or a live subscription-limit check.
+
+The adapter disables native steering, Fast mode, structured questions and hidden native subagents. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
+
+### Selected skills
+
+Structured prompt `content` can carry skill mentions with UTF-16 `start`/`end` offsets and a `resource` containing `kind: "command"`, `source: "skill"`, `name`, and `origin: "user" | "project"`. Its text blocks, joined with newlines, must match `text`. The Claude harness advertises `skill_mentions: true`; GUI clients must not drop these mentions when using an older core.
+
+Before each send, core loads the selected user/project `SKILL.md` bodies on the execution machine under the agent's file permissions. Tags work anywhere and repeated selections load once. Saved requests stay unchanged. Missing, ambiguous, oversized or unsupported native-feature skills fail before delivery. Bodies are literal instructions, not a replacement for native argument, shell, hook or fork execution; use an untagged leading slash command for those features and namespaced plugin skills.
+
+### Verification boundary
+
+Local probes against Claude Code **2.1.278** verified guarded startup, context-only notices, missing-login failures, exact-identity resume, conversation forks and acknowledged shutdown. HTTP checks used disposable PostgreSQL and logged-out native execution; a separate wire fixture verified child coordination, compaction, Stop and queued continuation. These are not real-inference evidence. Logged-in Linux/GUI acceptance and template activation remain required before claiming deployment readiness. Upgrades must preserve the checked lifecycle, cancellation and hook capabilities.
+
+## Cloud Codex sign-in
+
+The core advertises `codex_auth` and exposes authenticated `GET /v1/accounts/codex`, `POST /v1/accounts/codex/login`, and `POST /v1/accounts/codex/cancel`. Mutations accept `{ "request_id": "unique-id" }`; reuse it after an uncertain response. Cancellation targets that login attempt only.
+
+The core uses Codex's official device-code flow in the configured runtime user's home. Enable device-code login in ChatGPT security settings if OpenAI requires it. The app receives only account status and the temporary verification URL/code, never OAuth tokens. Login traffic is excluded from conversation and diagnostic records. A live account/usage check verifies ChatGPT access; limits and network errors stay distinct from missing authentication. Active Codex work blocks login changes.
+
+New Codex starts without authentication return `codex_auth_required` before acceptance. Clients keep the prompt and offer sign-in, then retry the same start ID. Already accepted work and running sessions are unchanged. Expired login attempts can be restarted; interruption never replays a task.
+
+With `codex_auth_import`, authenticated `POST /v1/accounts/codex/import` accepts a file-backed ChatGPT login (64 KiB maximum). It creates `auth.json` only when absent, under the runtime user with mode `0600`, then verifies the account. Existing files, active work, and pending browser sign-ins are preserved. Retries never replace a login; tokens never enter responses or history.
+
+The desktop helper attempts this import before showing sign-in or starting Codex, and discovers logins added after pairing. `CODEX_HOME` is remembered; Keychain-only, missing, or unusable local logins fall back to **Connect Codex**. Import is not continuous credential sync or account switching. Old `auth-codex` sync requests still receive HTTP 410. Upgrade core and desktop together; existing cloud logins remain intact. Each native Codex manages renewal; cross-machine refresh conflicts still require live verification.
+
+## Cloud Pi logins
+
+With `pi_auth_import`, the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when the Mac file changes. VM logins always win. `!command` keys stay on the Mac because their secret managers are Mac-only. Keys set only as shell variables are not copied.
+
+`GET /v1/accounts/pi` lists provider names, never secrets. `POST /v1/accounts/pi/import` adds valid missing providers. `POST /v1/accounts/pi/key` with `{"provider","key"}` saves or replaces one API key; the CLI is `cloudroom cloud pi key PROVIDER`, reading the key from stdin. Copied OAuth logins refresh separately on each machine, so one side may need to sign in again.
+
+### Continue after a usage limit
+
+A Codex or Pi turn that fails on a subscription usage limit is recorded as `usage_limited`. A limited account may sign in with another ChatGPT account. After a successful sign-in, import, or authenticated `POST /v1/accounts/codex/switched` (for logins installed outside the core), the core verifies the account. If it is usable, the core restarts each quota-stopped session's harness so it loads the new login, then sends `keep working`. The response lists `continued` session IDs. Manually stopped, busy, or queued sessions are left alone; nothing is resent twice. Other idle Codex sessions keep their loaded login until their next restart.
 
 ## API and compatibility
 
@@ -33,9 +81,49 @@ Select a configured harness when creating a session:
 {"request_id":"my-session","harness":"pi"}
 ```
 
-All other session, prompt, interrupt, close, events and SSE endpoints are shared. Session creation accepts a model override and a reasoning level for either harness. Pi maps `none` to `off`, verifies the model supports the requested level, and checks that Pi applied it; unsupported levels fail rather than being silently changed. Capabilities include each harness's configured inference provider. Harness selection, model, reasoning and provider are saved with acceptance; changing deployment defaults does not change an existing session's selected model. Explicitly selecting another harness with the same creation request ID conflicts. Legacy receipts without harness metadata mean Codex. Original stored records are not rewritten, and legacy Codex `data.value` is reconstructed on reads inside the adapter boundary.
+All other session, prompt, interrupt, close, events and SSE endpoints are shared. Session creation accepts a model override and a reasoning level for either harness. Pi maps `none` to `off`, verifies the model supports the requested level, and checks that Pi applied it; unsupported levels fail rather than being silently changed. Capabilities include each harness's default inference provider. Pi advertises `provider_selection: true`; creation accepts an optional `provider` override authenticated in its private Pi home. Omitting it preserves the configured default. Harness selection, model, reasoning and provider are saved with acceptance; changing deployment defaults does not change an existing session's selected model. Explicitly selecting another harness with the same creation request ID conflicts. Legacy receipts without harness metadata mean Codex. Original stored records are not rewritten, and legacy Codex `data.value` is reconstructed on reads inside the adapter boundary.
+
+Codex reasoning is validated against its native `model/list` catalog, not a fixed Cloudroom list. `/v1/capabilities` exposes `harnesses[].models` with each model's `reasoning_levels`; a null catalog means discovery failed, not unsupported models. Discovery creates no Codex thread or turn and is cached for 60 seconds. Pi exposes its adapter's `reasoning_levels`; its model-specific check still happens during startup. Existing accepted requests are deduplicated before model revalidation.
+
+Launch rejections include stable codes such as `invalid_reasoning_effort`, `invalid_model`, and `request_conflict`. `storage_blocked`, `service_stopping`, and `model_catalog_unavailable` are temporary. Clients should classify codes, not assume every HTTP 409 is permanent, and never display arbitrary remote error bodies.
 
 Session responses include `harness`, `provider`, `capabilities` and an adapter-owned `native_cursor`. `current_turn` and `native_offset` remain for legacy Codex readers; they are not portable request/capture identifiers. Follow `current_request` and receipts for execution. Pi emits common text/thinking deltas and item/tool events; `tool_snapshot` replaces previous partial tool output rather than appending it. Raw native frames and native session records are preserved.
+
+## Command Guard
+
+New Codex, Pi and Claude runs include a small shell-command guard by default. Disable it
+for a session with `command_guard_enabled: false` in `POST /v1/sessions`; this
+choice survives resume and passes to Cloudroom-managed Pi and Claude children. The guard
+runs on the execution machine without the GUI. It never edits personal hooks or
+trusts unrelated Codex hooks. It never blocks a harness from starting, and a
+guard error allows the command ([ADR 0114](../../docs/adr/0114-command-guard-never-blocks-work.md)).
+
+Rules cover root/home deletion, disk wipes, hosted repository deletion, and fork
+bombs. Blocks return a named reason to the agent. This is regex-based accident
+prevention, not a sandbox or protection against arbitrary scripts and tools.
+Codex hooks were verified with 0.155.1; Pi uses the version above. Core Codex
+startup also requires the system Node runtime already used by Pi. Missing Node
+fails startup rather than silently dropping the guard.
+
+`src/runtime/command-guard.mjs` owns the shared rules and hook source. Keep its
+GUI copy, `gui/packages/plugin-sdk/src/internal/command-guard-runtime.mjs`,
+byte-identical when preparing a release.
+
+## Cursor implementation preview
+
+The core discovers `cursor-agent` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.cursor` home. Use `harness: "cursor"` in the API; the GUI provider remains `acp-cursor`. No new Cloudroom service environment variables are required. After upgrading core and the GUI, use **Settings → Cloudroom → Cursor → Manage connection**, or `cloudroom cloud cursor login --request-id ID` followed by `cloudroom cloud cursor status`. Browser login runs on the VM, with `NO_OPEN_BROWSER=1` confined to the Cursor login child. Credentials stay in the shared native account home.
+
+The authenticated account API exposes `GET /v1/accounts/cursor` and `POST /v1/accounts/cursor/{login,cancel,key}`. Mutations use `{ "request_id": "ID" }`; `/key` additionally takes `api_key`. Mutations return HTTP 202. An active login is reused, cancellation targets its request ID, and missing authentication rejects session creation before acceptance. Keys are verified with `--list-models` (`status` ignores API keys), saved privately as `.cursor/cloudroom-api-key`, and supplied through `CURSOR_API_KEY` only to Cursor children. The GUI clears its password field after submission; CLI key input uses `cloudroom cloud cursor key` through stdin, never a key argument. Neither login links nor keys enter conversation records or sync. Close live Cursor sessions before changing their login.
+
+Cursor runs in print mode. Cursor's ACP mode only runs each model at its default reasoning, so the core's built-in driver (`src/runtime/cursor_print.rs`) speaks the small ACP subset the adapter uses and runs one `cursor-agent -p --output-format stream-json --resume CHAT --model VARIANT` per prompt. It shares the process driver, durable queue and history. Steering and Stop end the running prompt, including its shell tools, and the chat resumes with the next message. Prompt dispatch is not completion.
+
+`cursor_models.rs` groups `--list-models` into model families with reasoning levels, named like the GUI picker (`auto` is `default`; the `cursor-` prefix is dropped). Capabilities advertise them, and launch resolves the family and level to the exact variant, e.g. `gpt-5.6-sol` + `xhigh` → `gpt-5.6-sol-xhigh`. Reasoning remains fixed for a session. Manual compaction, rewind, direct image inputs, independent subagent controls and context-only notices are not advertised.
+
+Cursor runs without Command Guard: its tested versions do not run native safety hooks for Cloudroom, so `command_guard_enabled` has no effect on Cursor sessions.
+
+Chats live at `.cursor/chats/<md5 of the working folder>/<chat ID>`. The adapter records bounded native SQLite snapshot chunks, including metadata and WAL-backed data. The Python helper uses SQLite backup with query-only SQL; read/write opening permits required WAL sidecars after Cursor exits. `cursor-history.py restore ROOT CWD` accepts one complete snapshot's native JSONL on stdin, checks its digest, writes it under `ROOT/<md5 of CWD>`, and never replaces an existing session. It restores native history, not workspace files or credentials.
+
+Initial sync discovery includes Cursor skills, global rules and the `notifications`, `hints`, and `suggestNextPrompt` preferences. Existing paired roots are preserved. Credentials, session stores, hooks, plugins and MCP configuration do not sync.
 
 ## Queue, completion and recovery
 
@@ -62,12 +150,13 @@ CARGO_BUILD_JOBS=1 cargo test --locked --all-targets
 CARGO_BUILD_JOBS=1 cargo build --locked
 python3 tests/core_fixture.py
 python3 tests/pi_http.py
+python3 tests/cursor_http.py # disposable PostgreSQL required for start-gating checks
 python3 tests/pi_e2e.py
 # Disposable Linux + PostgreSQL + configured native credentials:
 python3 tests/core_e2e.py --fixture
 python3 tests/core_e2e.py
 python3 tests/core_e2e.py --harness pi
-# Prepared disposable quota VM and test accounts only:
+# Prepared disposable Linux VM and test accounts only:
 sudo python3 tests/storage_e2e.py --disposable --mixed
 ```
 

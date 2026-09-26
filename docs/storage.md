@@ -1,36 +1,57 @@
 # Disk safety
 
-Workspace Management owns disk policy and narrowly scoped cleanup. Session Management gates execution and saves warnings; Runtime owns native warning delivery and cgroup pause/resume. No extra daemon, Rust dependency, private website, or email service is used.
+Workspace Management measures actual available disk space. Session Management records warnings and gates execution; Runtime pauses and resumes its own workloads. There is no fixed agent allowance, extra reserve deduction, quota dependency, or separate monitoring service.
 
-## Current implementation
+## Behavior
 
-- Linux ext4 user quotas limit the shared agent account across the root filesystem, including its home, workspace, `/tmp`, and `/var/tmp`. Agent children drop supplementary groups and all capabilities, and cannot gain privileges through executables.
-- Provisioning calculates an agent hard limit that leaves **10 GB** available for the OS, core, and history. Quotas alone do not constrain unrelated administrator/service writes. Workspace and state free space are checked too.
-- With 2 GB of headroom remaining before that reserve or the agent quota, new sessions/prompts and queued execution are blocked. Each live session gets one persisted `storage_warning` with `data.text`, replayable through events/SSE; Codex receives a developer message through `thread/inject_items`, without starting another turn. Delivery confirmation is recorded separately, never assumed from the saved warning.
-- At 512 MB headroom, Runtime freezes its workload cgroups and all descendants. Cleanup runs only after every managed workload confirms frozen. Recovery requires 3 GB headroom; only groups this Runtime froze are thawed. Pausing does not reset native RPC deadlines or replay user prompts.
-- Missing quota enforcement, mismatched limits, failed/stale measurements, or near-exhausted agent inode quota block execution. Core reads and history upload remain available. Recovery after process loss remains separate from thawing living processes.
-- Cleanup handles **only verified SHA-512-addressed npm download blobs** under the configured disposable cache root. It never scans repositories or deletes histories, outputs, credentials, executable `_npx` packages, or arbitrary build directories. Wrong hashes, symlinks, hardlinks, open files, and memory mappings are preserved. Unmanaged agent-account processes prevent cleanup rather than risk their files. Passes are bounded and retried, not recursive whole-directory deletions.
+- At **5 GB available or less**, warn once per low-space episode. Agents, new work, and sync continue.
+- **Below 2 GB**, block new work and uploads, then freeze managed agents, sync transfers, and attachment writers. Saved history, health, and recovery reads remain available.
+- **Above 2.5 GB**, resume paused work, even if the low-space warning remains. Never replay a prompt or reset an in-flight native RPC deadline because of a pause.
+- Failed measurements, or measurements older than five seconds, block work until disk access can be verified.
+- Validate `/code` and registered workspace paths against the configured filesystem; unsupported mounts block work. Measure the actual workspace root and history location. Linux filesystem-reserved blocks are already excluded from available space; do not subtract another reserve.
 
-Generated build directories are deliberately not cleaned automatically: this slice has no reliable registry proving they are disposable. User/operator removal of larger outputs remains explicit.
+Warnings and pause/resume events are saved in session history and replayed to clients. Harness notification acknowledgement is not proof that the model read it. Account isolation, capability dropping, cgroups, and history ownership remain unchanged.
+
+Safe cleanup handles only verified SHA-512-addressed npm download blobs after managed workloads are frozen. It preserves open or mapped files, hardlinks, symlinks, wrong hashes, executable `_npx` packages, project files, history, credentials, and unknown backups. Unmanaged agent processes prevent cleanup. No automatic build-directory deletion.
+
+This is polling-based protection, not a kernel guarantee: rapid writes or unrelated administrator processes can still exhaust a disk. Check capacity before large transfers and keep emergency operator access.
+
+## Sync recovery: manual cleanup
+
+Displaced originals and their metadata stay in `.cloudroom-sync-pending` until explicitly removed. Retaining the original inode preserves later writes through already-open files; a matching hash does not prove a writer has finished. Recovery files are excluded from normal syncing and automatic cache cleanup.
+
+Before cleanup, stop sync and relevant writers on that device. Review the saved copies, recover any needed edits, then remove only the selected copy and its matching `.json` metadata. Do not bulk-delete recovery directories while writers are running. Retained copies consume disk space. Interrupted incoming transfers may leave unpaired staging files; inspect them before manual removal.
+
+Update both the core and the laptop sync helper. Stop old sync workers during rollout: an older helper can still delete its local recovery copies.
+
+A previously initialized cloud sync root that disappears is reported unavailable, never silently recreated as empty. Restore the folder and its contents or its mount before retrying. Older paired installations are handled conservatively; missing roots require recovery, not an empty replacement.
 
 ## Provisioning
 
-Use a disposable VM first. Never run quota setup on a busy customer VM without coordinated operator maintenance.
+Follow [setup](setup.md). `install/configure.py --storage-only DIRECTORY` creates the protected `storage.json` and disposable cache directory. Full managed setup calls the same function. Existing policies are preserved on retry.
 
-1. Install the approved Linux `quota` package. Prepare separate `cloudroom-agent` and `cloudroom` accounts. The agent must have no sudo, rootful Docker socket, or equivalent privileges. Preserve existing customer work when migrating identities.
-2. Put the compiled binary and this repository's `install/` files in administrator-owned, non-agent-writable locations. Configure the prepared repository, agent home, Codex home, model, external PostgreSQL, and core token in `/etc/cloudroom/core.env` (service-readable, mode 0600). The history directory belongs to the core, not the agent.
-3. Run `sudo bash install/storage.sh cloudroom-agent cloudroom /etc/cloudroom/storage.json`. It sizes ext4 user quotas once and writes a protected policy, without formatting. It refuses unsupported mounts, insufficient free space, and an existing policy. To restore enforcement, append `restore`: reapply the saved limit without resizing it, rewriting the policy, or requiring 10 GB free. A provider restore may need to rebuild lost quota accounting.
-4. Install `install/cloudroom.service`. Its narrow capabilities let the trusted core switch child identities and contain processes; **children receive none**. `Delegate=yes` and `KillMode=control-group` keep agents contained through shutdown. The policy's `cgroup_root` must match the actual systemd unit.
-5. Verify `/v1/health` reports `storage.enabled: true` and `storage.level: normal` before admitting work. Hosts that lose quota state should run `storage.sh … restore` in a privileged boot hook; the generic service unit does not include one. A nonfatal systemd `ExecStartPre=-+…` lets the core serve recovery reads when restoration fails; its independent storage guard still blocks agent execution. Invalid or missing protected configuration remains a startup error. Other mounted writable filesystems need explicit accounting before use.
+New installations bind plain HTTP to `127.0.0.1:9840`. Keep this default for an HTTPS proxy on the same VM. An external HTTPS gateway may require `CLOUDROOM_LISTEN=0.0.0.0:9840` during provisioning, but first restrict port 9840 to that gateway over a private or encrypted connection. The installer does not configure TLS or firewall rules. Retries preserve the existing listen address.
 
-`CLOUDROOM_STORAGE_POLICY` is required normally. Existing local fixture tests explicitly use `CLOUDROOM_UNPROTECTED_TEST_MODE=1`; this is not a hosting default. `storage.sh` only configures disk protection. `install/configure.py [protected-directory]` accepts private JSON on stdin: `{userId, coreToken, databaseUrl, release}`. Run it as root after staging the reviewed binary/install files in `/usr/local/lib/cloudroom`, its `version` marker, separate service/agent accounts, and the service unit. The directory defaults to `/etc/cloudroom`; its location must match the unit's `EnvironmentFile`.
+The policy retains `agent_uid`, `agent_gid`, `cache_dir`, and `cgroup_root`. Optional `warning_bytes`, `pause_bytes`, and `resume_bytes` default to the rules above. The core requires Linux, a protected service account, and delegated cgroups. Agent paths must share the monitored filesystem. The service recreates its disposable cache directory on boot; no quota restoration or filesystem remount is needed.
 
-New installations bind plain HTTP to `127.0.0.1:9840` (localhost). For an external HTTPS gateway, explicitly run `sudo env CLOUDROOM_LISTEN=0.0.0.0:9840 python3 install/configure.py [protected-directory]`, after restricting port 9840 to that gateway over a private or encrypted connection. The installer does not configure TLS or firewall rules. Keep the localhost default for a proxy on the same VM; see the [setup guide](setup.md).
+`CLOUDROOM_STORAGE_POLICY` remains required. Never use `CLOUDROOM_UNPROTECTED_TEST_MODE` to bypass a broken live installation.
 
-The installer writes mode-0600 configuration, initializes protection, and enables the service. `userId` names the history store; it need not be a UUID. Supply a standard PostgreSQL URL and a random core token of at least 32 visible ASCII characters. Database role names, password formats, and customer authorization belong to the operator/hosting layer, not this installer. Identical retries keep running workloads and preserve the existing listen address; changed credentials fail without replacement. Harness installation/login and database migrations are separate steps. Hosting code owns clean templates, scoped database provisioning, authenticated HTTPS, persistent paths, and restore hooks. Verify configuration and history survive a real provider stop/resume; do not rely on snapshot documentation alone.
+## Upgrade an existing quota-based VM
 
-## Verification and limitations
+Use an approved idle core update. Preserve files, identities, credentials, history, and the old binary/policy for rollback.
 
-Run `python3 tests/install.py`, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --all-targets`, and existing HTTP/fixture checks. Installer tests use temporary files and mocked system commands; they do not establish real quota enforcement. On the designated disposable Linux VM, run `sudo python3 tests/storage_e2e.py --disposable --mixed` after preparing its explicitly named test accounts and enabling root quotas. Use an administrator-owned test copy accessible to both accounts, not a private home directory. This tests real quota exhaustion, busy Codex/Pi protocol fixtures, detached tool descendants, warning replay/SSE, cleanup exclusions, blocked starts, thaw without prompt replay, database outage, and disabled enforcement.
+1. Remove `quota_mount`, `quota_limit_bytes`, and `reserve_bytes` from the saved policy. Remove old threshold overrides to adopt the new defaults.
+2. Remove the old `storage.sh ... restore` startup hook and replace the service with the updated unit. Keep unrelated firewall hooks.
+3. Clear only this account's byte and inode quotas: `sudo setquota -u cloudroom-agent 0 0 0 0 /`. Do not disable other users' quotas or change Linux's reserved blocks.
+4. Install the tested core and reload/restart the service. Remove the obsolete installed `storage.sh` after its hook is gone.
+5. Verify readiness, actual free-space reporting, preserved sessions, and a real task. Recheck after restart so an old hook cannot silently restore the quota.
 
-Both [harness adapters](harnesses.md) share kernel enforcement and provide native context warnings. These fixture checks do not establish real inference. App integrations must display `storage_warning.data.text`; API/SSE verification does not prove BB UI delivery. This is not protection against arbitrary root access, kernel failure, or unlimited growth of essential history. Uploaded local history is never pruned by this cleaner. No customer deployment or paid VM upgrade is performed by these tests.
+No database migration is needed. Old cores cannot read the new policy; rollback must restore the matching old policy and quota too. Updating source defaults does not change existing VMs or published templates.
+
+## Verification
+
+Run the Rust checks, `python3 tests/install.py`, and existing API/fixture checks. The Rust boundary cases cover warning-only admission, emergency pausing, recovery below the warning threshold, and missing/stale measurements. Installer tests preserve account, path, and retry protections without invoking quota or mount commands.
+
+On an explicitly disposable Linux VM with `cr-disk-test` and `cr-service-test` accounts, run `sudo python3 tests/storage_e2e.py --disposable --mixed`. It uses a 512 MiB tmpfs and scaled thresholds, never fills the host disk, and exercises real API reads/writes, busy Codex/Pi fixtures, child processes, warnings, emergency pause, safe cleanup, recovery, and database outages. CI runs the same check. This establishes fixture behavior, not real inference or production rollout.
+
+For transfer and mount regressions, run `python3 tests/disk_writers.py --disposable` inside a fresh privileged Linux container with a private cgroup namespace and the compiled core. It refuses non-container hosts, uses a 256 MiB tmpfs, and checks active upload/download pausing, blocked attachment admission, safe resumption, and rejection of an unmonitored `/code` volume. Never run these mount/disk tests on a customer machine.
