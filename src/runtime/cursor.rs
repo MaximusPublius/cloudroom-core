@@ -11,7 +11,6 @@ use std::{
 use tokio::process::Command;
 
 const HISTORY: &str = include_str!("cursor-history.py");
-const DRIVER: &str = include_str!("cursor-print.py");
 const PLAIN_CHAT: &str = "Ask the user questions in plain chat. Do not use structured question or plan-approval tools. Never infer the user's answer or approval.";
 
 fn invalid(message: &str) -> io::Error {
@@ -27,6 +26,8 @@ pub(super) struct Flavor {
     pub meta: &'static str,
     pub valid_id: fn(&str) -> bool,
     pub capture: bool,
+    /// Diagnostics the agent sends as message text; never part of the reply.
+    pub notices: &'static [&'static str],
 }
 pub(super) const CURSOR: Flavor = Flavor {
     harness: "cursor",
@@ -35,6 +36,7 @@ pub(super) const CURSOR: Flavor = Flavor {
     meta: "meta.json",
     valid_id,
     capture: true,
+    notices: &[],
 };
 
 pub(crate) fn capabilities() -> Value {
@@ -49,9 +51,9 @@ pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Co
             "Cursor home must belong to the configured agent account",
         ));
     }
-    let mut command = child_command(std::path::Path::new("python3"), config);
+    let mut command = child_command(&std::env::current_exe()?, config);
     super::cursor_auth::apply_key(&mut command, config)?;
-    command.args(["-I", "-c", DRIVER]).arg(&profile.binary);
+    command.arg("--cursor-driver").arg(&profile.binary);
     Ok(command)
 }
 
@@ -241,7 +243,7 @@ fn chat_root(home: &Path, id: &str, path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(i, byte)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -413,9 +415,15 @@ impl Adapter for Protocol {
             ) {
                 events.extend(state.started());
             }
+            let text = update["content"]["text"].as_str().unwrap_or_default();
+            let notice = kind == "agent_message_chunk"
+                && self
+                    .flavor
+                    .notices
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix));
             match kind {
-                "agent_message_chunk" | "agent_thought_chunk" => {
-                    let text = update["content"]["text"].as_str().unwrap_or_default();
+                "agent_message_chunk" | "agent_thought_chunk" if !notice => {
                     let thinking = kind == "agent_thought_chunk";
                     let item_type = if thinking {
                         "reasoning"

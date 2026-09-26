@@ -549,6 +549,21 @@ impl Manager {
         }
     }
 
+    /// Match cloud Claude Code to the Mac's version (ADR 0133); waits while Claude runs.
+    pub async fn match_claude_version(&self, version: String) -> Result<Value> {
+        if !runtime::claude_version::valid(&version) {
+            return Err(Error::Conflict("invalid version"));
+        }
+        if !self.config.harnesses.contains_key(&runtime::Kind::Claude) {
+            return Err(Error::Conflict("harness is not configured"));
+        }
+        let busy = self.local.lock().unwrap().sessions.values().any(|s| {
+            s.harness == runtime::Kind::Claude
+                && (s.handle.is_some() || matches!(s.state.as_str(), "starting" | "resuming"))
+        });
+        Ok(runtime::claude_version::ensure(self.config.clone(), version, busy).await)
+    }
+
     /// Account checks shared by new sessions and Teleport's preflight.
     async fn harness_ready(self: &Arc<Self>, kind: runtime::Kind) -> Result<()> {
         if kind == runtime::Kind::Claude {

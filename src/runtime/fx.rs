@@ -12,6 +12,7 @@ pub(super) const FX: cursor::Flavor = cursor::Flavor {
     meta: "session.json",
     valid_id,
     capture: false,
+    notices: &["[context] ", "skill discovery warning: "],
 };
 
 pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Command> {

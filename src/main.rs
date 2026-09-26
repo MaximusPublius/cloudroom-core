@@ -50,6 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cloudroom::preview::authorized_keys(std::path::Path::new(&args[1]), args[2].parse()?)?;
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("--cursor-driver") {
+        let binary = args.get(1).ok_or("missing Cursor binary")?;
+        cloudroom::runtime::cursor_print::run(binary)?;
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("--clean-npm-cache") {
         let root = std::env::args_os().nth(2).ok_or("missing cache root")?;
         let groups = std::env::args_os()

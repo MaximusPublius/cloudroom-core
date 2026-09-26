@@ -30,6 +30,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/accounts/cursor", get(cursor_auth))
         .route("/v1/accounts/cursor/{action}", post(cursor_account))
         .route("/v1/accounts/claude", get(claude_auth))
+        .route("/v1/accounts/claude/version", post(claude_version))
         .route("/v1/accounts/claude/{action}", post(claude_account))
         .route("/v1/accounts/pi", get(pi_auth))
         .route("/v1/accounts/pi/import", post(pi_import))
@@ -135,6 +136,7 @@ struct ClaudeAccountRequest {
     state: Option<String>,
     token: Option<String>,
     plan: Option<String>,
+    api_key: Option<String>,
 }
 async fn claude_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
     Json(manager.claude_auth_status().await)
@@ -154,17 +156,25 @@ async fn claude_account(
                 && !s.starts_with("sk-ant-")
         })
     };
-    let token = input.token.as_ref().is_some_and(|s| {
-        s.starts_with("sk-ant-oat")
-            && s.len() <= 1024
-            && s.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    });
-    if !matches!(action.as_str(), "login" | "cancel" | "complete" | "token")
-        || (action == "complete" && (!valid(&input.code, 2048) || !valid(&input.state, 512)))
+    let secret = |value: &Option<String>, prefix: &str| {
+        value.as_ref().is_some_and(|s| {
+            s.starts_with(prefix)
+                && s.len() <= 1024
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        })
+    };
+    let token = secret(&input.token, "sk-ant-oat");
+    let key = secret(&input.api_key, "sk-ant-api");
+    if !matches!(
+        action.as_str(),
+        "login" | "cancel" | "complete" | "token" | "key"
+    ) || (action == "complete" && (!valid(&input.code, 2048) || !valid(&input.state, 512)))
         || (action != "complete" && (input.code.is_some() || input.state.is_some()))
         || (action == "token") != token
         || (action != "token" && input.token.is_some())
+        || (action == "key") != key
+        || (action != "key" && input.api_key.is_some())
         || (action != "token" && input.plan.is_some())
         || input.plan.as_ref().is_some_and(|s| {
             s.is_empty() || s.len() > 32 || !s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
@@ -172,10 +182,10 @@ async fn claude_account(
     {
         return Err(session::Error::Conflict("invalid Claude sign-in request"));
     }
-    let (code, state) = if action == "token" {
-        (input.token, input.plan)
-    } else {
-        (input.code, input.state)
+    let (code, state) = match action.as_str() {
+        "token" => (input.token, input.plan),
+        "key" => (input.api_key, None),
+        _ => (input.code, input.state),
     };
     Ok((
         StatusCode::ACCEPTED,
@@ -273,6 +283,20 @@ async fn teleport_prepare(
     Ok((
         StatusCode::ACCEPTED,
         Json(manager.teleport_prepare(manifest).await?),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeVersion {
+    version: String,
+}
+async fn claude_version(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<ClaudeVersion>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.match_claude_version(input.version).await?),
     ))
 }
 async fn teleport_check(

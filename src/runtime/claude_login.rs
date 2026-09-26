@@ -3,15 +3,15 @@ use super::{Adapter, Event, Kind, Progress, auth::Status, claude, process::Proce
 use crate::config::Config;
 use serde_json::{Value, json};
 use std::{
-    io,
+    fs, io,
+    path::Path,
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, watch};
 
 const LIFETIME: Duration = Duration::from_secs(10 * 60);
-fn save_token(config: &Config, token: &str, plan: Option<&str>) -> io::Result<()> {
-    use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
-    let path = claude::token_path(config);
+fn save_private(path: &Path, contents: &str) -> io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let temporary = path.with_extension("tmp");
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -19,9 +19,32 @@ fn save_token(config: &Config, token: &str, plan: Option<&str>) -> io::Result<()
         .truncate(true)
         .mode(0o600)
         .open(&temporary)?;
-    file.write_all(format!("{token}\n{}\n", plan.unwrap_or_default()).as_bytes())?;
+    file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     fs::rename(temporary, path)
+}
+fn remove(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+/// Subscription and API key replace each other, so Claude only ever sees one.
+fn save_token(config: &Config, token: &str, plan: Option<&str>) -> io::Result<()> {
+    let contents = format!("{token}\n{}\n", plan.unwrap_or_default());
+    save_private(&claude::token_path(config), &contents)?;
+    remove(&claude::key_path(config))
+}
+/// `auth status` accepts any key, so one tiny request proves it works before
+/// the subscription token is dropped. A rejected key leaves the old login intact.
+async fn save_key(config: &Config, key: &str) -> Result<(), &'static str> {
+    let path = claude::key_path(config);
+    save_private(&path, &format!("{key}\n")).map_err(|_| "Could not save the API key.")?;
+    if claude::probe(config, "haiku", None).await.is_err() {
+        let _ = remove(&path);
+        return Err("Anthropic did not accept this API key. Check the key and its credits.");
+    }
+    remove(&claude::token_path(config)).map_err(|_| "Could not remove the old Claude token.")
 }
 struct Protocol;
 impl Adapter for Protocol {
@@ -132,6 +155,17 @@ impl ClaudeLogin {
             state.checked = None;
             if !saved {
                 return Status::new("error", Some("Could not save the Claude token."));
+            }
+            return Self::inspect(&mut state, config).await;
+        }
+        if action == "key" {
+            state.login = None;
+            state.checked = None;
+            let Some(key) = code else {
+                return Status::new("error", Some("Paste an Anthropic API key."));
+            };
+            if let Err(message) = save_key(config, &key).await {
+                return Status::new("error", Some(message));
             }
             return Self::inspect(&mut state, config).await;
         }

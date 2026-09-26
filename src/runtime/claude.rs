@@ -102,12 +102,23 @@ pub(super) fn token_path(config: &Config) -> PathBuf {
     config.state_dir.join("claude-oauth-token")
 }
 
+/// The user's Anthropic API key, the alternative to a subscription. Only core can read this file.
+pub(super) fn key_path(config: &Config) -> PathBuf {
+    config.state_dir.join("claude-api-key")
+}
+
 pub(super) fn profile_env(command: &mut Command, config: &Config, profile: &HarnessConfig) {
     // Setting this even to ~/.claude relocates ~/.claude.json and hides native user settings.
     if profile.home != config.account_home.join(".claude") {
         command.env("CLAUDE_CONFIG_DIR", &profile.home);
     }
-    if let Ok(saved) = fs::read_to_string(token_path(config)) {
+    // Cloudroom matches the Mac's Claude version (ADR 0133); Claude's own updater must not move it.
+    command.env("DISABLE_AUTOUPDATER", "1");
+    // Claude prefers an API key over a subscription token, so pass only one.
+    let key = fs::read_to_string(key_path(config)).unwrap_or_default();
+    if !key.trim().is_empty() {
+        command.env("ANTHROPIC_API_KEY", key.trim());
+    } else if let Ok(saved) = fs::read_to_string(token_path(config)) {
         let mut lines = saved.lines().map(str::trim);
         if let Some(token) = lines.next().filter(|s| !s.is_empty()) {
             command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
@@ -131,8 +142,10 @@ pub(super) async fn auth_ready(config: &Config) -> io::Result<bool> {
 /// One tiny real request with the exact model and effort. `auth status` can report
 /// "logged in" for a token Anthropic rejects, so Teleport verifies with inference.
 pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>) -> io::Result<()> {
+    // The prompt goes first: `--tools` takes a list and would swallow a trailing prompt.
     let mut args = vec![
         "-p",
+        "Reply with exactly: OK",
         "--model",
         model,
         "--output-format",
@@ -144,7 +157,6 @@ pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>)
     if let Some(effort) = reasoning.filter(|effort| *effort != "none") {
         args.extend(["--effort", effort]);
     }
-    args.push("Reply with exactly: OK");
     let (_, value) = run_json(config, &args, 40).await?;
     if value["is_error"] == false {
         return Ok(());
@@ -161,6 +173,18 @@ async fn run_json(
     args: &[&str],
     seconds: u64,
 ) -> io::Result<(Option<i32>, Value)> {
+    let (code, bytes) = run_output(config, args, seconds).await?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::other("Claude returned an unreadable response"))?;
+    Ok((code, value))
+}
+
+/// Run the configured Claude CLI as the agent and return its exit code and stdout.
+pub(super) async fn run_output(
+    config: &Config,
+    args: &[&str],
+    seconds: u64,
+) -> io::Result<(Option<i32>, Vec<u8>)> {
     use tokio::io::AsyncReadExt;
     let profile = config
         .harnesses
@@ -186,9 +210,7 @@ async fn run_json(
         if bytes.len() > 65536 {
             return Err(io::Error::other("Claude response too large"));
         }
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| io::Error::other("Claude returned an unreadable response"))?;
-        Ok((child.wait().await?.code(), value))
+        Ok((child.wait().await?.code(), bytes))
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Claude did not answer in time"))
@@ -714,6 +736,10 @@ impl Adapter for Protocol {
                     ));
                 }
             }
+            return Ok(events);
+        }
+        // Long tools emit a 30s heartbeat whose parent_tool_use_id is the tool itself, not a subagent.
+        if kind == "tool_progress" {
             return Ok(events);
         }
         if value["parent_tool_use_id"].as_str().is_some() {

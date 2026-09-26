@@ -294,6 +294,10 @@ export class CloudroomClient {
   async prepareTeleport(manifest: TeleportManifest): Promise<TeleportStatus> {
     return await this.#json("/v1/teleports", manifest) as unknown as TeleportStatus;
   }
+  /** Ask the VM to run the same Claude Code version as this Mac (ADR 0133). It switches only while no Claude session runs. */
+  async matchClaudeVersion(version: string): Promise<{ state: "current" | "updating" | "waiting" | "failed"; installed?: string; target: string; error?: string | null }> {
+    return await this.#json("/v1/accounts/claude/version", { version }) as unknown as { state: "current" | "updating" | "waiting" | "failed"; installed?: string; target: string; error?: string | null };
+  }
   async checkTeleport(check: TeleportCheck, signal?: AbortSignal): Promise<TeleportCheckResult> {
     // One real model request runs on the VM, so allow longer than ordinary commands.
     return await this.#json("/v1/teleports/check", check, signal, undefined, 120_000) as unknown as TeleportCheckResult;
@@ -495,8 +499,8 @@ export class CloudroomClient {
     return result;
   }
 
-  async claudeAuth(action?: "login" | "cancel" | "complete" | "token", id?: string, code?: string, state?: string, signal?: AbortSignal): Promise<CodexAuthStatus> {
-    const value = await this.#json(`/v1/accounts/claude${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "complete" ? { code, state } : {}), ...(action === "token" ? { token: code, ...(state ? { plan: state } : {}) } : {}) } : undefined, signal);
+  async claudeAuth(action?: "login" | "cancel" | "complete" | "token" | "key", id?: string, code?: string, state?: string, signal?: AbortSignal): Promise<CodexAuthStatus> {
+    const value = await this.#json(`/v1/accounts/claude${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "complete" ? { code, state } : {}), ...(action === "token" ? { token: code, ...(state ? { plan: state } : {}) } : {}), ...(action === "key" ? { api_key: code } : {}) } : undefined, signal, undefined, action === "key" ? 60_000 : undefined);
     if (!["missing", "waiting", "connected", "unavailable", "error", "expired"].includes(String(value.state))) throw new CloudroomError("Invalid Claude account status");
     const nullable = (key: string) => value[key] === null ? null : text(value[key]);
     const result = { state: value.state as CodexAuthStatus["state"], email: nullable("email"), plan: nullable("plan"), message: nullable("message"), login_id: nullable("login_id"), verification_url: nullable("verification_url"), user_code: nullable("user_code") };
