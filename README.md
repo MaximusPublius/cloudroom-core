@@ -1,8 +1,11 @@
 # Cloudroom core
 
+[Website](https://www.cloudroom.dev) · [Join the waitlist](https://www.cloudroom.dev/#waitlist) · [Changelog](https://www.cloudroom.dev/changelog) · [Security](https://www.cloudroom.dev/security)
+
 A self-hostable Rust service that runs coding agents on your own Linux VM and saves their session history.
 Supports Codex, Claude Code, Pi, and Cursor. Agents make their own model calls with your own logins.
 One Cargo package; one service per VM. No Cloudroom account or hosted service is required.
+Don't want to run your own VM? Hosted Cloudroom is invite-only for now. [Join the waitlist](https://www.cloudroom.dev/#waitlist).
 
 ![Cloudroom core architecture: session management, agent runtime, workspace management, storage, and app integrations](docs/architecture.png)
 
@@ -28,7 +31,7 @@ See [cloudroom.dev/security](https://www.cloudroom.dev/security). Report vulnera
 ## Desktop app
 
 [Download the Cloudroom GUI beta](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs, with a Linux alpha.
-Downloads are public, but hosted cloud access remains invite-only. The core does not require the GUI.
+Downloads are public, but hosted cloud access remains invite-only ([join the waitlist](https://www.cloudroom.dev/#waitlist)). The core does not require the GUI.
 
 ## Build and test
 
