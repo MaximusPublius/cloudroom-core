@@ -39,6 +39,9 @@ impl Manager {
         if !session.command_guard_enabled() {
             input["command_guard_enabled"] = json!(false);
         }
+        if let Some(system_prompt) = session.system_prompt() {
+            input["system_prompt"] = json!(system_prompt);
+        }
         if let Some(existing) = local.sessions.get(&id) {
             Self::retry(existing, &start_id, "start", &input)?
                 .ok_or(Error::Conflict("child identity conflict"))?;

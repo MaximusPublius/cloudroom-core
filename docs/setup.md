@@ -187,6 +187,18 @@ A failed readiness check usually means the database, TLS certificate, migrations
 
 Cloud sandboxes have no systemd ([scope](../../docs/scopes/sandboxes.md)). The web app writes `/etc/cloudroom/core.env` on every wake, then starts `install/sandbox-start.sh` as root, detached. It parses (never sources) `image.env` and `core.env`, creates the agents' cgroup, runs Core as `cloudroom` with only the capabilities it needs, and restarts it after a crash. A second start is a no-op. The log is `/var/log/cloudroom/core.log`. With `"agent_sudo": true` in `storage.json`, agents keep sudo inside their own sandbox. Before a stop, `POST /v1/drain {"hold":true}` refuses new work and reports whether anything still runs; `{"hold":false}` reopens it.
 
+## What Core needs from a machine
+
+Any VM or sandbox provider can run Core if its machines give all of this. `evals/sandbox-perf/tests/core-prod.mjs` checks a provider in a few minutes.
+
+- **Linux on x86_64 or arm64**, with root or passwordless sudo and the tools the image uses: `useradd`, a standard `visudo`, `setpriv`, `curl` and Node.js.
+- **Writable cgroup v2.** Core creates its own cgroup with `cgroup.freeze` and `cgroup.kill` to stop whole agent process trees. A read-only `/sys/fs/cgroup` stops Core.
+- **Capabilities** `setuid`, `setgid`, `dac_read_search` and `kill` in the bounding set, plus `setpcap` to hand them to Core's service account.
+- **One disk** for `/code`, `/tmp`, `/var/tmp`, `/var/cache`, `/var/lib/cloudroom` and the agent's home, kept across stops. Core watches free space there, so a separate memory-backed `/tmp`, `/var/tmp` or `/var/cache` fails.
+- **A public HTTPS URL for port 9840** that passes the `Authorization` header unchanged, streams server-sent events without buffering, keeps idle streams open (Core sends a keep-alive every 15 seconds), and forwards `Upgrade: cloudroom-tunnel` for previews and Mac access.
+- **The database nearby.** Every history write waits one round trip to the database pooler, over IPv4.
+- **No process kills while agents work.** A stop may end every process; `sandbox-start.sh` restarts Core from its saved state on the next start.
+
 ## Cloud folders
 
 Send `"workspace":"PROJECT_ID"` and optional `"workspace_name":"project-name"` with `POST /v1/sessions`. The core creates an empty directory under `/code` and starts the harness. Repeated workspace IDs reuse their recorded directory; name collisions never overwrite another folder. No Git repository, local source folder, archive upload, or sync worker is required. The agent can clone a repository or install dependencies after starting. Send `"workspace":"root"` to start in `/code` itself, outside any project folder.

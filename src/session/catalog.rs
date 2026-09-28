@@ -59,6 +59,27 @@ impl Manager {
     }
 
     pub(super) async fn model_catalog(&self, kind: runtime::Kind) -> Result<Vec<runtime::Model>> {
+        self.catalog(kind, false).await
+    }
+
+    /// Whether `model` accepts `reasoning`. The saved list answers first, so a start never waits for a refresh
+    /// (capabilities calls keep it current); a model or effort it lacks gets one fresh check.
+    pub(super) async fn reasoning_supported(
+        &self,
+        kind: runtime::Kind,
+        model: &str,
+        reasoning: &str,
+    ) -> Result<bool> {
+        let check = |models: &[runtime::Model]| {
+            runtime::reasoning_levels(kind, models, model).map(|levels| levels.contains(&reasoning))
+        };
+        if check(&self.catalog(kind, true).await?) == Some(true) {
+            return Ok(true);
+        }
+        check(&self.model_catalog(kind).await?).ok_or(Error::Conflict("invalid model"))
+    }
+
+    async fn catalog(&self, kind: runtime::Kind, saved_ok: bool) -> Result<Vec<runtime::Model>> {
         let cache = match kind {
             runtime::Kind::Codex => &self.codex_models,
             runtime::Kind::Claude => &self.claude_models,
@@ -67,7 +88,7 @@ impl Manager {
         };
         let mut cached = cache.lock().await;
         if let Some((checked, models)) = &*cached
-            && checked.elapsed() < Duration::from_secs(60)
+            && (saved_ok || checked.elapsed() < Duration::from_secs(60))
         {
             return Ok(models.clone());
         }
@@ -179,11 +200,8 @@ impl Manager {
         };
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
-                let models = self.model_catalog(kind).await?;
                 let selected = model.ok_or(Error::Conflict("invalid model"))?;
-                runtime::reasoning_levels(kind, &models, &selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .contains(&reasoning)
+                self.reasoning_supported(kind, &selected, reasoning).await?
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)

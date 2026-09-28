@@ -70,6 +70,8 @@ pub struct Manifest {
     pub reasoning: Option<String>,
     pub service_tier: Option<String>,
     pub command_guard_enabled: Option<bool>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     pub workspace: String,
     pub workspace_name: String,
     pub files: Vec<Entry>,
@@ -144,6 +146,10 @@ fn validate(manifest: &Manifest) -> Result<()> {
             .is_some_and(|p| p.is_empty() || p.len() > 256)
         || manifest.handoff.is_empty()
         || manifest.handoff.len() > 32768
+        || manifest
+            .system_prompt
+            .as_ref()
+            .is_some_and(|p| p.trim().is_empty() || p.len() > 32768 || p.contains('\0'))
         || manifest.queued.iter().any(|prompt| {
             prompt.input()["text"]
                 .as_str()
@@ -807,7 +813,7 @@ impl Manager {
         let receipt = Receipt {
             request_id: id.into(),
             command: "start".into(),
-            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"command_guard_enabled":manifest.command_guard_enabled}),
+            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"command_guard_enabled":manifest.command_guard_enabled,"system_prompt":manifest.system_prompt}),
             state: "completed".into(),
             model: Some(manifest.model.clone()),
             provider: manifest.provider.clone(),

@@ -31,7 +31,7 @@ mod process;
 
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
 // Cold Pi handshakes exceeded the ordinary 30s RPC deadline during VM recovery.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const STARTUP_RPC_MULTIPLIER: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -292,6 +292,7 @@ pub struct Handle {
     baseline: Arc<Mutex<Option<String>>>,
     rpc_timeout: Duration,
     command_guard_enabled: bool,
+    system_prompt: Option<String>,
     controls: Arc<tokio::sync::Mutex<()>>,
 }
 impl Handle {
@@ -300,7 +301,7 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
-        Self::spawn_guarded(config, kind, resume, true)
+        Self::spawn_guarded(config, kind, resume, true, None)
     }
 
     pub fn spawn_guarded(
@@ -308,8 +309,16 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
         command_guard_enabled: bool,
+        system_prompt: Option<String>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
-        Self::spawn_inner(config, kind, resume, command_guard_enabled, None)
+        Self::spawn_inner(
+            config,
+            kind,
+            resume,
+            command_guard_enabled,
+            system_prompt,
+            None,
+        )
     }
 
     fn spawn_inner(
@@ -317,6 +326,7 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
         command_guard_enabled: bool,
+        system_prompt: Option<String>,
         fork: Option<&str>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
         let mut profile = config
@@ -343,6 +353,7 @@ impl Handle {
                     resume.as_ref(),
                     fork,
                     command_guard_enabled,
+                    system_prompt.as_deref(),
                 )?;
                 let saved = resume.as_ref().filter(|_| fork.is_none());
                 (
@@ -389,8 +400,13 @@ impl Handle {
                 None,
             ),
             Kind::Pi => {
-                let (command, path, helper) =
-                    pi::command(config, &profile, resume.as_ref(), command_guard_enabled)?;
+                let (command, path, helper) = pi::command(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    command_guard_enabled,
+                    system_prompt.as_deref(),
+                )?;
                 (
                     command,
                     Box::new(pi::Protocol::new(
@@ -414,8 +430,9 @@ impl Handle {
                 file_identity,
                 reasoning: resume.as_ref().and_then(|saved| saved.reasoning.clone()),
                 baseline: Arc::new(Mutex::new(None)),
-                rpc_timeout: Duration::from_secs(30),
+                rpc_timeout: config.rpc_timeout,
                 command_guard_enabled,
+                system_prompt,
                 controls: Arc::new(tokio::sync::Mutex::new(())),
                 resume,
                 session_file,
@@ -474,7 +491,7 @@ impl Handle {
     }
     pub async fn start_session(&self) -> io::Result<String> {
         let mut startup = self.clone();
-        startup.rpc_timeout = STARTUP_TIMEOUT;
+        startup.rpc_timeout = self.rpc_timeout * STARTUP_RPC_MULTIPLIER;
         match self.kind {
             Kind::Codex => codex::start(&startup).await,
             Kind::Pi => pi::start(&startup).await,
@@ -565,6 +582,7 @@ impl Handle {
             self.kind,
             Some(saved),
             self.command_guard_enabled,
+            self.system_prompt.clone(),
             Some(&parent),
         )
         .map(|(handle, events)| Some((handle.with_reasoning(self.reasoning.clone()), events)))

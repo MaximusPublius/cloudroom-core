@@ -45,6 +45,7 @@ fn fixture() -> (Directory, Config) {
         )]
         .into(),
         storage: None,
+        rpc_timeout: Duration::from_secs(30),
     };
     (dir, config)
 }

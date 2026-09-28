@@ -54,6 +54,7 @@ impl Fixture {
             )]
             .into(),
             storage: None,
+            rpc_timeout: Duration::from_secs(30),
         };
         Self { root, config }
     }

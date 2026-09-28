@@ -34,6 +34,7 @@ pub(super) fn command(
     saved: Option<&Resume>,
     fork: Option<&str>,
     guarded: bool,
+    system_prompt: Option<&str>,
 ) -> io::Result<(Command, String)> {
     let id = match saved.filter(|_| fork.is_none()) {
         Some(saved) => saved.id.clone(),
@@ -69,7 +70,9 @@ pub(super) fn command(
             "--model",
             &profile.model,
             "--append-system-prompt",
-            INSTRUCTIONS,
+            &system_prompt.map_or(INSTRUCTIONS.to_owned(), |p| {
+                format!("{INSTRUCTIONS}\n\n{p}")
+            }),
         ])
         .args([
             "--disallowedTools",

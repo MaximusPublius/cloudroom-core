@@ -43,10 +43,12 @@ class MixedHarnessTests(unittest.TestCase):
         self.send('pi','before-slow-restart','hello'); self.settled('pi','before-slow-restart')
         native = self.service.session('cr_pi')['native_id']
         self.service.stop()
-        (self.repo/'startup-delay').write_text('31')
+        # 2s RPC and 8s startup deadlines: this startup outlasts an ordinary RPC but not startup.
+        self.env.update(CLOUDROOM_TEST_RPC_TIMEOUT_MS='2000')
+        (self.repo/'startup-delay').write_text('4')
         self.start()
         self.send('pi','during-startup','hello')
-        until(lambda:self.service.session('cr_pi')['receipts']['during-startup']['state']=='completed','slow startup continuation',50)
+        until(lambda:self.service.session('cr_pi')['receipts']['during-startup']['state']=='completed','slow startup continuation',20)
         session = self.service.session('cr_pi')
         self.assertEqual(session['native_id'],native)
         self.assertEqual(session['queue'],[])
@@ -57,9 +59,10 @@ class MixedHarnessTests(unittest.TestCase):
     def test_startup_timeout_preserves_queue_until_explicit_retry(self):
         self.send('pi','original','hello'); self.settled('pi','original')
         native = self.service.session('cr_pi')['native_id']
+        self.env.update(CLOUDROOM_TEST_RPC_TIMEOUT_MS='2000')  # 8s startup deadline.
         self.service.stop(); (self.repo/'startup-delay').write_text('121'); self.start()
         self.send('pi','waiting','hello')
-        until(lambda:self.service.session('cr_pi').get('startup_error')=='startup_timeout','classified startup timeout',140)
+        until(lambda:self.service.session('cr_pi').get('startup_error')=='startup_timeout','classified startup timeout',30)
         self.assertEqual(self.service.session('cr_pi')['queue'],['waiting'])
         self.service.stop(); (self.repo/'startup-delay').unlink(); self.start()
         failed = self.service.session('cr_pi')

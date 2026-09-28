@@ -31,6 +31,7 @@ pub(super) fn command(
     profile: &HarnessConfig,
     saved: Option<&Resume>,
     command_guard_enabled: bool,
+    system_prompt: Option<&str>,
 ) -> io::Result<(Command, PathBuf, PathBuf)> {
     let directory = profile.home.join("sessions/cloudroom");
     let path = saved
@@ -81,6 +82,9 @@ pub(super) fn command(
         .arg(&profile.model)
         .arg("-e")
         .arg(&helper);
+    if let Some(system_prompt) = system_prompt {
+        command.arg("--append-system-prompt").arg(system_prompt);
+    }
     Ok((command, path, helper))
 }
 

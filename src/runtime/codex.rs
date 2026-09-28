@@ -73,6 +73,9 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     if let Some(reasoning) = &handle.reasoning {
         params["config"] = json!({"model_reasoning_effort":reasoning});
     }
+    if let Some(system_prompt) = &handle.system_prompt {
+        params["developerInstructions"] = json!(system_prompt);
+    }
     let method = if let Some(saved) = &handle.resume {
         params["threadId"] = json!(saved.id);
         params["path"] = json!(saved.path);
@@ -209,6 +212,9 @@ pub(super) async fn compact(handle: &Handle) -> io::Result<()> {
 
 pub(super) async fn rewind(handle: &Handle, input: &Value) -> io::Result<Value> {
     let mut params = json!({"threadId":handle.native()?});
+    if let Some(system_prompt) = &handle.system_prompt {
+        params["developerInstructions"] = json!(system_prompt);
+    }
     if let Some(id) = input["last_turn_id"]
         .as_str()
         .or_else(|| input["lastTurnId"].as_str())

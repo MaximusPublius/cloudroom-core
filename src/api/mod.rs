@@ -558,6 +558,7 @@ struct Start {
     provider: Option<String>,
     workspace_name: Option<String>,
     command_guard_enabled: Option<bool>,
+    system_prompt: Option<String>,
 }
 
 async fn workspace(
@@ -778,6 +779,13 @@ async fn start(
     {
         return Err(session::Error::Conflict("invalid reasoning effort"));
     }
+    if body
+        .system_prompt
+        .as_ref()
+        .is_some_and(|p| p.trim().is_empty() || p.len() > 32768 || p.contains('\0'))
+    {
+        return Err(session::Error::Conflict("invalid system prompt"));
+    }
     let (id, receipt) = manager
         .start(
             body.request_id,
@@ -785,7 +793,11 @@ async fn start(
             body.model,
             body.reasoning,
             (body.workspace, body.workspace_name),
-            (body.provider, body.command_guard_enabled),
+            (
+                body.provider,
+                body.command_guard_enabled,
+                body.system_prompt,
+            ),
         )
         .await?;
     Ok(accepted(&manager, &id, receipt))

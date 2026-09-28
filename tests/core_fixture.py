@@ -206,10 +206,11 @@ class ReplayTests(unittest.TestCase):
         (home / ".codex").mkdir(parents=True)
         self.state = self.root / "state"
         self.state.mkdir()
+        # The database is a missing socket: it fails at once, where a refused port is retried for 2s on every shutdown.
         self.env = {
             "PATH": "/usr/local/bin:/usr/bin:/bin", "CLOUDROOM_UNPROTECTED_TEST_MODE": "1", "CLOUDROOM_LISTEN": "127.0.0.1:0",
             "CLOUDROOM_TOKEN": "fixture-token-" + "x" * 32, "CLOUDROOM_STATE_DIR": str(self.state),
-            "CLOUDROOM_REPOSITORY": str(self.repo), "CLOUDROOM_DATABASE_URL": "postgres://127.0.0.1:1/fixture",
+            "CLOUDROOM_REPOSITORY": str(self.repo), "CLOUDROOM_DATABASE_URL": f"postgres://localhost/fixture?host={self.root}/no-database",
             "CLOUDROOM_STORE": "fixture", "CLOUDROOM_ALLOW_INSECURE_DATABASE": "1",
             "CLOUDROOM_CODEX_BINARY": str(Path(__file__).resolve()), "CLOUDROOM_ACCOUNT_HOME": str(home),
             "CLOUDROOM_CODEX_HOME": str(home / ".codex"), "CLOUDROOM_MODEL": "fixture",

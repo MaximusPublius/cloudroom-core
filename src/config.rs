@@ -1,6 +1,6 @@
 use crate::runtime::Kind;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, io, net::SocketAddr, path::PathBuf};
+use std::{collections::BTreeMap, env, io, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HarnessConfig {
@@ -25,6 +25,8 @@ pub struct Config {
     pub default_harness: Kind,
     pub harnesses: BTreeMap<Kind, HarnessConfig>,
     pub storage: Option<crate::workspace::storage::Policy>,
+    /// Harness RPC deadline; startup allows four times as long.
+    pub rpc_timeout: Duration,
 }
 
 impl Config {
@@ -61,6 +63,14 @@ impl Config {
             Some(crate::workspace::storage::Policy::load(&PathBuf::from(
                 required("CLOUDROOM_STORAGE_POLICY")?,
             ))?)
+        };
+        // Unprotected tests shorten harness deadlines instead of waiting out the real ones.
+        let rpc_timeout = match env::var("CLOUDROOM_TEST_RPC_TIMEOUT_MS") {
+            Ok(ms) if unprotected_test_mode => Duration::from_millis(
+                ms.parse()
+                    .map_err(|_| io::Error::other("invalid CLOUDROOM_TEST_RPC_TIMEOUT_MS"))?,
+            ),
+            _ => Duration::from_secs(30),
         };
         let default_harness = match env::var("CLOUDROOM_HARNESS").as_deref().unwrap_or("codex") {
             "codex" => Kind::Codex,
@@ -149,6 +159,7 @@ impl Config {
         }
         Ok(Self {
             storage,
+            rpc_timeout,
             default_harness,
             harnesses,
             listen,

@@ -161,6 +161,14 @@ impl Session {
             .unwrap_or(true)
     }
 
+    fn system_prompt(&self) -> Option<String> {
+        self.receipts
+            .values()
+            .find(|r| r.command == "start")
+            .and_then(|r| r.input["system_prompt"].as_str())
+            .map(str::to_owned)
+    }
+
     fn resume(&self) -> Option<runtime::Resume> {
         Some(runtime::Resume {
             id: self.native_id.clone()?,
@@ -616,11 +624,8 @@ impl Manager {
     ) -> Result<()> {
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
-                let models = self.model_catalog(kind).await?;
                 let selected = model.unwrap_or(&self.config.harnesses[&kind].model);
-                runtime::reasoning_levels(kind, &models, selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .contains(&reasoning)
+                self.reasoning_supported(kind, selected, reasoning).await?
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)
@@ -639,7 +644,11 @@ impl Manager {
         model: Option<String>,
         reasoning: Option<String>,
         (workspace, workspace_name): (Option<String>, Option<String>),
-        (provider, command_guard_enabled): (Option<String>, Option<bool>),
+        (provider, command_guard_enabled, system_prompt): (
+            Option<String>,
+            Option<bool>,
+            Option<String>,
+        ),
     ) -> Result<(String, Receipt)> {
         let id = format!("cr_{request}");
         let kind = harness
@@ -659,6 +668,9 @@ impl Manager {
         };
         if command_guard_enabled == Some(false) {
             input["command_guard_enabled"] = json!(false);
+        }
+        if let Some(system_prompt) = &system_prompt {
+            input["system_prompt"] = json!(system_prompt);
         }
         if let Some(model) = &model {
             input["model"] = json!(model);
@@ -697,12 +709,30 @@ impl Manager {
         if self.config.harnesses.is_empty() {
             return Err(Error::Conflict("agent setup is incomplete"));
         }
+        // The history, login, and model checks run together; their results apply in this order.
+        let configured = self.config.harnesses.contains_key(&kind);
+        let (history, ready, supported) = tokio::join!(
+            self.history.summary(&id, Some(&request)),
+            async {
+                if configured {
+                    self.harness_ready(kind).await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                match &reasoning {
+                    Some(reasoning) if configured => {
+                        self.execution_supported(kind, model.as_ref(), reasoning)
+                            .await
+                    }
+                    _ => Ok(()),
+                }
+            },
+        );
         // Fresh-state retries must not recreate an externally saved session.
-        let (external, receipt) = self
-            .history
-            .summary(&id, Some(&request))
-            .await
-            .map_err(|e| Error::Storage(format!("history database: {e}")))?;
+        let (external, receipt) =
+            history.map_err(|e| Error::Storage(format!("history database: {e}")))?;
         if let Some(external) = external {
             if harness.is_some_and(|kind| kind != external.harness) {
                 return Err(Error::Conflict("request_id already has different content"));
@@ -714,14 +744,11 @@ impl Manager {
             }
             return Ok((id, receipt));
         }
-        if !self.config.harnesses.contains_key(&kind) {
+        if !configured {
             return Err(Error::Conflict("harness is not configured"));
         }
-        self.harness_ready(kind).await?;
-        if let Some(reasoning) = &reasoning {
-            self.execution_supported(kind, model.as_ref(), reasoning)
-                .await?;
-        }
+        ready?;
+        supported?;
         let workspace = match workspace {
             // Unregistered like legacy sessions, so no project folder is created.
             Some(id) if id == crate::workspace::ROOT => crate::workspace::Workspace {
@@ -824,9 +851,10 @@ impl Manager {
                 config.repository = session.workspace.as_ref().ok_or_else(|| io::Error::other("session workspace missing"))?.path.canonicalize()?;
                 let (kind, reasoning) = (session.harness, session.reasoning.clone());
                 let command_guard_enabled = session.command_guard_enabled();
+                let system_prompt = session.system_prompt();
                 // Claim before spawning: a crash after this point must not repeat uncertain execution.
                 local.append(&id, "state", json!({"state":"starting"}), None)?;
-                let (handle, events) = runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled)?;
+                let (handle, events) = runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled, system_prompt)?;
                 let handle = handle.with_reasoning(reasoning);
                 let pid = handle.pid();
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
@@ -1740,6 +1768,7 @@ impl Manager {
                     kind,
                     Some(saved),
                     local.sessions[&id].command_guard_enabled(),
+                    local.sessions[&id].system_prompt(),
                 )?;
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
                 local.append(&id, "harness", json!({"pid":handle.pid()}), None)?;

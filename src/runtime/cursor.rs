@@ -156,7 +156,10 @@ pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::R
         .dispatch(
             "session/prompt",
             json!({"sessionId":handle.native()?,
-        "prompt":[{"type":"text","text":format!("{PLAIN_CHAT}\n\n{text}")}]}),
+        "prompt":[{"type":"text","text":match &handle.system_prompt {
+            Some(system_prompt) => format!("{PLAIN_CHAT}\n\n[Cloudroom system prompt]\n{system_prompt}\n\n{text}"),
+            None => format!("{PLAIN_CHAT}\n\n{text}"),
+        }}]}),
             Some(request),
             None,
         )

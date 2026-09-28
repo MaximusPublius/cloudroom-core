@@ -21,7 +21,7 @@ Every Cloudroom feature is available over this API. It is plain HTTP on `127.0.0
 ## Sessions
 
 - `GET /v1/sessions`: the latest 1,000 sessions, newest activity first, as `{total, sessions}`. Each summary has `session_id`, `harness`, `model`, `provider`, `state`, `workspace`, `parent_session`, `current_request`, `queued`, `last_sequence` and `last_activity_ms`.
-- `POST /v1/sessions`: start a session. Body: `request_id`, plus optional `harness` (`codex`, `claude-code`, `pi`, `cursor`), `model`, `reasoning`, `provider` (Pi only), `workspace`, `workspace_name` and `command_guard_enabled`.
+- `POST /v1/sessions`: start a session. Body: `request_id`, plus optional `harness` (`codex`, `claude-code`, `pi`, `cursor`), `model`, `reasoning`, `provider` (Pi only), `workspace`, `workspace_name`, `command_guard_enabled` and `system_prompt` (up to 32768 bytes; added to the harness's system prompt, or to each Cursor prompt, and inherited by children).
 - `GET /v1/sessions/{id}`: full state, including receipts and the queue.
 - `GET /v1/sessions/{id}/workspace`: the session's folder, branch and commit.
 - `GET /v1/sessions/{id}/recovery`: whether a stopped session can resume ([lifecycle](session-lifecycle.md)).
