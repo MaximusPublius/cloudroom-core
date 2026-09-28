@@ -762,8 +762,16 @@ pub(super) fn command(binary: &Path, config: &Config) -> Command {
         path.push(config.account_home.join(folder));
     }
     let mut command = Command::new(binary);
+    command.env_clear();
+    // The user's own variables from Cloud environment settings, one NAME=value per line. Read at every
+    // start, so saved changes reach new agents at once. Core's own values below win over them.
+    let saved = std::fs::read_to_string(config.state_dir.join("environment")).unwrap_or_default();
+    for (name, value) in saved.lines().filter_map(|line| line.split_once('=')) {
+        if !name.is_empty() && !name.contains('\0') && !value.contains('\0') {
+            command.env(name, value);
+        }
+    }
     command
-        .env_clear()
         .env("PATH", path)
         .env("HOME", &config.account_home)
         .env("LANG", "C.UTF-8")
