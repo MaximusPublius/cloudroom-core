@@ -1,153 +1,222 @@
-"""Real HTTP imports, Git fidelity, and per-workspace harness recovery."""
+"""Direct HTTP starts and durable workspace recovery; archive imports are retired."""
 import concurrent.futures
-import gzip
 import http.client
-import io
 import json
 from pathlib import Path
+import secrets
+import socket
 import subprocess
-import sys
-import tarfile
+import time
 import unittest
 
 import core_fixture
-from core_e2e import until
-
-SCRIPT = Path(__file__).resolve().parents[1] / 'src/workspace/transfer.py'
+from core_e2e import until, run, MIGRATIONS
 
 
 class WorkspaceTests(unittest.TestCase):
     setUp, tearDown, start = core_fixture.ReplayTests.setUp, core_fixture.ReplayTests.tearDown, core_fixture.ReplayTests.start
 
-    def snapshot(self, source):
-        archive = self.root / 'project.tar.gz'
-        subprocess.run([sys.executable, str(SCRIPT), 'pack', str(source), str(archive)], check=True, capture_output=True)
-        return archive.read_bytes()
+    def pi(self):
+        home = self.root / 'pi-home'; home.mkdir(exist_ok=True)
+        self.env.update(CLOUDROOM_PI_HOME=str(home), CLOUDROOM_PI_BINARY=str(Path(__file__).with_name('pi_fixture.py').resolve()), CLOUDROOM_PI_MODEL='fixture', CLOUDROOM_PI_PROVIDER='fixture')
 
-    def upload(self, key, body, name='project', expected=201, token=True):
-        connection = http.client.HTTPConnection(self.service.address, timeout=20)
-        headers = {'Content-Type': 'application/gzip'}
-        if token:
-            headers['Authorization'] = 'Bearer ' + self.env['CLOUDROOM_TOKEN']
-        connection.request('POST', f'/v1/workspaces/{key}?name={name}', body, headers)
-        response = connection.getresponse()
-        data = response.read()
-        connection.close()
-        self.assertEqual(response.status, expected, data)
-        return json.loads(data)
+    def database(self):
+        name = 'cloudroom-workspace-' + secrets.token_hex(6)
+        password = secrets.token_hex(16)
+        with socket.socket() as socket_:
+            socket_.bind(('127.0.0.1', 0)); port = socket_.getsockname()[1]
+        run('docker', 'run', '-d', '--pull=never', '--name', name, '--memory', '256m', '--cpus', '.5', '--pids-limit', '64', '-e', 'POSTGRES_PASSWORD=' + password, '-e', 'POSTGRES_DB=cloudroom_core_test', '-p', f'127.0.0.1:{port}:5432', 'postgres:16-alpine')
+        self.addCleanup(lambda: subprocess.run(['docker', 'rm', '-f', name], capture_output=True))
+        until(lambda: subprocess.run(['docker','exec',name,'pg_isready','-h','127.0.0.1','-U','postgres'],capture_output=True).returncode == 0, 'disposable PostgreSQL', 30)
+        for filename in ['0001-session-records.sql', '0002-diagnostics.sql']:
+            run('docker','exec','-i',name,'psql','-U','postgres','-d','cloudroom_core_test','-v','ON_ERROR_STOP=1',input=(MIGRATIONS/filename).read_text())
+        self.env.update(CLOUDROOM_DATABASE_URL=f'postgres://postgres:{password}@127.0.0.1:{port}/cloudroom_core_test', CLOUDROOM_STORE=name)
 
-    def git(self, folder, *args):
-        return subprocess.check_output(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-C', str(folder), *args], stderr=subprocess.DEVNULL)
+    def seed(self, key, path, harness='codex', paused=False, parent=None, legacy_state=None):
+        workspace = {'id':key,'path':str(path.resolve()), **({'parent':parent} if parent else {})}
+        registry = self.state / 'workspaces'; registry.mkdir(exist_ok=True)
+        (registry / (key + '.pending')).write_text(json.dumps(workspace))
+        records = [('receipt', {'request_id':key,'command':'start','input':{'workspace':key, **({'harness':harness} if harness!='codex' else {})},'workspace':workspace,'state':'accepted'})]
+        if legacy_state: records.append(('state', {'state':legacy_state}))
+        records.append(('receipt', {'request_id':'first','command':'prompt','input':{'text':'hello'},'state':'accepted'}))
+        if paused: records.append(('receipt', {'request_id':'stop','command':'stop','input':{},'state':'accepted'}))
+        sequence = len(list(self.state.glob('*.record')))
+        for kind, data in records:
+            sequence += 1
+            (self.state / f'{sequence:020}.record').write_text(json.dumps({'sequence':sequence,'session_id':'cr_'+key,'kind':kind,'data':data}))
+        return workspace
 
-    def test_projects_added_later_collisions_retries_and_existing_cloud_edits(self):
-        (self.repo / 'file').write_text('local')
-        (self.repo / '.env').write_text('SYNTHETIC=1')
-        (self.repo / 'run').write_text('#!/bin/sh\n'); (self.repo / 'run').chmod(0o755)
-        (self.repo / 'link').symlink_to('file')
-        (self.repo / 'node_modules').mkdir(); (self.repo / 'node_modules/skip').touch()
-        archive = self.snapshot(self.repo)
+    def test_new_empty_folders_collisions_concurrent_starts_and_retry(self):
+        self.database(); self.pi(); self.start()
+        samples = []
+        for kind in ['codex','pi']:
+            key = kind + '-empty'
+            body = {'request_id':key,'harness':kind,'workspace':key,'workspace_name':'project'}
+            started = time.monotonic()
+            accepted = self.service.request('POST','/v1/sessions',body,202)
+            sid = accepted['session_id']
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST',f'/v1/sessions/{sid}/attachments?request_id=attachment&name=note.txt&kind=file',b'explicit attachment',{'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            uploaded = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status,202,uploaded)
+            self.assertEqual(Path(uploaded['receipt']['input']['path']).read_bytes(),b'explicit attachment')
+            self.service.request('POST',f'/v1/sessions/{sid}/prompts',{'request_id':'hello','text':'hello'},202)
+            until(lambda:self.service.session(sid)['receipts']['hello']['state']=='completed', 'empty '+kind, 10)
+            samples.append(round(time.monotonic()-started,3))
+            first = self.service.session(sid)
+            self.assertEqual(first['receipts'][key]['state'],'completed')
+            self.assertFalse((Path(first['workspace']['path']) / '.git').exists())
+            self.assertEqual(self.service.request('GET',f'/v1/sessions/{sid}/workspace')['branch'],None)
+            self.service.request('POST','/v1/sessions',body,202)
+            self.assertEqual(self.service.session(sid)['native_id'],first['native_id'])
+            self.service.request('POST','/v1/sessions',{**body,'workspace_name':'different'},409)
+        self.assertNotEqual(self.service.session('cr_codex-empty')['workspace']['path'],self.service.session('cr_pi-empty')['workspace']['path'])
+        path = Path(self.service.session('cr_codex-empty')['workspace']['path'])
+        (path / 'keep').write_text('cloud work')
+        def create(key):
+            return self.service.request('POST','/v1/sessions',{'request_id':key,'workspace':'codex-empty'},202)
+        with concurrent.futures.ThreadPoolExecutor(2) as pool: results = list(pool.map(create,['peer-a','peer-b']))
+        for item in results:
+            until(lambda:self.service.session(item['session_id'])['state']=='idle','peer',10)
+            self.assertEqual(self.service.session(item['session_id'])['workspace']['path'],str(path))
+        self.assertEqual((path/'keep').read_text(),'cloud work')
+        print('Direct empty-folder start + attachment + first prompt (protocol fixtures), seconds:',samples)
+
+    def test_attachment_bytes_limits_retry_and_no_symlink_escape(self):
+        self.pi()
+        paths = {kind:self.state.resolve()/'code'/kind for kind in ['codex','pi']}
+        for kind,path in paths.items(): self.seed(kind,path,kind)
         self.start()
-        self.upload('first', archive, expected=401, token=False)
-        with concurrent.futures.ThreadPoolExecutor(2) as pool:
-            results = list(pool.map(lambda _: self.upload('first', archive), range(2)))
-        self.assertEqual(results[0], results[1])
-        first = Path(results[0]['path'])
-        self.assertEqual((first / '.env').read_text(), 'SYNTHETIC=1')
-        self.assertTrue((first / 'run').stat().st_mode & 0o111)
-        self.assertTrue((first / 'link').is_symlink())
-        self.assertFalse((first / 'node_modules').exists())
-        (first / 'file').write_text('cloud edit')
-        self.assertEqual(self.upload('first', archive), results[0])
-        self.assertEqual((first / 'file').read_text(), 'cloud edit')
-        second = self.upload('second', archive)
-        self.assertNotEqual(second['path'], str(first))
-        with concurrent.futures.ThreadPoolExecutor(2) as pool:
-            collisions = list(pool.map(lambda key: self.upload(key, archive, name='collision'), ['a', 'b']))
-        self.assertNotEqual(collisions[0]['path'], collisions[1]['path'])
-        empty = self.root / 'empty'; empty.mkdir()
-        third = self.upload('third', self.snapshot(empty), name='new-project')
-        self.assertEqual(list(Path(third['path']).iterdir()), [])
-        self.service.stop()
-        (self.state / 'workspaces/first.json').rename(self.state / 'workspaces/first.pending')
-        (first / '.cloudroom-imported').write_text('first')
+        def upload(kind, key, name, content, media='file', expected=202):
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST',f'/v1/sessions/cr_{kind}/attachments?request_id={key}&name={name}&kind={media}',content,
+                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            data = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status,expected,data)
+            return data
+        for kind,path in paths.items():
+            until(lambda:self.service.session('cr_'+kind)['state']=='idle','attachment target',10)
+            path.chmod(0o700)
+            for index, (blocked, mode) in enumerate([(path, 0o000), (path/'.cloudroom', 0o000),
+                    (path/'.cloudroom/attachments', 0o500), (path/'.cloudroom/attachments/denied-3', 0o500)]):
+                blocked.mkdir(mode=0o700, exist_ok=True)
+                blocked.chmod(mode)
+                try:
+                    denied = upload(kind,'denied-'+str(index),'note.txt',b'retry me',expected=409)
+                    self.assertEqual(denied, {'code':'attachment_permission_denied','error':'Cloud folder permission denied'})
+                    self.assertNotIn('denied-'+str(index),self.service.session('cr_'+kind)['receipts'])
+                finally:
+                    blocked.chmod(0o700)
+                retried = upload(kind,'denied-'+str(index),'note.txt',b'retry me')['receipt']['input']
+                self.assertEqual(Path(retried['path']).read_bytes(),b'retry me')
+            payload = ('ATTACHMENT_'+kind+'\\n').encode()*10000
+            uploaded = upload(kind,'note','note.txt',payload)['receipt']['input']
+            dest = Path(uploaded['path'])
+            self.assertEqual(dest.read_bytes(),payload)
+            self.assertEqual(uploaded['size'],len(payload))
+            self.assertEqual(dest.stat().st_mode & 0o777,0o600)
+            self.assertEqual(upload(kind,'note','note.txt',payload)['receipt']['input'],uploaded)
+            for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
+                too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
+                self.assertEqual(too_large['code'],'attachment_too_large')
+                self.assertFalse((path/'.cloudroom/attachments'/('large-'+media)/'large').exists())
+            outside = self.root.resolve()/('outside-'+kind); outside.mkdir()
+            (outside/'keep').write_text('untouched')
+            (path/'.cloudroom/attachments/escape').symlink_to(outside)
+            upload(kind,'escape','keep',b'changed',expected=409)
+            linked = path/'.cloudroom/attachments/linked'; linked.mkdir()
+            (linked/'keep').symlink_to(outside/'keep')
+            upload(kind,'linked','keep',b'changed',expected=409)
+            temporary = path/'.cloudroom/attachments/temporary'; temporary.mkdir()
+            (temporary/'.note.txt.tmp').symlink_to(outside/'keep')
+            temporary_upload = upload(kind,'temporary','note.txt',b'normal upload')['receipt']['input']
+            self.assertEqual(Path(temporary_upload['path']).read_bytes(),b'normal upload')
+            self.assertTrue((temporary/'.note.txt.tmp').is_symlink())
+            upload(kind,'traversal','..%2Fkeep',b'changed',expected=409)
+            self.assertEqual((outside/'keep').read_text(),'untouched')
+            self.assertFalse(list(path.rglob('.attachment-*')))
+            self.service.request('POST',f'/v1/sessions/cr_{kind}/prompts',
+                {'request_id':'read','text':'read attachment','attachments':[uploaded]},202)
+            until(lambda:self.service.session('cr_'+kind)['receipts']['read']['state']=='completed','attachment prompt',10)
+
+    def assert_single_dispatch(self, kind, path, native):
+        if kind == 'codex':
+            self.assertEqual((path/(native+'.requests')).read_text().splitlines(),['first'])
+        else:
+            until(lambda:self.service.session('cr_'+kind)['native_path'] is not None,'Pi history',10)
+            records = [json.loads(line) for line in Path(self.service.session('cr_'+kind)['native_path']).read_text().splitlines()]
+            self.assertEqual(records[0]['cwd'],str(path))
+            self.assertEqual([r['message']['content'] for r in records if r.get('message',{}).get('role')=='user'],['hello'])
+
+    def test_old_pending_starts_launch_in_empty_folders_and_resume_once(self):
+        self.pi()
+        paths = {kind:self.state.resolve()/'code'/kind for kind in ['codex','pi']}
+        for kind,path in paths.items(): self.seed(kind,path,kind,legacy_state='waiting_for_files')
         self.start()
-        self.assertEqual(self.service.request('GET', '/v1/workspaces/first'), results[0])
-        self.assertFalse((self.state / 'workspaces/first.pending').exists())
-        self.assertEqual(self.service.request('GET', '/v1/workspaces/third'), third)
+        identities = {}
+        for kind,path in paths.items():
+            sid = 'cr_'+kind
+            until(lambda:self.service.session(sid)['receipts']['first']['state']=='completed','old pending '+kind,10)
+            identities[kind] = self.service.session(sid)['native_id']
+            self.assert_single_dispatch(kind,path,identities[kind])
+        self.service.stop(); self.start()
+        for kind,path in paths.items():
+            until(lambda:self.service.session('cr_'+kind)['state']=='idle','resume '+kind,10)
+            self.assertEqual(self.service.session('cr_'+kind)['native_id'],identities[kind])
+            self.assert_single_dispatch(kind,path,identities[kind])
 
-    def test_dirty_git_linked_worktrees_and_submodules_are_portable(self):
-        (self.repo / 'tracked').write_text('base')
-        (self.repo / 'deleted').write_text('delete me')
-        self.git(self.repo, 'add', '.'); self.git(self.repo, 'commit', '-qm', 'unpublished')
-        linked = self.root / 'linked'
-        self.git(self.repo, 'worktree', 'add', '-qb', 'feature', str(linked))
-        (linked / 'tracked').write_text('staged'); self.git(linked, 'add', 'tracked')
-        (linked / 'tracked').write_text('unstaged')
-        (linked / 'deleted').unlink(); (linked / 'untracked').write_text('new')
-        sub = self.root / 'sub'; sub.mkdir(); self.git(sub, 'init', '-q')
-        (sub / 'nested').write_text('nested'); self.git(sub, 'add', '.'); self.git(sub, 'commit', '-qm', 'sub')
-        self.git(linked, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(sub), 'module')
-        (linked / 'module/nested').write_text('submodule edit')
-        expected_status = self.git(linked, 'status', '--porcelain')
-        archive = self.snapshot(linked)
+    def test_paused_start_keeps_queue_paused_and_nested_mapping(self):
+        parent = self.state.resolve()/'code/project'
+        self.seed('parent',parent)
+        child = parent/'nested/child'
+        self.seed('child',child,paused=True,parent='parent')
         self.start()
-        copied = Path(self.upload('git', archive)['path'])
-        self.assertEqual(self.git(copied, 'status', '--porcelain'), expected_status)
-        self.assertEqual(self.git(copied, 'branch', '--show-current'), b'feature\n')
-        self.assertEqual(self.git(copied, 'show', ':tracked'), b'staged')
-        self.assertEqual((copied / 'tracked').read_text(), 'unstaged')
-        self.assertEqual(self.git(copied / 'module', 'show', 'HEAD:nested'), b'nested')
-        self.assertEqual((copied / 'module/nested').read_text(), 'submodule edit')
-        self.assertTrue((copied / '.git').is_dir())
+        until(lambda:self.service.session('cr_child')['state']=='idle','paused child',10)
+        self.assertTrue(child.is_dir())
+        self.assertTrue(self.service.session('cr_child')['queue_paused'])
+        self.assertEqual(self.service.session('cr_child')['receipts']['first']['state'],'accepted')
+        self.service.request('POST','/v1/sessions/cr_child/resume',{'request_id':'resume'},202)
+        until(lambda:self.service.session('cr_child')['receipts']['first']['state']=='completed','resume child',10)
+        self.assertEqual(self.service.session('cr_child')['workspace']['path'],str(child))
 
-    def test_invalid_and_interrupted_archives_never_publish_a_workspace(self):
+    def test_existing_dirty_git_and_files_are_untouched(self):
+        path = self.state.resolve()/'code/project'; path.mkdir(parents=True)
+        run('git','init','-q',str(path))
+        (path/'file').write_text('base')
+        run('git','-C',str(path),'add','.')
+        run('git','-C',str(path),'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','base')
+        (path/'file').write_text('staged'); run('git','-C',str(path),'add','file')
+        (path/'file').write_text('unstaged'); (path/'.env').write_text('SYNTHETIC=keep')
+        before = run('git','-C',str(path),'show',':file')
+        self.seed('dirty',path); self.start()
+        until(lambda:self.service.session('cr_dirty')['receipts']['first']['state']=='completed','dirty folder',10)
+        self.assertEqual((path/'file').read_text(),'unstaged')
+        self.assertEqual(run('git','-C',str(path),'show',':file'),before)
+        self.assertEqual((path/'.env').read_text(),'SYNTHETIC=keep')
+        self.assertIsNotNone(self.service.request('GET','/v1/sessions/cr_dirty/workspace')['head'])
+
+    def test_path_escape_is_rejected_without_touching_outside_files(self):
+        root = self.state.resolve()/'code'; root.mkdir()
+        outside = self.root.resolve()/'outside'; outside.mkdir()
+        (outside/'keep').write_text('private')
+        (root/'escape').symlink_to(outside)
+        self.seed('escape',root/'escape')
+        # Preserve the lexical path so the no-follow directory walk must reject it.
+        pending = self.state/'workspaces/escape.pending'
+        pending.write_text(json.dumps({'id':'escape','path':str(root/'escape')}))
+        record = self.state/'00000000000000000001.record'
+        value=json.loads(record.read_text()); value['data']['workspace']['path']=str(root/'escape');record.write_text(json.dumps(value))
         self.start()
-        for index, (name, kind, link) in enumerate([
-            ('../escape', tarfile.REGTYPE, ''), ('files/link', tarfile.SYMTYPE, '/tmp/escape'),
-            ('files/hard', tarfile.LNKTYPE, '../escape'), ('files/.git/config', tarfile.REGTYPE, ''),
-        ]):
-            output = io.BytesIO()
-            with tarfile.open(fileobj=output, mode='w:gz') as archive:
-                entry = tarfile.TarInfo(name); entry.type = kind; entry.linkname = link
-                archive.addfile(entry)
-            self.upload(f'bad{index}', output.getvalue(), expected=409)
-            self.service.request('GET', f'/v1/workspaces/bad{index}', expected=404)
-        entry = tarfile.TarInfo('files/huge'); entry.size = 4 * 1024**3 + 1
-        self.upload('huge', gzip.compress(entry.tobuf()), expected=409)
-        self.upload('retry', self.snapshot(self.repo)[:20], expected=409)
-        self.upload('retry', self.snapshot(self.repo))
-        outside = self.root / 'outside'; outside.write_text('private')
-        (self.repo / 'external').symlink_to(outside)
-        result = subprocess.run([sys.executable, str(SCRIPT), 'pack', str(self.repo), str(self.root / 'bad.tar.gz')], capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_sessions_resume_in_their_recorded_folders(self):
-        self.start()
-        archive = self.snapshot(self.repo)
-        workspaces = [self.upload(key, archive, name=key) for key in ['one', 'two']]
-        self.service.stop()
-        native_root = Path(self.env['CLOUDROOM_CODEX_HOME']) / 'sessions'; native_root.mkdir()
-        sequence = 0
-        for workspace in workspaces:
-            key = workspace['id']
-            path = native_root / f'{key}.jsonl'; path.write_text('{"fixture":"seed"}\n')
-            for kind, data in [('receipt', {'request_id': key, 'command': 'start', 'input': {'workspace': key}, 'workspace': workspace, 'state': 'completed'}),
-                               ('native_identity', {'id': key, 'path': str(path)}), ('state', {'state': 'idle'})]:
-                sequence += 1
-                (self.state / f'{sequence:020}.record').write_text(json.dumps({'sequence': sequence, 'session_id': 'cr_' + key, 'kind': kind, 'data': data}))
-        for attempt in range(2):
-            self.start()
-            for workspace in workspaces:
-                key = workspace['id']; sid = 'cr_' + key
-                until(lambda: self.service.session(sid)['state'] == 'idle', 'workspace resume', 10)
-                self.service.request('POST', '/v1/sessions', {'request_id': key, 'workspace': key}, 202)
-                self.service.request('POST', '/v1/sessions', {'request_id': key, 'workspace': 'different'}, 409)
-                request = f'check-{attempt}'
-                self.service.request('POST', f'/v1/sessions/{sid}/prompts', {'request_id': request, 'text': 'hello'}, 202)
-                until(lambda: self.service.session(sid)['receipts'][request]['state'] == 'completed', 'workspace prompt', 10)
-                self.assertIn(request, (Path(workspace['path']) / (key + '.requests')).read_text())
-            self.service.stop()
+        until(lambda:self.service.session('cr_escape')['state']=='failed','invalid mapping',10)
+        self.assertFalse((outside/'child').exists())
+        self.assertEqual((outside/'keep').read_text(),'private')
+        self.service.request('POST','/v1/sessions',{'request_id':'bad','workspace':'../outside'},409)
+        self.service.request('POST','/v1/sessions',{'request_id':'bad','workspace':'good','workspace_name':'../outside'},409)
+        self.service.request('POST','/v1/sessions',{'request_id':'bad','workspace':'good'},401,token=None)
+        self.service.request('POST','/v1/workspaces/old',{},405)
+        self.service.request('POST','/v1/workspaces/old/prepare',{},404)
 
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == '__main__': unittest.main()

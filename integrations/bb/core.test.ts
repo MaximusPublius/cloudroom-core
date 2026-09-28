@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
-import { CloudroomClient } from "./client.ts";
+import { CloudroomClient, CloudroomError } from "./client.ts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const driver = `
@@ -85,6 +85,26 @@ test(
       await exited;
     });
     let client = new CloudroomClient(await next());
+    const capabilities = await client.capabilities();
+    assert.match(JSON.stringify(capabilities.harnesses), /"reasoning_levels":\["low","medium","high","xhigh","max"\]/);
+    for (const options of [{ model: "fixture", reasoning: "ultra" }, { model: "basic", reasoning: "max" }, { model: "missing", reasoning: "high" }]) {
+      await assert.rejects(client.start("invalid", "codex", options), (error: unknown) => {
+        assert(error instanceof CloudroomError);
+        assert.equal(error.retryable, false);
+        assert.equal(error.code, options.model === "missing" ? "invalid_model" : "invalid_reasoning_effort");
+        return true;
+      });
+    }
+    const max = await client.start("bb-max", "codex", { model: "fixture", reasoning: "max" });
+    await until(async () => (await client.session(max.session_id)).state === "idle");
+    await client.prompt(max.session_id, "max-prompt", "verify max");
+    await until(async () => (await client.session(max.session_id)).receipts["max-prompt"]?.state === "completed");
+    const nativeRecords = (await client.events(max.session_id)).filter(record => record.kind === "native_record").map(record => JSON.parse(record.native!));
+    assert(nativeRecords.some(record => record.fixture === "launch" && record.reasoning === "max"));
+    assert(nativeRecords.some(record => record.fixture === "turn" && record.reasoning === "max"));
+    assert.equal((await client.start("bb-max", "codex", { model: "fixture", reasoning: "max" })).session_id, max.session_id);
+    await client.close(max.session_id, "max-close");
+    await until(async () => (await client.session(max.session_id)).state === "closed");
     const started = await client.start("bb-create");
     const id = started.session_id;
     await until(async () => (await client.session(id)).state === "idle");

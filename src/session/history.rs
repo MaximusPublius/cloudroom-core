@@ -26,8 +26,10 @@ impl History {
         } else {
             options = options.ssl_mode(PgSslMode::VerifyFull);
         }
+        // Many sandboxes share one database pooler: release idle connections quickly.
         let pool = PgPoolOptions::new()
             .max_connections(2)
+            .idle_timeout(Duration::from_secs(60))
             .acquire_timeout(Duration::from_secs(2))
             .connect_lazy_with(options);
         Ok(Self {
@@ -55,12 +57,16 @@ impl History {
         for record in records {
             let text = serde_json::to_string(record).map_err(|e| sqlx::Error::Decode(e.into()))?;
             // A lost commit reply may cause retransmission. Only identical content is a retry.
-            let matches: bool = sqlx::query_scalar(
+            // Insert-only, so the database login never needs permission to change history.
+            let inserted = sqlx::query(
                 "INSERT INTO cloudroom_records (store, session_id, sequence, record) VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (store, session_id, sequence) DO UPDATE SET record=cloudroom_records.record \
-                 RETURNING record=$4")
+                 ON CONFLICT (store, session_id, sequence) DO NOTHING")
                 .bind(&self.store).bind(&record.session_id).bind(record.sequence as i64)
-                .bind(text).fetch_one(&mut *tx).await?;
+                .bind(&text).execute(&mut *tx).await?.rows_affected() == 1;
+            let matches = inserted || sqlx::query_scalar::<_, bool>(
+                "SELECT record=$4 FROM cloudroom_records WHERE store=$1 AND session_id=$2 AND sequence=$3")
+                .bind(&self.store).bind(&record.session_id).bind(record.sequence as i64)
+                .bind(&text).fetch_one(&mut *tx).await?;
             if !matches {
                 return Err(sqlx::Error::Protocol("conflicting history record".into()));
             }
