@@ -268,8 +268,13 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     let info = initialize(handle).await?;
     if let Some(reasoning) = &handle.reasoning {
         let models = model_catalog(&info)?;
-        super::supports(&models, &handle.profile.model, reasoning)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        super::supports(
+            super::Kind::Claude,
+            &models,
+            &handle.profile.model,
+            reasoning,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         if reasoning != "none" {
             handle
                 .call(
@@ -528,6 +533,8 @@ pub(super) struct Protocol {
     blocks: HashMap<u64, Value>,
     streamed: HashSet<String>,
     tools: HashMap<String, String>,
+    // The last model call's prompt size; `result.usage` sums every call in the turn.
+    context: Option<u64>,
 }
 impl Protocol {
     pub(super) fn new(
@@ -556,6 +563,7 @@ impl Protocol {
             blocks: HashMap::new(),
             streamed: HashSet::new(),
             tools: HashMap::new(),
+            context: None,
         })
     }
     fn reply_control(id: &str, response: Value) -> Value {
@@ -798,6 +806,7 @@ impl Adapter for Protocol {
         }
         if kind == "system" && value["subtype"] == "compact_boundary" {
             self.compacted = true;
+            self.context = value["compact_metadata"]["post_tokens"].as_u64();
         }
         let request = self.active.as_ref().map(|(_, id)| id.clone());
         let mut data = json!({"harness":"claude-code","type":kind,"request_id":request});
@@ -888,6 +897,12 @@ impl Adapter for Protocol {
             events.push(Event::Authentication { accepted: false });
         }
         if kind == "assistant"
+            && let Some(tokens) = prompt_tokens(&value["message"]["usage"])
+            && tokens > 0
+        {
+            self.context = Some(tokens);
+        }
+        if kind == "assistant"
             && let Some(content) = value["message"]["content"].as_array()
         {
             let text = content
@@ -976,7 +991,7 @@ impl Adapter for Protocol {
                 .as_ref()
                 .is_some_and(|(id, _)| ids.contains(id.as_str()))
             {
-                state.last_usage = usage(value);
+                state.last_usage = usage(value, self.context);
                 data["usage"] = state.last_usage.clone();
                 let status = if self.interrupting {
                     "interrupted"
@@ -1088,7 +1103,20 @@ fn result_error(value: &Value) -> String {
     }
 }
 
-fn usage(value: &Value) -> Value {
+fn prompt_tokens(usage: &Value) -> Option<u64> {
+    usage.is_object().then(|| {
+        [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .map(|key| usage[key].as_u64().unwrap_or(0))
+        .sum()
+    })
+}
+
+fn usage(value: &Value, context: Option<u64>) -> Value {
     let mut input = 0u64;
     let mut output = 0u64;
     let mut read = 0u64;
@@ -1107,10 +1135,8 @@ fn usage(value: &Value) -> Value {
         window = window.max(model["contextWindow"].as_u64());
     }
     let last = &value["usage"];
-    let used = last["input_tokens"].as_u64().unwrap_or(0)
-        + last["cache_read_input_tokens"].as_u64().unwrap_or(0)
-        + last["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-    json!({"contextUsage":{"tokens":used,"contextWindow":window},"tokens":{"input":input,"output":output,"cacheRead":read,"cacheWrite":write,"total":input+output+read+write},"lastUsage":{"input":last["input_tokens"],"output":last["output_tokens"],"cacheRead":last["cache_read_input_tokens"],"cacheWrite":last["cache_creation_input_tokens"],"totalTokens":used+last["output_tokens"].as_u64().unwrap_or(0)},"estimated_cost_usd":value["total_cost_usd"]})
+    let used = prompt_tokens(last).unwrap_or(0);
+    json!({"contextUsage":{"tokens":context.unwrap_or(used),"contextWindow":window},"tokens":{"input":input,"output":output,"cacheRead":read,"cacheWrite":write,"total":input+output+read+write},"lastUsage":{"input":last["input_tokens"],"output":last["output_tokens"],"cacheRead":last["cache_read_input_tokens"],"cacheWrite":last["cache_creation_input_tokens"],"totalTokens":used+last["output_tokens"].as_u64().unwrap_or(0)},"estimated_cost_usd":value["total_cost_usd"]})
 }
 
 struct Capture {

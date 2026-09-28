@@ -34,6 +34,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/accounts/claude/{action}", post(claude_account))
         .route("/v1/accounts/pi", get(pi_auth))
         .route("/v1/accounts/pi/import", post(pi_import))
+        .route("/v1/accounts/pi/setup", post(pi_setup))
         .route("/v1/accounts/pi/key", post(pi_key))
         .route("/v1/accounts/codex", get(codex_auth))
         .route("/v1/accounts/codex/login", post(codex_login))
@@ -71,6 +72,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/sessions/{id}/prompts", post(prompt))
         .route("/v1/sessions/{id}/edit", post(edit))
         .route("/v1/sessions/{id}/cancel", post(cancel))
+        .route("/v1/sessions/{id}/reorder", post(reorder))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/compact", post(compact))
         .route("/v1/sessions/{id}/rewind", post(rewind))
@@ -218,6 +220,26 @@ async fn pi_import(
     let result =
         crate::runtime::pi_auth::import(&manager.config, &manager.storage, credentials).await;
     Ok(Json(result.map_err(pi_error)?))
+}
+/// Copies the Mac's custom Pi providers and installs its packages in the background.
+async fn pi_setup(
+    State(manager): State<Arc<Manager>>,
+    Json(setup): Json<Value>,
+) -> Result<Json<Value>> {
+    if manager.is_stopping() {
+        return Err(session::Error::Conflict("service is stopping"));
+    }
+    let (result, missing) =
+        crate::runtime::pi_auth::setup(&manager.config, &manager.storage, setup)
+            .await
+            .map_err(pi_error)?;
+    if !missing.is_empty() {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            crate::runtime::pi_auth::install(&manager.config, &manager.storage, missing).await
+        });
+    }
+    Ok(Json(result))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -582,6 +604,12 @@ struct Target {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Reorder {
+    request_id: String,
+    order: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Steer {
     request_id: String,
     target_request_id: String,
@@ -891,6 +919,19 @@ async fn cancel(
         "cancel",
         json!({"target_request_id":body.target_request_id}),
     )?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn reorder(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Reorder>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    for target in &body.order {
+        key(target)?;
+    }
+    let receipt = manager.command(&id, body.request_id, "reorder", json!({"order":body.order}))?;
     Ok(accepted(&manager, &id, receipt))
 }
 

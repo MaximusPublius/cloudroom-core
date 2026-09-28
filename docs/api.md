@@ -31,6 +31,7 @@ Commands, all `POST /v1/sessions/{id}/...` with a `request_id`:
 - `prompts`: send a message. Body: `text`, plus optional `content`, `attachments`, `reasoning` and `service_tier`. Messages sent while busy queue in order.
 - `edit`: replace a queued message. Adds `target_request_id` and `expected_revision`.
 - `cancel`: remove a queued message (`target_request_id`).
+- `reorder`: set the queue order (`order`: request IDs). Unlisted queued messages keep their place after the listed ones.
 - `steer`: add guidance to the running turn (`target_request_id`, `text`), where the harness supports it.
 - `interrupt`: stop the current turn (`target_request_id`). Queued messages continue.
 - `stop` and `resume`: pause and restart the queue.
@@ -64,7 +65,7 @@ Harness logins run on the VM. Responses report status and sign-in links, never t
 - Codex: `GET /v1/accounts/codex`; `POST .../login`, `.../import`, `.../switched`, `.../cancel`.
 - Claude Code: `GET /v1/accounts/claude`; `POST .../{login|cancel|complete|token}`.
 - Cursor: `GET /v1/accounts/cursor`; `POST .../{login|cancel|key}`.
-- Pi: `GET /v1/accounts/pi`; `POST .../import`, `.../key`.
+- Pi: `GET /v1/accounts/pi`; `POST .../import`, `.../key`, `.../setup`.
 
 ## Workspaces, sync, previews and transfers
 

@@ -196,9 +196,20 @@ class Tree:
                 except FileNotFoundError:
                     pass
 
+    def known_rollout(self, native_id):
+        # Codex resumes a conversation it already knows only from that saved path.
+        # Its dated folders win over teleport/ copies left by earlier failed transfers.
+        found = []
+        for folder, _, names in os.walk(self.root):
+            for name in names:
+                if name.endswith(f'-{native_id}.jsonl'):
+                    relative = os.path.relpath(os.path.join(folder, name), self.root)
+                    found.append((not relative.startswith('teleport/'), os.lstat(os.path.join(folder, name)).st_mtime, relative))
+        return max(found)[2] if found else None
+
     def install_transfer(self, request, stream):
-        relative = request['path']
         native = request.get('native')
+        relative = (native and native['harness'] == 'codex' and self.known_rollout(native['id'])) or request['path']
         digest = hashlib.sha256()
         count = 0
         with self.parent(relative, create=True) as (fd, name):
@@ -244,7 +255,11 @@ class Tree:
                             while chunk := existing.read(CHUNK): checksum.update(chunk)
                             return checksum.digest()
                     if checksum(name) != checksum(temporary):
-                        raise Conflict('transfer destination changed')
+                        if not native:
+                            raise Conflict('transfer destination changed')
+                        # A returning conversation replaces the VM's older copy, which stays beside it.
+                        os.link(name, f'{name}.before-teleport-{uuid.uuid4().hex}', src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+                        os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
                 os.fsync(fd)
             finally:
                 try: os.unlink(temporary, dir_fd=fd)
@@ -654,6 +669,27 @@ def worker():
             data = json.dumps({**current, **{name: request['credentials'][name] for name in added}}, indent=2).encode()
             tree.apply('auth.json', expected, transfer(io.BytesIO(data), 'file', False), io.BytesIO(data))
         result = {'providers': sorted({*current, *added}), 'added': added}
+    elif op == 'pi_setup':
+        # The Mac's custom providers replace same-named VM providers; VM-only providers stay.
+        if tree.filename != 'models.json' or not isinstance(request['providers'], dict):
+            raise ValueError('invalid Pi setup request')
+        try:
+            with tree.snapshot('models.json') as (previous, data):
+                expected, current = previous['tag'], json.load(data)
+        except FileNotFoundError:
+            expected, current = None, {}
+        if not isinstance(current, dict) or not isinstance(current.get('providers', {}), dict):
+            raise ValueError('invalid Pi models file')
+        providers = {**current.get('providers', {}), **request['providers']}
+        if providers != current.get('providers', {}):
+            data = json.dumps({**current, 'providers': providers}, indent=2).encode()
+            tree.apply('models.json', expected, transfer(io.BytesIO(data), 'file', False), io.BytesIO(data))
+        try:
+            with Tree(tree.root, 'auth', 'settings.json').snapshot('settings.json') as (_, data):
+                packages = json.load(data).get('packages', [])
+        except FileNotFoundError:
+            packages = []
+        result = {'providers': sorted(providers), 'packages': packages if isinstance(packages, list) else []}
     elif op == 'apply':
         tree.apply(request['path'], request['expected'], request.get('entry'), sys.stdin.buffer)
         result = {}

@@ -212,6 +212,28 @@ impl Local {
                 {
                     session.queue.retain(|id| id != target);
                 }
+                if receipt.command == "reorder"
+                    && receipt.state == "accepted"
+                    && !session.receipts.contains_key(&receipt.request_id)
+                    && let Some(order) = receipt.input["order"].as_array()
+                {
+                    // Listed requests go first in the new order. Anything queued since, or
+                    // missing from a stale list, keeps its place after them.
+                    let mut queue: Vec<String> = order
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|id| session.queue.iter().any(|queued| queued == id))
+                        .map(str::to_owned)
+                        .collect();
+                    let rest: Vec<String> = session
+                        .queue
+                        .iter()
+                        .filter(|id| !queue.contains(id))
+                        .cloned()
+                        .collect();
+                    queue.extend(rest);
+                    session.queue = queue;
+                }
                 if receipt.command == "compact" {
                     let terminal = matches!(
                         receipt.state.as_str(),

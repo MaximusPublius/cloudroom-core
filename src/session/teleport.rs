@@ -180,6 +180,15 @@ fn validate(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// A closed session gave its conversation back (Teleport to Local).
+fn native_in_use(local: &super::Local, native_id: &str) -> bool {
+    local.sessions.values().any(|s| {
+        s.native_id.as_deref() == Some(native_id)
+            && s.state != "closed"
+            && s.close_request.is_none()
+    })
+}
+
 impl Manager {
     fn transfer_directory(&self, id: &str) -> Result<PathBuf> {
         if !valid_id(id) {
@@ -308,8 +317,14 @@ impl Manager {
                 Err(error) => return fail("models_unavailable", error.message(), None),
             };
             let supported = match reasoning {
-                Some(reasoning) => runtime::supports(&models, &check.model, reasoning),
-                None if models.iter().any(|entry| entry.model == check.model) => Ok(()),
+                Some(reasoning) => {
+                    runtime::supports(check.harness, &models, &check.model, reasoning)
+                }
+                None if runtime::reasoning_levels(check.harness, &models, &check.model)
+                    .is_some() =>
+                {
+                    Ok(())
+                }
                 None => Err(format!("model {} is not offered on this VM", check.model)),
             };
             if let Err(error) = supported {
@@ -523,6 +538,14 @@ impl Manager {
             file.sync_all()?;
         }
         if file.metadata()?.len() == entry.size {
+            // Installing replaces the VM's older copy of this conversation.
+            if entry.kind == "native"
+                && native_in_use(&self.local.lock().unwrap(), &transfer.manifest.native_id)
+            {
+                return Err(Error::Conflict(
+                    "native conversation already belongs to a cloud session",
+                ));
+            }
             let native = if entry.kind == "native" {
                 Some((
                     self.config
@@ -785,12 +808,7 @@ impl Manager {
                     "service is stopping or disk protection is blocking writes".into(),
                 ));
             }
-            // A closed session gave its conversation back (Teleport to Local).
-            if local.sessions.values().any(|s| {
-                s.native_id.as_deref() == Some(&manifest.native_id)
-                    && s.state != "closed"
-                    && s.close_request.is_none()
-            }) {
+            if native_in_use(&local, &manifest.native_id) {
                 return Err(Error::Conflict(
                     "native conversation already belongs to a cloud session",
                 ));

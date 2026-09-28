@@ -9,6 +9,7 @@ mod history;
 mod prompt;
 mod sleep;
 mod state;
+pub mod thread;
 
 use crate::{
     config::Config,
@@ -608,20 +609,18 @@ impl Manager {
         &self,
         kind: runtime::Kind,
         model: Option<&String>,
-        reasoning: &String,
+        reasoning: &str,
     ) -> Result<()> {
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
                 let models = self.model_catalog(kind).await?;
                 let selected = model.unwrap_or(&self.config.harnesses[&kind].model);
-                let entry = models
-                    .iter()
-                    .find(|entry| &entry.model == selected)
-                    .ok_or(Error::Conflict("invalid model"))?;
-                entry.reasoning_levels.contains(reasoning)
+                runtime::reasoning_levels(kind, &models, selected)
+                    .ok_or(Error::Conflict("invalid model"))?
+                    .contains(&reasoning)
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
-                runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str())
+                runtime::PI_REASONING_LEVELS.contains(&reasoning)
             }
         };
         if !supported {
@@ -959,6 +958,7 @@ impl Manager {
                     | "resume"
                     | "edit"
                     | "cancel"
+                    | "reorder"
                     | "steer"
                     | "compact"
                     | "rewind"
@@ -1154,7 +1154,7 @@ impl Manager {
                     self.wake(&mut local, id)?;
                     Next::None
                 }
-                "edit" | "cancel" | "attach" => {
+                "edit" | "cancel" | "reorder" | "attach" => {
                     local.finish_receipt(id, &request, "completed")?;
                     Next::None
                 }

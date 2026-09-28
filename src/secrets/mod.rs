@@ -104,7 +104,7 @@ pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
 }
 
 /// The caller and its parents, so a command run by a harness maps to that harness's session.
-fn ancestors(mut pid: i32) -> Vec<u32> {
+pub(crate) fn ancestors(mut pid: i32) -> Vec<u32> {
     let mut found = Vec::new();
     while pid > 1 && found.len() < 64 {
         found.push(pid as u32);

@@ -27,7 +27,7 @@ Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/t
 
 ## Claude Code
 
-`src/runtime/claude.rs` integrates the native CLI through stream JSON, without an SDK bridge. Core discovers `CLOUDROOM_ACCOUNT_HOME/.local/bin/claude`, then `/usr/local/bin/claude`, when the account's `.claude` directory exists. Prepare both before restarting core. No Claude-specific service variables are needed. Core resolves the executable path at startup: restart it safely after upgrading the CLI to use the new binary and model catalog. Opus 5.5 requires Claude Code **2.1.280+**. The default model is `sonnet`; session creation can select another native model. `CLOUDROOM_HARNESS=claude-code` selects Claude as the default harness.
+`src/runtime/claude.rs` integrates the native CLI through stream JSON, without an SDK bridge. Core discovers `CLOUDROOM_ACCOUNT_HOME/.local/bin/claude`, then `/usr/local/bin/claude`, when the account's `.claude` directory exists. Prepare both before restarting core. No Claude-specific service variables are needed. Core resolves the executable path at startup: restart it safely after upgrading the CLI to use the new binary and model catalog. Opus 5.5 requires Claude Code **2.1.280+**. The default model is `sonnet`; session creation can select another native model. Core also accepts exact models Claude's catalog omits, such as `claude-opus-5-5[1m]`, at any effort the catalog lists; Claude reports an unknown model itself. `CLOUDROOM_HARNESS=claude-code` selects Claude as the default harness.
 
 ### Native subscription login
 
@@ -65,7 +65,9 @@ The desktop helper attempts this import before showing sign-in or starting Codex
 
 ## Cloud Pi logins
 
-With `pi_auth_import`, the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when the Mac file changes. VM logins always win. `!command` keys stay on the Mac because their secret managers are Mac-only. Keys set only as shell variables are not copied.
+Only after the user agrees in first-run setup ([ADR 0130](../../docs/adr/0130-reuse-local-logins-and-keys.md)), the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when a Mac Pi file changes. VM logins always win. `!command` and `$VAR` keys are resolved on the Mac first, because the VM cannot run Mac secret managers or see Mac shell variables; unresolved keys are skipped.
+
+With `pi_setup`, the helper also copies custom providers from `models.json` (Mac wins per provider; VM-only providers stay), syncs `extensions/`, and sends the `packages` list from `settings.json`. `POST /v1/accounts/pi/setup` saves the providers and runs `pi install` in the background for remote packages the VM lacks. Local-path packages stay on the Mac.
 
 `GET /v1/accounts/pi` lists provider names, never secrets. `POST /v1/accounts/pi/import` adds valid missing providers. `POST /v1/accounts/pi/key` with `{"provider","key"}` saves or replaces one API key; the CLI is `cloudroom cloud pi key PROVIDER`, reading the key from stdin. Copied OAuth logins refresh separately on each machine, so one side may need to sign in again.
 

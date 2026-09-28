@@ -51,25 +51,39 @@ pub struct Model {
     pub reasoning_levels: Vec<String>,
 }
 
+/// Effort levels the catalog allows for `model`, or `None` when the model is not offered.
+/// Claude also runs exact models its catalog omits, such as `claude-opus-5-5[1m]`, so Cloud
+/// accepts what Local accepts (ADR 0133) and Claude itself reports an unknown model.
+pub fn reasoning_levels<'a>(kind: Kind, models: &'a [Model], model: &str) -> Option<Vec<&'a str>> {
+    if let Some(entry) = models.iter().find(|entry| entry.model == model) {
+        return Some(entry.reasoning_levels.iter().map(String::as_str).collect());
+    }
+    (kind == Kind::Claude).then(|| {
+        let mut levels = Vec::new();
+        for level in models.iter().flat_map(|entry| &entry.reasoning_levels) {
+            if !levels.contains(&level.as_str()) {
+                levels.push(level.as_str());
+            }
+        }
+        levels
+    })
+}
+
 /// One detailed answer for "can this catalog run this model at this effort?" (ADR 0123).
-pub fn supports(models: &[Model], model: &str, reasoning: &str) -> Result<(), String> {
-    let Some(entry) = models.iter().find(|entry| entry.model == model) else {
+pub fn supports(kind: Kind, models: &[Model], model: &str, reasoning: &str) -> Result<(), String> {
+    let Some(levels) = reasoning_levels(kind, models, model) else {
         let offered: Vec<&str> = models.iter().map(|entry| entry.model.as_str()).collect();
         return Err(format!(
             "model {model} is not offered on this VM; offered models: {}",
             offered.join(", ")
         ));
     };
-    if entry
-        .reasoning_levels
-        .iter()
-        .any(|level| level == reasoning)
-    {
+    if levels.contains(&reasoning) {
         return Ok(());
     }
     Err(format!(
         "model {model} does not support {reasoning} effort on this VM; supported: {}",
-        entry.reasoning_levels.join(", ")
+        levels.join(", ")
     ))
 }
 

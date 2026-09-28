@@ -31,6 +31,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if args.first().map(String::as_str) == Some("thread") {
+        match cloudroom::session::thread::cli(&args[1..]).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) == Some("--secrets-skill") {
         print!("{}", cloudroom::secrets::SKILL);
         return Ok(());
@@ -69,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The service starts without arguments; anything else is a mistyped agent command.
     if let Some(command) = args.first() {
         eprintln!(
-            "Unknown command {command}. Use cloudroom preview, cloudroom mac, or cloudroom secret."
+            "Unknown command {command}. Use cloudroom preview, cloudroom mac, cloudroom secret, or cloudroom thread."
         );
         std::process::exit(2);
     }

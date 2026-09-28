@@ -608,6 +608,15 @@ export class CloudroomClient {
     );
   }
 
+  reorder(sessionId: string, id: string, order: string[]) {
+    return this.#command(
+      `${sessionPath(sessionId)}/reorder`,
+      "reorder",
+      { request_id: id, order: order.map(requestId) },
+      sessionId,
+    );
+  }
+
   steer(sessionId: string, id: string, targetRequestId: string, text: string) {
     if (!text.trim() || new TextEncoder().encode(text).length > 32768) {
       throw new CloudroomError("Prompt must contain 1–32768 bytes of text");

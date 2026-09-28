@@ -181,13 +181,9 @@ impl Manager {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
                 let models = self.model_catalog(kind).await?;
                 let selected = model.ok_or(Error::Conflict("invalid model"))?;
-                models
-                    .iter()
-                    .find(|entry| entry.model == selected)
+                runtime::reasoning_levels(kind, &models, &selected)
                     .ok_or(Error::Conflict("invalid model"))?
-                    .reasoning_levels
-                    .iter()
-                    .any(|level| level == reasoning)
+                    .contains(&reasoning)
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)

@@ -1,11 +1,12 @@
-//! Pi provider logins on the VM. The Mac helper copies providers the VM lacks; users can also set one key.
-use super::Kind;
+//! Pi setup on the VM. The Mac helper copies logins the VM lacks, custom providers, and packages (ADR 0130); users can also set one key.
+use super::{Kind, command as child_command};
 use crate::{config::Config, workspace::storage::Guard};
 use serde_json::{Map, Value, json};
 use std::{io, process::Stdio, time::Duration};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
+const MAX_PROVIDER_BYTES: usize = 256 * 1024;
 
 fn name(value: &str, extra: &[u8]) -> bool {
     !value.is_empty()
@@ -49,17 +50,21 @@ fn entry(value: &Value) -> Option<Value> {
     }
 }
 
-async fn update(
-    config: &Config,
-    storage: &Guard,
-    credentials: Map<String, Value>,
-    replace: bool,
-) -> io::Result<Value> {
-    let home = &config
+fn profile(config: &Config) -> io::Result<&crate::config::HarnessConfig> {
+    config
         .harnesses
         .get(&Kind::Pi)
-        .ok_or_else(|| io::Error::other("Pi is not configured"))?
-        .home;
+        .ok_or_else(|| io::Error::other("Pi is not configured"))
+}
+
+/// Runs one private-file operation in `sync/files.py` on a file in Pi's home.
+async fn helper(
+    config: &Config,
+    storage: &Guard,
+    filename: &str,
+    mut request: Value,
+) -> io::Result<Value> {
+    request["tree"] = json!({"root":profile(config)?.home,"kind":"auth","filename":filename});
     let mut command = Command::new("python3");
     command
         .env_clear()
@@ -72,7 +77,6 @@ async fn update(
     let (mut child, _workload) = storage.spawn_writer(&mut command)?;
     let mut stdin = child.stdin.take().unwrap();
     // Keys travel only over private stdin, never process arguments or diagnostic records.
-    let request = json!({"op":"pi_auth","tree":{"root":home,"kind":"auth","filename":"auth.json"},"credentials":credentials,"replace":replace});
     stdin.write_all(&serde_json::to_vec(&request)?).await?;
     stdin.write_all(b"\n").await?;
     drop(stdin);
@@ -80,10 +84,21 @@ async fn update(
     let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
     if !output.status.success() || result["ok"] != true {
         return Err(io::Error::other(format!(
-            "Pi login file update failed ({})",
+            "Pi file update failed ({})",
             result["error"].as_str().unwrap_or("no helper result")
         )));
     }
+    Ok(result)
+}
+
+async fn update(
+    config: &Config,
+    storage: &Guard,
+    credentials: Map<String, Value>,
+    replace: bool,
+) -> io::Result<Value> {
+    let request = json!({"op":"pi_auth","credentials":credentials,"replace":replace});
+    let result = helper(config, storage, "auth.json", request).await?;
     Ok(json!({"providers":result["providers"],"added":result["added"]}))
 }
 
@@ -120,4 +135,113 @@ pub(crate) async fn set_key(
         ));
     }
     update(config, storage, Map::from_iter([(provider, value)]), true).await
+}
+
+/// A custom provider from the Mac's `models.json`. `!command` values ran on the Mac already;
+/// any left over would run Mac-only secret managers, so they are dropped.
+fn provider(value: &Value) -> Option<Value> {
+    let mut value = value.clone();
+    let provider = value.as_object_mut()?;
+    if provider
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .is_some_and(|key| key.starts_with('!'))
+    {
+        provider.remove("apiKey");
+    }
+    if let Some(headers) = provider.get_mut("headers").and_then(Value::as_object_mut) {
+        headers.retain(|_, value| !value.as_str().is_some_and(|value| value.starts_with('!')));
+    }
+    (serde_json::to_vec(&value).ok()?.len() <= MAX_PROVIDER_BYTES).then_some(value)
+}
+
+/// Package sources the VM can fetch itself. Local paths only exist on the Mac.
+fn remote_package(value: &Value) -> Option<String> {
+    let source = value.as_str().or_else(|| value["source"].as_str())?;
+    (source.len() <= 1024
+        && !source.chars().any(|c| c.is_whitespace() || c.is_control())
+        && ["npm:", "git:", "https://", "http://", "ssh://", "git://"]
+            .iter()
+            .any(|prefix| source.starts_with(prefix)))
+    .then(|| source.to_owned())
+}
+
+/// Saves the Mac's custom providers (Mac wins per provider) and returns packages the VM still needs.
+pub(crate) async fn setup(
+    config: &Config,
+    storage: &Guard,
+    value: Value,
+) -> io::Result<(Value, Vec<String>)> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid Pi setup");
+    let providers: Map<String, Value> = value["providers"]
+        .as_object()
+        .ok_or_else(invalid)?
+        .iter()
+        .filter(|(name, _)| self::name(name, b"-."))
+        .filter_map(|(name, value)| Some((name.clone(), provider(value)?)))
+        .collect();
+    let packages: Vec<String> = value["packages"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .filter_map(remote_package)
+        .collect();
+    let result = helper(
+        config,
+        storage,
+        "models.json",
+        json!({"op":"pi_setup","providers":providers}),
+    )
+    .await?;
+    let installed: Vec<&str> = result["packages"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().or_else(|| item["source"].as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let missing: Vec<String> = packages
+        .into_iter()
+        .filter(|source| !installed.contains(&source.as_str()))
+        .collect();
+    Ok((
+        json!({"providers":result["providers"],"installing":missing}),
+        missing,
+    ))
+}
+
+/// Installs packages one at a time with the VM's own Pi, the same as `pi install` in a terminal.
+pub(crate) async fn install(config: &Config, storage: &Guard, packages: Vec<String>) {
+    static RUNNING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _running = RUNNING.lock().await;
+    let Ok(profile) = profile(config) else { return };
+    for source in packages {
+        let mut command = child_command(&profile.binary, config);
+        command
+            .env("PI_CODING_AGENT_DIR", &profile.home)
+            .env("PI_TELEMETRY", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(&config.account_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .args(["install", &source]);
+        let installed = async {
+            let (child, _workload) = storage.spawn_writer(&mut command)?;
+            let output = tokio::time::timeout(Duration::from_secs(300), child.wait_with_output())
+                .await
+                .map_err(|_| io::Error::other("timed out"))??;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(output.status.to_string()))
+            }
+        }
+        .await;
+        if let Err(error) = installed {
+            eprintln!("Pi package install failed for {source}: {error}");
+        }
+    }
 }

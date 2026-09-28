@@ -157,6 +157,11 @@ impl Sync {
                 "skills",
                 None,
             ),
+            "extensions-pi" => (
+                profile(runtime::Kind::Pi, ".pi/agent").join("extensions"),
+                "skills",
+                None,
+            ),
             "skills-claude" => (home.join(".claude/skills"), "skills", None),
             "skills-cursor" => (home.join(".cursor/skills"), "skills", None),
             "rules-cursor" => (home.join(".cursor/rules"), "skills", None),

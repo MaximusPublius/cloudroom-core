@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -135,9 +136,29 @@ def busy(values):
                                        '/srv/cloudroom/agent/.local/share/claude/versions/', '/opt/ascii-agent/'))
                        or Path(exe).name in ('codex', 'codex-code-mode')
                        or any(a.endswith(b'/codex.js') for a in args[1:3]))
-            if not harness:
+            if not harness and not mcp_server(pid):
                 return 'running tool ' + Path(exe).name
     return None
+
+
+# `@playwright/mcp@latest`, `playwright-mcp`, `mcp-server-git`: MCP servers launched by a harness.
+MCP_ARG = re.compile(rb'(^|[/@])([\w.]+-)*mcp(-[\w.]+)*(@[\w.]+)?$')
+
+
+def mcp_server(pid):
+    """MCP servers and their children belong to their harness and restart with it."""
+    for _ in range(8):
+        try:
+            args = Path('/proc', pid, 'cmdline').read_bytes().split(b'\0')
+            pid = next(line.split()[1] for line in Path('/proc', pid, 'status').read_text().splitlines()
+                       if line.startswith('PPid:'))
+        except (OSError, StopIteration):
+            return False
+        if any(MCP_ARG.search(arg) for arg in args[:4]):
+            return True
+        if pid in ('0', '1'):
+            return False
+    return False
 
 
 def gate(values, on):
