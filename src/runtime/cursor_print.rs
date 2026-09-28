@@ -26,6 +26,8 @@ struct State {
     session: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
+    models: Vec<String>,
+    fast: bool,
     turn: Option<Arc<Turn>>,
 }
 
@@ -34,8 +36,23 @@ static STATE: Mutex<State> = Mutex::new(State {
     session: None,
     cwd: None,
     model: None,
+    models: Vec::new(),
+    fast: false,
     turn: None,
 });
+
+impl State {
+    /// The selected model, or its `-fast` twin while Fast is on and Cursor offers one.
+    fn variant(&self) -> Option<String> {
+        let model = self.model.clone()?;
+        let fast = format!("{model}-fast");
+        Some(if self.fast && self.models.contains(&fast) {
+            fast
+        } else {
+            model
+        })
+    }
+}
 
 pub fn run(binary: &str) -> io::Result<()> {
     STATE.lock().unwrap().binary = binary.to_owned();
@@ -122,6 +139,9 @@ fn open_session(request: &Value, session: &str, cwd: &str) -> io::Result<()> {
     let mut state = STATE.lock().unwrap();
     state.session = Some(session.to_owned());
     state.cwd = Some(cwd.to_owned());
+    state.models = (models.iter())
+        .filter_map(|model| model["modelId"].as_str().map(str::to_owned))
+        .collect();
     drop(state);
     // Cursor stores print-mode chats under chats/<md5 of the working folder>/<chat ID>.
     let store = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
@@ -186,11 +206,7 @@ impl Turn {
     fn start(request: &Value, text: String) -> io::Result<()> {
         let (session, cwd, model) = {
             let state = STATE.lock().unwrap();
-            (
-                state.session.clone(),
-                state.cwd.clone(),
-                state.model.clone(),
-            )
+            (state.session.clone(), state.cwd.clone(), state.variant())
         };
         let (Some(session), Some(cwd)) = (session, cwd) else {
             return Err(io::Error::other("Cursor turn has no session"));
@@ -386,6 +402,15 @@ fn handle(message: &Value) {
                 reply(
                     request,
                     Ok(json!({"configOptions":[{"id":"model","currentValue":params["value"]}]})),
+                );
+            }
+            // Cursor's own ACP names Fast the same way: a "fast" option set to "true" or "false".
+            "session/set_config_option" if params["configId"] == "fast" => {
+                let value = field("value")?;
+                STATE.lock().unwrap().fast = value == "true";
+                reply(
+                    request,
+                    Ok(json!({"configOptions":[{"id":"fast","currentValue":value}]})),
                 );
             }
             "session/prompt" => {

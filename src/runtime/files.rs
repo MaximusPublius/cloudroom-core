@@ -155,7 +155,7 @@ fn open_entry(root: &Path, path: &Path, identity: Identity, directory: bool) -> 
         .stdout(Stdio::from(OwnedFd::from(child_socket)))
         .stderr(Stdio::null());
     if let Some((uid, gid)) = identity {
-        super::linux::as_agent(&mut command, uid, gid, None)?;
+        super::linux::as_agent(&mut command, uid, gid, None, true)?;
     }
     let mut child = command.as_std_mut().spawn()?;
     drop(command);

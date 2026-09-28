@@ -44,6 +44,7 @@ pub const FEATURES: &[&str] = &[
     "usage",
     "subagents",
     "session_list",
+    "drain",
 ];
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {

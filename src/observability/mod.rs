@@ -149,8 +149,14 @@ impl Observability {
         let this = Self {
             sender,
             stderr,
+            // Many sandboxes share one store: their label keeps each one's runs apart.
             run_id: Arc::new(format!(
-                "{:016x}",
+                "{}{:016x}",
+                config
+                    .instance
+                    .as_ref()
+                    .map(|label| format!("{label}-"))
+                    .unwrap_or_default(),
                 RandomState::new().hash_one(SystemTime::now())
             )),
             sequence: Arc::new(AtomicU64::new(0)),
@@ -158,7 +164,11 @@ impl Observability {
             stop,
             finished,
             resources: watch::channel((None, json!({"cpu":null,"memory":null,"disk":null}))).0,
-            metrics: Arc::new(metrics::History::new(pool.clone(), config.store.clone())),
+            metrics: Arc::new(metrics::History::new(
+                pool.clone(),
+                config.store.clone(),
+                config.instance.clone(),
+            )),
         };
         let config = config.clone();
         let worker = this.clone();

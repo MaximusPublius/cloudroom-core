@@ -17,6 +17,9 @@ pub struct Policy {
     pub agent_gid: u32,
     pub cache_dir: PathBuf,
     pub cgroup_root: PathBuf,
+    /// Sandbox deployments give agents sudo: the sandbox itself is the security boundary.
+    #[serde(default)]
+    pub agent_sudo: bool,
     #[serde(default = "warning")]
     pub warning_bytes: u64,
     #[serde(default = "pause")]
@@ -229,7 +232,7 @@ impl Guard {
             .as_ref()
             .map(|policy| {
                 let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
-                group.attach(command, policy.agent_uid, policy.agent_gid)?;
+                group.attach(command, policy)?;
                 Ok::<_, io::Error>(group)
             })
             .transpose()?;
@@ -305,7 +308,7 @@ impl Guard {
             .arg(&p.cache_dir)
             .arg(&p.cgroup_root)
             .kill_on_drop(true);
-        linux::as_agent(&mut command, p.agent_uid, p.agent_gid, None)?;
+        linux::as_agent(&mut command, p.agent_uid, p.agent_gid, None, true)?;
         let result = tokio::time::timeout(Duration::from_secs(5), command.output())
             .await
             .map_err(|_| io::Error::other("cache cleanup timed out"))??;

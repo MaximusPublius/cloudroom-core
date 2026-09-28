@@ -107,6 +107,14 @@ pub(super) struct Transfers {
     locks: std::sync::Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 impl Transfers {
+    /// A transfer is mid-request, so the machine must not stop now.
+    pub(super) fn busy(&self) -> bool {
+        self.locks
+            .lock()
+            .unwrap()
+            .values()
+            .any(|lock| lock.try_lock().is_err())
+    }
     fn lock(&self, id: &str) -> Arc<Mutex<()>> {
         self.locks
             .lock()
@@ -306,7 +314,7 @@ impl Manager {
         if let Err(error) = self.harness_ready(check.harness).await {
             return fail("login_required", error.message(), None);
         }
-        if check.service_tier.as_deref() == Some("fast") && check.harness != runtime::Kind::Codex {
+        if check.service_tier.as_deref() == Some("fast") && !check.harness.fast() {
             let error = format!("Cloud {harness} has no Fast mode; turn Fast off, then Teleport");
             return fail("setting_unavailable", error, None);
         }
@@ -365,6 +373,9 @@ impl Manager {
                 "service is stopping or the session journal is not writable".into(),
             ));
         }
+        if self.local.lock().unwrap().draining {
+            return Err(Error::Conflict("service is draining"));
+        }
         if !self.config.harnesses.contains_key(&manifest.harness) {
             return Err(Error::Conflict("harness is not configured"));
         }
@@ -422,8 +433,7 @@ impl Manager {
                 }
             }
             if let Some(tier) = input["service_tier"].as_str()
-                && (tier != "default"
-                    && !(tier == "fast" && manifest.harness == runtime::Kind::Codex))
+                && (tier != "default" && !(tier == "fast" && manifest.harness.fast()))
             {
                 return Err(Error::Conflict("invalid service tier"));
             }
@@ -707,6 +717,9 @@ impl Manager {
         retry_request: Option<String>,
     ) -> Result<Value> {
         self.transfer_directory(id)?;
+        if self.local.lock().unwrap().draining {
+            return Err(Error::Conflict("service is draining"));
+        }
         if retry_request
             .as_ref()
             .is_some_and(|request| !valid_id(request))

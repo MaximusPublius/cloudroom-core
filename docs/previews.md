@@ -15,6 +15,10 @@ Commands return JSON. Only `state: "ready"` includes a current laptop URL, such 
 
 The open command waits briefly for the helper, then returns pending rather than blocking cloud work. Readiness expires after 15 seconds without a helper report. Readiness checks the browser-facing local proxy through SSH to an HTTP server, not merely the SSH process. It does not mean the application passed its tests.
 
+## Sandboxes
+
+Cloud sandboxes have no inbound SSH. Their image writes `previews/setup.json` with `"tunnel": true` and no SSH fields. Pairing then returns `{"tunnel":true}`. The helper opens each preview connection as `GET /v1/previews/PORT/tunnel?device=ID` with `Upgrade: cloudroom-tunnel` and the core bearer token. Core rechecks the device, the registration, and the agent's listener, answers `101`, and joins the connection to `127.0.0.1:PORT`. Closing a preview or revoking the device ends its tunnels. Mac access uses the same pairing. The helper finds awake sandboxes through the website with the desktop token.
+
 ## Ownership
 
 - `src/preview/mod.rs`: registry, agent-only Unix socket, authenticated HTTP API, public SSH-key authorization, and CLI. Runs inside the existing core service. Registry writes stay in the protected state directory; no SQL.

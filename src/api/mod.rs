@@ -52,6 +52,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/dashboard", get(dashboard))
+        .route("/v1/drain", post(drain))
         .route("/v1/metrics", get(metrics))
         .route(
             "/v1/teleports",
@@ -264,6 +265,16 @@ async fn pi_key(
     Ok(Json(result.map_err(pi_error)?))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Drain {
+    hold: bool,
+}
+/// Sandbox hosts call this before stopping the machine (see session::sleep).
+async fn drain(State(manager): State<Arc<Manager>>, Json(input): Json<Drain>) -> Json<Value> {
+    Json(manager.drain(input.hold))
+}
+
 async fn codex_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
     Json(manager.codex_auth_status().await)
 }
@@ -406,8 +417,9 @@ async fn observe(
         .unwrap_or("unmatched")
         .to_owned();
     let mut response = next.run(request).await;
-    // The hosting gateway retains idle upstream sockets. Keep SSE streams, not completed requests.
+    // The hosting gateway retains idle upstream sockets. Keep SSE streams and upgraded tunnels, not completed requests.
     if matches!(version, Version::HTTP_10 | Version::HTTP_11)
+        && response.status() != StatusCode::SWITCHING_PROTOCOLS
         && !response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -510,6 +522,7 @@ impl IntoResponse for session::Error {
             "invalid workspace" | "workspace mapping unavailable" => "invalid_workspace",
             "storage unsafe; new execution is blocked" => "storage_blocked",
             "service is stopping" => "service_stopping",
+            "service is draining" => "service_draining",
             "model catalog unavailable" => "model_catalog_unavailable",
             "connect Codex before starting cloud work" => "codex_auth_required",
             "connect Claude Code before starting cloud work" => "claude_auth_required",

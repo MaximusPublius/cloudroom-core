@@ -1,4 +1,4 @@
-use super::{Adapter, Event, Handle, Progress, Resume, command as child_command};
+use super::{Adapter, Event, Handle, Kind, Progress, Resume, command as child_command};
 use crate::config::{Config, HarnessConfig};
 use serde_json::{Value, json};
 use std::{
@@ -39,10 +39,10 @@ pub(super) const CURSOR: Flavor = Flavor {
     notices: &[],
 };
 
-pub(crate) fn capabilities() -> Value {
+pub(crate) fn capabilities(kind: Kind) -> Value {
     json!({"resume":true,"interrupt":true,"system_notice":false,"interactive_dialogs":false,
         "steer":true,"compact":false,"rewind":false,"attachments":true,
-        "service_tier":false,"subagents":false,"usage":false,"command_guard":false})
+        "service_tier":kind.fast(),"subagents":false,"usage":false,"command_guard":false})
 }
 
 pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Command> {
@@ -133,6 +133,16 @@ pub(super) fn option_value<'a>(state: &'a Value, name: &str) -> Option<&'a str> 
 }
 
 pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<()> {
+    if handle.kind == Kind::Cursor {
+        // Fast is per turn: the driver runs the selected model's `-fast` variant when Cursor offers one.
+        let fast = input["service_tier"] == "fast";
+        handle
+            .call(
+                "session/set_config_option",
+                json!({"sessionId":handle.native()?,"configId":"fast","value":fast.to_string()}),
+            )
+            .await?;
+    }
     let mut text = input["text"].as_str().unwrap_or_default().to_owned();
     if let Some(attachments) = input["attachments"].as_array() {
         for attachment in attachments {
@@ -690,7 +700,7 @@ impl Capture {
                 .as_ref()
                 .map(|policy| {
                     let group = super::linux::Workload::create(&policy.cgroup_root)?;
-                    group.attach(&mut command, policy.agent_uid, policy.agent_gid)?;
+                    group.attach(&mut command, policy)?;
                     Ok::<_, io::Error>(group)
                 })
                 .transpose()?;

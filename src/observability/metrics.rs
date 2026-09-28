@@ -43,14 +43,16 @@ impl Range {
 pub(crate) struct History {
     pool: PgPool,
     store: String,
+    instance: Option<String>,
     // One in-flight read across all ranges; polling must not crowd out history uploads.
     cache: Mutex<BTreeMap<Range, (Instant, Value)>>,
 }
 impl History {
-    pub fn new(pool: PgPool, store: String) -> Self {
+    pub fn new(pool: PgPool, store: String, instance: Option<String>) -> Self {
         Self {
             pool,
             store,
+            instance,
             cache: Mutex::new(BTreeMap::new()),
         }
     }
@@ -79,7 +81,7 @@ impl History {
                             nullif((record->>'memory_total_bytes')::double precision, 0) AS memory
                     FROM cloudroom_diagnostics
                     WHERE store=$1 AND timestamp_ms >= $2 AND timestamp_ms <= $3
-                        AND record->>'kind'='resources'
+                        AND record->>'kind'='resources' AND ($5::text IS NULL OR run_id LIKE $5 || '-%')
                 ), samples AS (
                     SELECT *, lag(timestamp_ms) OVER (ORDER BY timestamp_ms) AS previous FROM readings
                 ), buckets AS (
@@ -109,6 +111,7 @@ impl History {
                 JOIN LATERAL (
                     SELECT record FROM cloudroom_diagnostics
                     WHERE store=$1 AND timestamp_ms=buckets.sampled_at AND record->>'kind'='resources'
+                        AND ($5::text IS NULL OR run_id LIKE $5 || '-%')
                     ORDER BY run_id, sequence LIMIT 1
                 ) AS latest ON true ORDER BY bucket",
             )
@@ -116,6 +119,7 @@ impl History {
             .bind(from as i64)
             .bind(to as i64)
             .bind(step as i64)
+            .bind(&self.instance)
             .fetch_all(&mut *tx)
             .await?;
             tx.commit().await?;

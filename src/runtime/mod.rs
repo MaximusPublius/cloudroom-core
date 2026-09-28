@@ -44,6 +44,12 @@ pub enum Kind {
     Claude,
     Fx,
 }
+impl Kind {
+    /// Harnesses that accept a per-turn `fast` service tier. Claude Fast stays off (ADR 0133).
+    pub fn fast(self) -> bool {
+        matches!(self, Kind::Codex | Kind::Cursor)
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Model {
@@ -460,11 +466,11 @@ impl Handle {
     }
     pub fn capabilities(&self) -> Value {
         if matches!(self.kind, Kind::Cursor | Kind::Fx) {
-            return cursor::capabilities();
+            return cursor::capabilities(self.kind);
         }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
             "steer":self.kind!=Kind::Claude,"compact":true,"rewind":true,"attachments":true,
-            "service_tier":self.kind==Kind::Codex,"subagents":true,"usage":true})
+            "service_tier":self.kind.fast(),"subagents":true,"usage":true})
     }
     pub async fn start_session(&self) -> io::Result<String> {
         let mut startup = self.clone();

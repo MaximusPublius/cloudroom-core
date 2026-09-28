@@ -104,7 +104,7 @@ impl Process {
             .as_ref()
             .map(|policy| {
                 let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
-                group.attach(&mut command, policy.agent_uid, policy.agent_gid)?;
+                group.attach(&mut command, policy)?;
                 command.env("npm_config_cache", policy.cache_dir.join("npm"));
                 Ok::<_, io::Error>(group)
             })

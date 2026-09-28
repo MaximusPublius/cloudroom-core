@@ -114,16 +114,25 @@ impl Local {
         {
             session.teleport_output = true;
         }
-        // Lifecycle bookkeeping, such as restart recovery, is not user or agent activity.
-        if !matches!(
-            record.kind.as_str(),
-            "state"
-                | "harness"
-                | "workspace"
-                | "launch_reasoning"
-                | "native_identity"
-                | "native_history_unavailable"
-        ) {
+        // Lifecycle bookkeeping, such as restart recovery, is not user or agent activity. Neither are a harness's
+        // environment notices, such as Codex's `skills/changed` after skills sync: they would keep idle work awake.
+        let notice = record.kind == "native_event"
+            && record.data["method"].as_str().is_some_and(|method| {
+                ["skills/", "account/", "mcpServer/", "config/"]
+                    .iter()
+                    .any(|prefix| method.starts_with(prefix))
+            });
+        if !notice
+            && !matches!(
+                record.kind.as_str(),
+                "state"
+                    | "harness"
+                    | "workspace"
+                    | "launch_reasoning"
+                    | "native_identity"
+                    | "native_history_unavailable"
+            )
+        {
             session.last_activity = record.timestamp_ms.or(session.last_activity);
         }
         match record.kind.as_str() {

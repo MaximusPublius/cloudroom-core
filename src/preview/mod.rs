@@ -2,8 +2,9 @@
 use crate::config::Config;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path as RoutePath, State},
-    http::StatusCode,
+    body::Body,
+    extract::{ConnectInfo, Path as RoutePath, Query, Request, State},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -33,9 +34,14 @@ pub const SKILL: &str = include_str!("cloud-preview/SKILL.md");
 struct Setup {
     socket: PathBuf,
     host: Option<IpAddr>,
+    #[serde(default)]
     port: u16,
+    #[serde(default)]
     host_key_file: PathBuf,
     agent_uid: u32,
+    /// Sandboxes have no inbound SSH: the Mac reaches previews through Core's own HTTPS port.
+    #[serde(default)]
+    tunnel: bool,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,12 +79,24 @@ pub struct Port {
 pub struct Host {
     host: IpAddr,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelDevice {
+    device: String,
+}
+/// An open preview tunnel, closed when its preview or device goes away.
+struct Live {
+    port: u16,
+    device: String,
+    task: tokio::task::AbortHandle,
+}
 
 pub struct Previews {
     directory: PathBuf,
     setup: Mutex<Option<Setup>>,
     saved: Mutex<Saved>,
     reports: Mutex<BTreeMap<(String, u16), (u64, Report)>>,
+    tunnels: Mutex<Vec<Live>>,
     core_port: u16,
 }
 #[derive(Debug)]
@@ -141,8 +159,7 @@ impl Previews {
             Err(e) => return Err(e),
         };
         if let Some(setup) = &setup {
-            if !setup.host_key_file.is_absolute()
-                || setup.port == 0
+            if (!setup.tunnel && (!setup.host_key_file.is_absolute() || setup.port == 0))
                 || !setup.socket.is_absolute()
                 || config
                     .storage
@@ -180,6 +197,7 @@ impl Previews {
             setup: Mutex::new(setup),
             saved: Mutex::new(saved),
             reports: Mutex::new(BTreeMap::new()),
+            tunnels: Mutex::new(Vec::new()),
             core_port: config.listen.port(),
         }))
     }
@@ -274,10 +292,7 @@ impl Previews {
         self.save(&next)?;
         *saved = next;
         self.reports.lock().unwrap().clear();
-        disconnect_ssh(
-            self.setup()?.agent_uid,
-            fs::metadata(&self.directory)?.uid(),
-        )?;
+        self.disconnect(|live| live.port == port)?;
         Ok(json!({"port":port,"state":"closed"}))
     }
     pub fn view(&self, port: u16) -> Result<Value> {
@@ -324,9 +339,15 @@ impl Previews {
         if !valid_device(&device.device) || !valid_key(&device.public_key) {
             return Err(conflict("Invalid preview device key"));
         }
-        let host = setup.host.ok_or(conflict(
-            "The VM's preview SSH address has not been configured",
-        ))?;
+        let host = match setup.host {
+            Some(host) => Some(host),
+            None if setup.tunnel => None,
+            None => {
+                return Err(conflict(
+                    "The VM's preview SSH address has not been configured",
+                ));
+            }
+        };
         let mut saved = self.saved.lock().unwrap();
         if saved
             .devices
@@ -345,6 +366,9 @@ impl Previews {
             next.devices.insert(device.device, device.public_key);
             self.save(&next)?;
             *saved = next;
+        }
+        if setup.tunnel {
+            return Ok(json!({"tunnel":true}));
         }
         let text = fs::read_to_string(&setup.host_key_file)?;
         let host_key = text
@@ -365,10 +389,7 @@ impl Previews {
         self.save(&next)?;
         *saved = next;
         self.reports.lock().unwrap().clear();
-        disconnect_ssh(
-            self.setup()?.agent_uid,
-            fs::metadata(&self.directory)?.uid(),
-        )?;
+        self.disconnect(|live| live.device == device)?;
         Ok(json!({"revoked":true}))
     }
     pub fn report(&self, input: Report) -> Result<Value> {
@@ -388,6 +409,7 @@ impl Previews {
             || input.error.as_ref().is_some_and(|s| {
                 ![
                     "SSH connection unavailable",
+                    "Tunnel unavailable",
                     "Cloud HTTP server unavailable",
                     "Local preview port unavailable",
                 ]
@@ -401,6 +423,42 @@ impl Previews {
             .unwrap()
             .insert((input.device.clone(), input.port), (now(), input));
         Ok(json!({"accepted":true}))
+    }
+    /// Ends SSH forwarding (VMs) or open tunnels (sandboxes) that no longer have a preview or device.
+    fn disconnect(&self, stale: impl Fn(&Live) -> bool) -> Result<()> {
+        if self.setup()?.tunnel {
+            self.tunnels.lock().unwrap().retain(|live| {
+                if stale(live) {
+                    live.task.abort();
+                }
+                !stale(live) && !live.task.is_finished()
+            });
+            return Ok(());
+        }
+        disconnect_ssh(
+            self.setup()?.agent_uid,
+            fs::metadata(&self.directory)?.uid(),
+        )?;
+        Ok(())
+    }
+    /// A paired Mac's tunnel to a registered preview, rechecking that the agent still owns the listener.
+    async fn connect(&self, port: u16, device: &str) -> Result<TcpStream> {
+        if !self.setup()?.tunnel {
+            return Err(conflict("Previews on this VM use SSH"));
+        }
+        {
+            let saved = self.saved.lock().unwrap();
+            if !saved.devices.contains_key(device) || !saved.previews.contains_key(&port) {
+                return Err(Failure(
+                    StatusCode::FORBIDDEN,
+                    "Preview or device is not registered".into(),
+                ));
+            }
+        }
+        self.port_allowed(port)?;
+        TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| conflict("The cloud server is not listening"))
     }
     pub async fn listen(self: &Arc<Self>) -> io::Result<()> {
         let Some(setup) = self.setup.lock().unwrap().clone() else {
@@ -491,6 +549,47 @@ pub fn routes() -> Router<Arc<crate::session::Manager>> {
         .route("/v1/previews/device/{id}", axum::routing::delete(revoke))
         .route("/v1/previews/report", post(report))
         .route("/v1/previews/{port}", get(status).delete(close))
+        .route("/v1/previews/{port}/tunnel", get(tunnel))
+}
+/// Sandbox previews: after `101 Switching Protocols`, raw bytes flow between the Mac and 127.0.0.1:PORT.
+async fn tunnel(
+    State(m): State<Arc<crate::session::Manager>>,
+    RoutePath(port): RoutePath<u16>,
+    Query(input): Query<TunnelDevice>,
+    mut request: Request,
+) -> Result<Response> {
+    if request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        != Some("cloudroom-tunnel")
+    {
+        return Err(Failure(
+            StatusCode::BAD_REQUEST,
+            "Send Upgrade: cloudroom-tunnel".into(),
+        ));
+    }
+    let mut upstream = m.previews.connect(port, &input.device).await?;
+    let upgrade = hyper::upgrade::on(&mut request);
+    let task = tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            let mut mac = hyper_util::rt::TokioIo::new(upgraded);
+            let _ = tokio::io::copy_bidirectional(&mut mac, &mut upstream).await;
+        }
+    });
+    let mut tunnels = m.previews.tunnels.lock().unwrap();
+    tunnels.retain(|live| !live.task.is_finished());
+    tunnels.push(Live {
+        port,
+        device: input.device,
+        task: task.abort_handle(),
+    });
+    Ok(Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "cloudroom-tunnel")
+        .body(Body::empty())
+        .unwrap())
 }
 async fn list(State(m): State<Arc<crate::session::Manager>>) -> Result<Json<Value>> {
     Ok(Json(m.previews.list()?))

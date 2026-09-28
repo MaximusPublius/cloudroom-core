@@ -94,6 +94,36 @@ impl Local {
 }
 
 impl Manager {
+    /// Before a sandbox stops, refuse new work, but only when nothing is running.
+    /// `hold: false` releases the drain, for example when the stop is cancelled.
+    pub fn drain(&self, hold: bool) -> Value {
+        let mut local = self.local.lock().unwrap();
+        if !hold {
+            local.draining = false;
+            return json!({"drained": false});
+        }
+        // Closed sessions keep their close request forever, but nothing of theirs is running.
+        let busy = local
+            .sessions
+            .values()
+            .filter(|s| s.state != "closed")
+            .find(|s| {
+                s.busy()
+                    || s.compacting
+                    || s.rewind_request.is_some()
+                    || s.close_request.is_some()
+                    || s.interrupt_pending()
+            });
+        if let Some(session) = busy {
+            return json!({"drained":false,"reason":"session_busy","session_id":session.session_id});
+        }
+        if self.teleports.busy() {
+            return json!({"drained":false,"reason":"transfer_running"});
+        }
+        local.draining = true;
+        json!({"drained":true,"pending_records":local.journal.last() - local.journal.saved()})
+    }
+
     pub fn start_idle_sleeper(self: &Arc<Self>) {
         let manager = self.clone();
         tokio::spawn(async move {

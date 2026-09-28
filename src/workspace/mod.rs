@@ -232,6 +232,7 @@ impl Workspaces {
                 policy.agent_uid,
                 policy.agent_gid,
                 None,
+                true,
             )?;
         }
         let mut child = command.spawn()?;
@@ -267,6 +268,7 @@ impl Workspaces {
                     policy.agent_uid,
                     policy.agent_gid,
                     None,
+                    true,
                 )?;
             }
             let output =

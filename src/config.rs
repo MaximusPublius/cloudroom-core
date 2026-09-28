@@ -19,6 +19,8 @@ pub struct Config {
     pub database_url: String,
     pub store: String,
     pub allow_insecure_database: bool,
+    /// Optional host label, such as a sandbox name, that prefixes this process's diagnostic run IDs.
+    pub instance: Option<String>,
     pub account_home: PathBuf,
     pub default_harness: Kind,
     pub harnesses: BTreeMap<Kind, HarnessConfig>,
@@ -159,6 +161,23 @@ impl Config {
             store: required("CLOUDROOM_STORE")?,
             allow_insecure_database: env::var("CLOUDROOM_ALLOW_INSECURE_DATABASE").as_deref()
                 == Ok("1"),
+            instance: match env::var("CLOUDROOM_INSTANCE") {
+                Ok(value)
+                    if !value.is_empty()
+                        && value.len() <= 63
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+                {
+                    Some(value)
+                }
+                Ok(value) if !value.is_empty() => {
+                    return Err(io::Error::other(
+                        "CLOUDROOM_INSTANCE must be lowercase letters, digits and dashes",
+                    ));
+                }
+                _ => None,
+            },
             account_home,
         })
     }

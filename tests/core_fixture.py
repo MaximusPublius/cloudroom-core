@@ -1032,6 +1032,8 @@ def queue_and_recovery_checks(service, root):
         r = service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": key, "text": key}, 202)
         assert r["receipt"]["state"] == "accepted", r
     assert service.session(sid)["queue"] == ["q2", "q3"], service.session(sid)["queue"]
+    # A sandbox host may stop the machine only after Core drains; a turn in flight refuses it.
+    assert service.request("POST", "/v1/drain", {"hold": True}, 200)["drained"] is False
     # Retrying a queued id is idempotent; conflicting content is rejected.
     service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "q2", "text": "q2"}, 202)
     service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "q2", "text": "different"}, 409)
@@ -1039,6 +1041,9 @@ def queue_and_recovery_checks(service, root):
     for key in ["q1", "q2", "q3"]:
         until(lambda k=key: service.session(sid)["receipts"][k]["state"] == "completed", f"{key} completed")
     until(lambda: service.session(sid)["state"] == "idle", "queue drained")
+    assert service.request("POST", "/v1/drain", {"hold": True}, 200)["drained"] is True
+    service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "while-draining", "text": "x"}, 409)
+    service.request("POST", "/v1/drain", {"hold": False}, 200)
     order = [r["data"]["request_id"] for r in service.records(sid)
              if r["kind"] == "state" and r["data"].get("state") == "starting_turn"]
     assert order == ["q1", "q2", "q3"], order

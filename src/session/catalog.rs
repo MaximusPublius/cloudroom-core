@@ -108,7 +108,7 @@ impl Manager {
                     };
                     harness["steer"] = json!(*kind == runtime::Kind::Codex);
                     harness["compact"] = json!(true);
-                    harness["service_tier"] = json!(*kind == runtime::Kind::Codex);
+                    harness["service_tier"] = json!(kind.fast());
                     harness["skill_mentions"] = json!(*kind == runtime::Kind::Claude);
                     harness["rewind"] = json!(true);
                     harness["attachments"] = json!({"images":true,"files":true});
@@ -116,7 +116,7 @@ impl Manager {
                     harness["usage"] = json!(true);
                 }
                 runtime::Kind::Cursor | runtime::Kind::Fx => {
-                    let capabilities = runtime::cursor::capabilities();
+                    let capabilities = runtime::cursor::capabilities(*kind);
                     for (key, value) in capabilities.as_object().unwrap() {
                         harness[key] = value.clone();
                     }
@@ -210,7 +210,7 @@ impl Manager {
             .get(id)
             .ok_or(Error::NotFound)?
             .harness;
-        if kind != runtime::Kind::Codex && tier == "fast" {
+        if !kind.fast() && tier == "fast" {
             return Err(Error::Conflict("invalid service tier"));
         }
         Ok(())

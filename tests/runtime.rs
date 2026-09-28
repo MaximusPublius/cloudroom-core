@@ -31,6 +31,7 @@ fn fixture() -> (Directory, Config) {
         database_url: "postgres://127.0.0.1:1/fixture".into(),
         store: "fixture".into(),
         allow_insecure_database: true,
+        instance: None,
         account_home: dir.0.clone(),
         default_harness: runtime::Kind::Codex,
         harnesses: [(
@@ -219,6 +220,7 @@ async fn workload_cleanup_requires_confirmed_empty_group() {
         agent_gid: 1,
         cache_dir: dir.0.join("cache"),
         cgroup_root: root.clone(),
+        agent_sudo: false,
         warning_bytes: 5,
         pause_bytes: 2,
         resume_bytes: 3,

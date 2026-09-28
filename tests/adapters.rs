@@ -40,6 +40,7 @@ impl Fixture {
             database_url: "postgres://127.0.0.1:1/test".into(),
             store: "test".into(),
             allow_insecure_database: true,
+            instance: None,
             account_home: root.clone(),
             default_harness: kind,
             harnesses: [(

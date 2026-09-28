@@ -236,6 +236,8 @@ struct Local {
     sequences: BTreeMap<String, Vec<u64>>,
     changed: watch::Sender<u64>,
     database_available: bool,
+    // Set by a drain before the sandbox stops; refuses new work until released.
+    draining: bool,
 }
 
 pub struct Manager {
@@ -271,6 +273,7 @@ impl Manager {
             sequences: BTreeMap::new(),
             changed,
             database_available: false,
+            draining: false,
         };
         for sequence in 1..=local.journal.last() {
             let record: Record = serde_json::from_slice(&local.journal.read(sequence)?)?;
@@ -756,6 +759,9 @@ impl Manager {
             if self.is_stopping() {
                 return Err(Error::Conflict("service is stopping"));
             }
+            if local.draining {
+                return Err(Error::Conflict("service is draining"));
+            }
             if self.storage.blocks() {
                 return Err(Error::Conflict("storage unsafe; new execution is blocked"));
             }
@@ -930,6 +936,9 @@ impl Manager {
             }
             if command == "sleep" {
                 return self.request_sleep(&mut local, id, request);
+            }
+            if local.draining && !matches!(command, "interrupt" | "close" | "stop" | "cancel") {
+                return Err(Error::Conflict("service is draining"));
             }
             if matches!(command, "compact" | "rewind") && session.state == "sleeping" {
                 self.schedule_resume(&mut local, id)?;

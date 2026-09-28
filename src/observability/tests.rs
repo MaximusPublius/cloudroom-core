@@ -55,6 +55,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
         database_url: "postgres://127.0.0.1:1/test".into(),
         store: "test".into(),
         allow_insecure_database: true,
+        instance: None,
         account_home: directory.0.clone(),
         default_harness: crate::runtime::Kind::Codex,
         harnesses: [(

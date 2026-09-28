@@ -198,7 +198,7 @@ pub(super) async fn run_output(
         .as_ref()
         .map(|policy| {
             let group = super::linux::Workload::create(&policy.cgroup_root)?;
-            group.attach(&mut command, policy.agent_uid, policy.agent_gid)?;
+            group.attach(&mut command, policy)?;
             Ok::<_, io::Error>(group)
         })
         .transpose()?;

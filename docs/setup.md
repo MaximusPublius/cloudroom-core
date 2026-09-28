@@ -183,6 +183,10 @@ sudo -u cloudroom-agent -H /usr/local/bin/codex login status
 
 A failed readiness check usually means the database, TLS certificate, migrations, or disk protection needs attention. A failed agent start may mean login or model configuration. There is no fixed limit on open harness sessions; actual concurrency depends on available VM resources. Keep logs private when asking for help.
 
+## Sandboxes without systemd
+
+Cloud sandboxes have no systemd ([scope](../../docs/scopes/sandboxes.md)). The web app writes `/etc/cloudroom/core.env` on every wake, then starts `install/sandbox-start.sh` as root, detached. It parses (never sources) `image.env` and `core.env`, creates the agents' cgroup, runs Core as `cloudroom` with only the capabilities it needs, and restarts it after a crash. A second start is a no-op. The log is `/var/log/cloudroom/core.log`. With `"agent_sudo": true` in `storage.json`, agents keep sudo inside their own sandbox. Before a stop, `POST /v1/drain {"hold":true}` refuses new work and reports whether anything still runs; `{"hold":false}` reopens it.
+
 ## Cloud folders
 
 Send `"workspace":"PROJECT_ID"` and optional `"workspace_name":"project-name"` with `POST /v1/sessions`. The core creates an empty directory under `/code` and starts the harness. Repeated workspace IDs reuse their recorded directory; name collisions never overwrite another folder. No Git repository, local source folder, archive upload, or sync worker is required. The agent can clone a repository or install dependencies after starting. Send `"workspace":"root"` to start in `/code` itself, outside any project folder.
