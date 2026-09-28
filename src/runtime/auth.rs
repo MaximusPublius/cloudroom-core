@@ -143,6 +143,8 @@ impl Adapter for Protocol {
 struct Rpc {
     process: Process,
     completed: watch::Receiver<Option<Value>>,
+    /// Ends once the app-server has exited.
+    exited: tokio::task::JoinHandle<()>,
 }
 impl Rpc {
     async fn open(config: &Config) -> io::Result<Self> {
@@ -153,7 +155,7 @@ impl Rpc {
         let (process, mut events) =
             Process::spawn(config, codex::command(config, profile), Box::new(Protocol))?;
         let (changed, completed) = watch::channel(None);
-        tokio::spawn(async move {
+        let exited = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
                     Event::Record {
@@ -168,14 +170,32 @@ impl Rpc {
                 }
             }
         });
-        let rpc = Self { process, completed };
-        rpc.call(
-            "initialize",
-            json!({"clientInfo":{"name":"cloudroom","version":env!("CARGO_PKG_VERSION")}}),
-        )
-        .await?;
-        rpc.process.notify("initialized").await?;
-        Ok(rpc)
+        let rpc = Self {
+            process,
+            completed,
+            exited,
+        };
+        let ready = async {
+            rpc.call(
+                "initialize",
+                json!({"clientInfo":{"name":"cloudroom","version":env!("CARGO_PKG_VERSION")}}),
+            )
+            .await?;
+            rpc.process.notify("initialized").await
+        }
+        .await;
+        match ready {
+            Ok(()) => Ok(rpc),
+            Err(error) => {
+                rpc.close().await;
+                Err(error)
+            }
+        }
+    }
+    /// Stops the app-server and waits for it to exit, so a quick service stop cannot leave it running.
+    async fn close(mut self) {
+        self.process.request_shutdown();
+        let _ = (&mut self.exited).await;
     }
     async fn call(&self, method: &str, params: Value) -> io::Result<Value> {
         self.process
@@ -312,7 +332,11 @@ impl CodexAuth {
                 .is_none_or(|at| at.elapsed() > Duration::from_secs(15))
         {
             state.status = match Rpc::open(config).await {
-                Ok(rpc) => rpc.probe().await.unwrap_or_else(failure),
+                Ok(rpc) => {
+                    let status = rpc.probe().await.unwrap_or_else(failure);
+                    rpc.close().await;
+                    status
+                }
                 Err(error) => failure(error),
             };
             state.checked = Some(Instant::now());
