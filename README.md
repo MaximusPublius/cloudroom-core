@@ -1,60 +1,52 @@
 # Cloudroom core
 
-[Website](https://www.cloudroom.dev) · [Join the waitlist](https://www.cloudroom.dev/#waitlist) · [Changelog](https://www.cloudroom.dev/changelog) · [Security](https://www.cloudroom.dev/security)
+[Website](https://www.cloudroom.dev) · [Changelog](https://www.cloudroom.dev/changelog) · [Security](https://www.cloudroom.dev/security)
 
-A self-hostable Rust service that runs coding agents on your own Linux VM and saves their session history.
-Supports Codex, Claude Code, Pi, and Cursor. Agents make their own model calls with your own logins.
-One Cargo package; one service per VM. No Cloudroom account or hosted service is required.
-Don't want to run your own VM? Hosted Cloudroom is invite-only for now. [Join the waitlist](https://www.cloudroom.dev/#waitlist).
+Cloudroom core runs coding agents on your own Linux machine and saves their chat history.
 
-![Cloudroom architecture: one cloud sandbox per agent, each running Cloudroom core and the agent. The web app wakes and sleeps sandboxes; the desktop app talks to core directly.](docs/architecture.png)
+- Works with Codex, Claude Code, Pi, and Cursor.
+- Agents use your own logins to call their models.
+- One Rust service per machine. No Cloudroom account needed.
 
-*Architecture as of September 27, 2026: one sandbox per agent.*
+Don't want to host it yourself? Hosted Cloudroom is invite-only for now. [Join the waitlist](https://www.cloudroom.dev/#waitlist).
+
+![Cloudroom architecture: one cloud sandbox per agent, each running Cloudroom core and the agent.](docs/architecture.png)
 
 ## Get started
 
 - [Install on Ubuntu 24.04](docs/setup.md) with one script, or build from source.
-- [HTTP API reference](docs/api.md): every endpoint, event, and error code.
-- [Linux builds](https://github.com/davidondrej/cloudroom-core/releases): CI-tested binaries for each release.
+- [HTTP API](docs/api.md): every endpoint, event, and error code.
+- [Linux builds](https://github.com/davidondrej/cloudroom-core/releases): tested binaries for each release.
 
 ## Security
 
-- Agents run as a separate Linux user with no admin rights. The core removes every Linux privilege before an agent starts, so `sudo` does not work.
-- Agents start with an empty environment. They cannot read the core's token, database password, or history files.
-- Every API request needs a secret token; the installer generates a random 256-bit one. The API listens only on localhost unless you opt in behind an HTTPS proxy.
-- History is saved to PostgreSQL outside the VM, over TLS with full certificate checks. Agents call model providers directly.
-- Command Guard blocks a few catastrophic commands, such as deleting a home folder or formatting a disk.
+- Agents run as a separate Linux user, with no admin rights and no `sudo`.
+- Agents can't read the core's token, database password, or history files.
+- Every API request needs a secret token. The API listens only on localhost unless you put it behind HTTPS.
+- History is saved to PostgreSQL outside the machine, over verified TLS.
+- Command Guard blocks a few disastrous commands, like wiping a home folder.
 
-Agents run without approval prompts and share one Linux user, so use one VM per trusted user.
-See [cloudroom.dev/security](https://www.cloudroom.dev/security). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Agents run without approval prompts, so give each trusted user their own machine.
+Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Desktop app
 
-[Download the Cloudroom GUI beta](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs, with a Linux alpha.
-Downloads are public, but hosted cloud access remains invite-only ([join the waitlist](https://www.cloudroom.dev/#waitlist)). The core does not require the GUI.
+[Download the Cloudroom app](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs (Linux alpha). The core works without it.
 
 ## Build and test
 
-Requires Rust 1.89+, Git, and the supported harness runtimes.
+Needs Rust 1.89+, Git, and the agent CLIs you want to run.
 
 ```sh
 cargo build --locked --release
 cargo test --locked --all-targets
 ```
 
-Apply the two SQL files in `docs/database/` to a dedicated PostgreSQL database as its owner.
-The service never applies migrations. Keep database and core credentials server-side.
+Apply the two SQL files in `docs/database/` to a dedicated PostgreSQL database. The core never runs migrations itself.
 
-- [Installation and workload protection](docs/storage.md)
-- [Harness configuration and verification](docs/harnesses.md)
-- [Session lifecycle](docs/session-lifecycle.md)
-- [Diagnostics](docs/observability.md)
-- [Dashboard API](docs/dashboard.md)
+More docs: [storage](docs/storage.md) · [harnesses](docs/harnesses.md) · [session lifecycle](docs/session-lifecycle.md) · [diagnostics](docs/observability.md) · [dashboard API](docs/dashboard.md)
 
 ## Contributing
 
-Issues and pull requests are welcome. Open an issue first for larger changes.
-Accepted changes ship in the next release. Each release's notes list what changed.
-
-This is pre-release software, not a claim that all planned features are complete.
-Licensed under [Apache 2.0](LICENSE).
+Issues and pull requests are welcome. For big changes, open an issue first.
+This is pre-release software. Licensed under [Apache 2.0](LICENSE).
