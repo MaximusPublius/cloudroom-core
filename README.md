@@ -7,9 +7,9 @@ Supports Codex, Claude Code, Pi, and Cursor. Agents make their own model calls w
 One Cargo package; one service per VM. No Cloudroom account or hosted service is required.
 Don't want to run your own VM? Hosted Cloudroom is invite-only for now. [Join the waitlist](https://www.cloudroom.dev/#waitlist).
 
-![Cloudroom core architecture: session management, agent runtime, workspace management, storage, and app integrations](docs/architecture.png)
+![Cloudroom architecture: one cloud sandbox per agent, each running Cloudroom core and the agent. The web app wakes and sleeps sandboxes; the desktop app talks to core directly.](docs/architecture.png)
 
-*Architecture design. Some components and integrations shown are planned, not yet implemented.*
+*Architecture as of September 27, 2026: one sandbox per agent.*
 
 ## Get started
 
