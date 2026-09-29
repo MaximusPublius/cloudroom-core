@@ -443,12 +443,19 @@ async fn observe(
 }
 
 async fn authenticate(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
-    let authorized = request
-        .headers()
+    // Some sandbox proxies replace Authorization with their own login, so the token may also arrive in X-Cloudroom-Token.
+    let headers = request.headers();
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|supplied| same_token(supplied, token.as_str()));
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let custom = headers
+        .get("x-cloudroom-token")
+        .and_then(|h| h.to_str().ok());
+    let authorized = [bearer, custom]
+        .into_iter()
+        .flatten()
+        .any(|supplied| same_token(supplied, token.as_str()));
     let mut response = if authorized {
         next.run(request).await
     } else {

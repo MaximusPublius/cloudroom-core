@@ -220,7 +220,7 @@ async fn workload_cleanup_requires_confirmed_empty_group() {
         agent_uid: 1,
         agent_gid: 1,
         cache_dir: dir.0.join("cache"),
-        cgroup_root: root.clone(),
+        cgroup_root: Some(root.clone()),
         agent_sudo: false,
         warning_bytes: 5,
         pause_bytes: 2,

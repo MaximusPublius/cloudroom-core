@@ -36,6 +36,16 @@ The policy retains `agent_uid`, `agent_gid`, `cache_dir`, and `cgroup_root`. Opt
 
 `CLOUDROOM_STORAGE_POLICY` remains required. Never use `CLOUDROOM_UNPROTECTED_TEST_MODE` to bypass a broken live installation.
 
+## Containers
+
+Some sandboxes are containers without cgroup delegation or the capabilities above, such as Upstash Box. If their agents may have sudo, the sandbox is the security boundary anyway, and the image writes `"cgroup_root": null` with `"agent_sudo": true` (`web/sandbox-image.sh` picks the mode). Core then:
+
+- runs as the agent account, so it needs no capabilities. The image makes `cloudroom` an alias of that account.
+- tags each workload's processes with `CLOUDROOM_WORKLOAD`, and stops, freezes and counts them with signals. Processes that clear their environment or switch user through sudo escape.
+- skips npm cache cleanup, which needs frozen cgroups, and allows a memory-backed `/var/tmp`.
+
+A policy without cgroups and without `agent_sudo` is rejected.
+
 ## Upgrade an existing quota-based VM
 
 Use an approved idle core update. Preserve files, identities, credentials, history, and the old binary/policy for rollback.

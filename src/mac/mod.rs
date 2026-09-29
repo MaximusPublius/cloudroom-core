@@ -41,6 +41,7 @@ const ACK: Duration = Duration::from_secs(10);
 const KEEP: Duration = Duration::from_secs(3600);
 const UNAVAILABLE: &str = "Mac unavailable: the paired Mac is offline, asleep, or has Mac access turned off. Continue cloud work and try again later.";
 pub const SKILL: &str = include_str!("cloud-mac/SKILL.md");
+pub const ROOM_CLI_SKILL: &str = include_str!("room-cli/SKILL.md");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -40,12 +40,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if args.first().map(String::as_str) == Some("computer-use") {
+        match cloudroom::computer_use::cli(&args[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().map(String::as_str) == Some("--computer-use-skill") {
+        print!("{}", cloudroom::computer_use::SKILL);
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("--secrets-skill") {
         print!("{}", cloudroom::secrets::SKILL);
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--mac-skill") {
         print!("{}", cloudroom::mac::SKILL);
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("--room-cli-skill") {
+        print!("{}", cloudroom::mac::ROOM_CLI_SKILL);
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--preview-skill") {

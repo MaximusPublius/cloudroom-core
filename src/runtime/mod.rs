@@ -785,7 +785,7 @@ pub(super) fn command(binary: &Path, config: &Config) -> Command {
 
 pub async fn reconcile(config: &Config) -> io::Result<()> {
     if let Some(policy) = &config.storage {
-        linux::Workload::clear(&policy.cgroup_root).await?;
+        linux::Workload::clear(policy).await?;
     }
     Ok(())
 }

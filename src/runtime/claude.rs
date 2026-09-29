@@ -200,7 +200,7 @@ pub(super) async fn run_output(
         .storage
         .as_ref()
         .map(|policy| {
-            let group = super::linux::Workload::create(&policy.cgroup_root)?;
+            let group = super::linux::Workload::create(policy)?;
             group.attach(&mut command, policy)?;
             Ok::<_, io::Error>(group)
         })

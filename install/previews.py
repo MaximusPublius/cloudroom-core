@@ -102,7 +102,7 @@ Match all
             atomic(lookup, previous_lookup, mode=0o755)
         raise ValueError('SSH validation/reload failed; previous configuration restored') from None
     # Mac access (ADR 0113) and secret requests share the preview pairing's agent socket, so their skills install here too.
-    for name, flag in [('cloud-preview', '--preview-skill'), ('cloud-mac', '--mac-skill'), ('cloud-secrets', '--secrets-skill')]:
+    for name, flag in [('cloud-preview', '--preview-skill'), ('cloud-mac', '--mac-skill'), ('cloud-secrets', '--secrets-skill'), ('room-cli', '--room-cli-skill')]:
         skill = subprocess.check_output([str(binary), flag], text=True)
         for base in ['.agents', '.codex', '.pi/agent', '.claude']:
             command = ['sudo', '-u', agent.pw_name, 'python3', '-c',

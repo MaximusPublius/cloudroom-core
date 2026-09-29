@@ -103,7 +103,7 @@ impl Process {
             .storage
             .as_ref()
             .map(|policy| {
-                let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
+                let group = Arc::new(linux::Workload::create(policy)?);
                 group.attach(&mut command, policy)?;
                 command.env("npm_config_cache", policy.cache_dir.join("npm"));
                 Ok::<_, io::Error>(group)

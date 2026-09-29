@@ -324,7 +324,9 @@ impl CodexAuth {
             } else {
                 return state.status.clone();
             }
-            state.login = None;
+            if let Some(login) = state.login.take() {
+                login.rpc.close().await;
+            }
             state.checked = Some(Instant::now());
         } else if refresh
             || state
@@ -454,7 +456,9 @@ impl CodexAuth {
                 .rpc
                 .call("account/login/cancel", json!({"loginId":login.native_id}))
                 .await;
-            state.login = None;
+            if let Some(login) = state.login.take() {
+                login.rpc.close().await;
+            }
             state.checked = None;
             state.status = Status::new(
                 "missing",
@@ -463,9 +467,17 @@ impl CodexAuth {
         }
         state.status.clone()
     }
-    pub fn shutdown(&self) {
+    /// Also waits for a pending sign-in's app-server to exit, so a quick service stop cannot leave it running.
+    pub async fn shutdown(&self) {
         if let Some(process) = self.process.lock().unwrap().take() {
             process.request_shutdown();
         }
+        let _ = tokio::time::timeout(super::SHUTDOWN_GRACE, async {
+            let login = self.state.lock().await.login.take();
+            if let Some(login) = login {
+                login.rpc.close().await;
+            }
+        })
+        .await;
     }
 }

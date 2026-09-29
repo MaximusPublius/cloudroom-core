@@ -1,4 +1,5 @@
 pub mod api;
+pub mod computer_use;
 pub mod config;
 pub mod mac;
 mod observability;
@@ -28,6 +29,7 @@ pub const FEATURES: &[&str] = &[
     "teleport",
     "command_guard",
     "system_prompt",
+    "computer_use",
     "codex_auth",
     "codex_auth_import",
     "cursor_auth",

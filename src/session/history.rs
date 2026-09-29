@@ -52,26 +52,33 @@ impl History {
                 .is_ok()
     }
 
+    /// One statement per batch: a distant database costs one round trip, not one per record.
     pub async fn upload(&self, records: &[Record]) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        for record in records {
-            let text = serde_json::to_string(record).map_err(|e| sqlx::Error::Decode(e.into()))?;
-            // A lost commit reply may cause retransmission. Only identical content is a retry.
-            // Insert-only, so the database login never needs permission to change history.
-            let inserted = sqlx::query(
-                "INSERT INTO cloudroom_records (store, session_id, sequence, record) VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (store, session_id, sequence) DO NOTHING")
-                .bind(&self.store).bind(&record.session_id).bind(record.sequence as i64)
-                .bind(&text).execute(&mut *tx).await?.rows_affected() == 1;
-            let matches = inserted || sqlx::query_scalar::<_, bool>(
-                "SELECT record=$4 FROM cloudroom_records WHERE store=$1 AND session_id=$2 AND sequence=$3")
-                .bind(&self.store).bind(&record.session_id).bind(record.sequence as i64)
-                .bind(&text).fetch_one(&mut *tx).await?;
-            if !matches {
-                return Err(sqlx::Error::Protocol("conflicting history record".into()));
-            }
+        let texts = records
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
+        let sessions: Vec<&str> = records.iter().map(|r| r.session_id.as_str()).collect();
+        let sequences: Vec<i64> = records.iter().map(|r| r.sequence as i64).collect();
+        // A lost commit reply may cause retransmission. Only identical content is a retry.
+        // Insert-only, so the database login never needs permission to change history.
+        // The final SELECT sees rows from before this statement, so rows it inserted are excluded by `added`.
+        let conflicts: i64 = sqlx::query_scalar(
+            "WITH incoming AS (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) AS i(session_id, sequence, record)), \
+             added AS (INSERT INTO cloudroom_records (store, session_id, sequence, record) \
+               SELECT $1, session_id, sequence, record FROM incoming \
+               ON CONFLICT (store, session_id, sequence) DO NOTHING RETURNING session_id, sequence) \
+             SELECT count(*) FROM incoming i \
+             WHERE NOT EXISTS (SELECT 1 FROM added a WHERE a.session_id=i.session_id AND a.sequence=i.sequence) \
+               AND NOT EXISTS (SELECT 1 FROM cloudroom_records r WHERE r.store=$1 AND r.session_id=i.session_id \
+                 AND r.sequence=i.sequence AND r.record=i.record)")
+            .bind(&self.store).bind(&sessions).bind(&sequences).bind(&texts)
+            .fetch_one(&self.pool).await?;
+        if conflicts > 0 {
+            return Err(sqlx::Error::Protocol("conflicting history record".into()));
         }
-        tx.commit().await
+        Ok(())
     }
 
     pub async fn summary(

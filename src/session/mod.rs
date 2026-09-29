@@ -2096,7 +2096,7 @@ impl Manager {
     }
 
     pub async fn shutdown(&self) {
-        self.codex_auth.shutdown();
+        self.codex_auth.shutdown().await;
         self.claude_auth.shutdown().await;
         self.claude_login.shutdown().await;
         self.cursor_auth.shutdown().await;

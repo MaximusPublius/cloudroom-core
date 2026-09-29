@@ -175,7 +175,7 @@ impl Previews {
                     || config
                         .storage
                         .as_ref()
-                        .is_some_and(|p| m.uid() == p.agent_uid)
+                        .is_some_and(|p| !p.container() && m.uid() == p.agent_uid)
                 {
                     return Err(io::Error::other(
                         "preview setup must be protected from agent writes",

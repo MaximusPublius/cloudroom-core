@@ -16,7 +16,8 @@ pub struct Policy {
     pub agent_uid: u32,
     pub agent_gid: u32,
     pub cache_dir: PathBuf,
-    pub cgroup_root: PathBuf,
+    /// Null in a container without cgroups or capabilities (see `container`).
+    pub cgroup_root: Option<PathBuf>,
     /// Sandbox deployments give agents sudo: the sandbox itself is the security boundary.
     #[serde(default)]
     pub agent_sudo: bool,
@@ -48,6 +49,11 @@ impl Policy {
         {
             return Err(io::Error::other("invalid disk protection policy"));
         }
+        if policy.container() && !policy.agent_sudo {
+            return Err(io::Error::other(
+                "cgroups are required unless the sandbox is the security boundary (agent_sudo)",
+            ));
+        }
         // Neither the policy nor its ancestors may be replaced by agent writes.
         for part in path.ancestors() {
             let m = fs::symlink_metadata(part)?;
@@ -60,18 +66,25 @@ impl Policy {
         Ok(policy)
     }
 
+    /// A container without cgroups or capabilities, whose agents have sudo: Core runs as the agent account and
+    /// contains work by marking its processes (runtime/linux.rs). Its /var/tmp may be a memory disk.
+    pub fn container(&self) -> bool {
+        self.cgroup_root.is_none()
+    }
+
     fn check_filesystems(&self, config: &Config) -> io::Result<()> {
         let mount = fs::metadata(&config.repository)?;
+        let var_tmp = (!self.container()).then_some(Path::new("/var/tmp"));
         for path in [
             &config.repository,
             &config.state_dir,
             &config.account_home,
             &self.cache_dir,
             Path::new("/tmp"),
-            Path::new("/var/tmp"),
             Path::new("/code"),
         ]
         .into_iter()
+        .chain(var_tmp)
         .chain(
             config
                 .harnesses
@@ -92,7 +105,7 @@ impl Policy {
             return Err(io::Error::other("disk protection requires Linux"));
         }
         self.check_filesystems(config)?;
-        if fs::metadata(&config.state_dir)?.uid() == self.agent_uid {
+        if !self.container() && fs::metadata(&config.state_dir)?.uid() == self.agent_uid {
             return Err(io::Error::other(
                 "history must belong to the protected service account",
             ));
@@ -107,23 +120,24 @@ impl Policy {
                 return Err(io::Error::other("cache root requires protected ancestors"));
             }
         }
+        let Some(root) = &self.cgroup_root else {
+            return Ok(());
+        };
         let current = fs::read_to_string("/proc/self/cgroup")?;
         let current = current
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
             .ok_or_else(|| io::Error::other("cgroup v2 is required"))?;
         let owner = Path::new("/sys/fs/cgroup").join(current.trim_start_matches('/'));
-        if self.cgroup_root != owner.join("agents") {
+        if *root != owner.join("agents") {
             return Err(io::Error::other(
                 "agent cgroups must be inside the core's delegated service",
             ));
         }
-        if !self.cgroup_root.exists() {
-            fs::create_dir(&self.cgroup_root)?;
+        if !root.exists() {
+            fs::create_dir(root)?;
         }
-        if !self.cgroup_root.join("cgroup.freeze").is_file()
-            || !self.cgroup_root.join("cgroup.kill").is_file()
-        {
+        if !root.join("cgroup.freeze").is_file() || !root.join("cgroup.kill").is_file() {
             return Err(io::Error::other(
                 "workload freeze and kill controls are required",
             ));
@@ -231,7 +245,7 @@ impl Guard {
             .policy
             .as_ref()
             .map(|policy| {
-                let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
+                let group = Arc::new(linux::Workload::create(policy)?);
                 group.attach(command, policy)?;
                 Ok::<_, io::Error>(group)
             })
@@ -301,12 +315,16 @@ impl Guard {
         let Some(p) = &self.policy else {
             return Ok(());
         };
+        // Cleanup proves quiescence through frozen cgroups, so containers without them skip it.
+        let Some(groups) = &p.cgroup_root else {
+            return Ok(());
+        };
         let mut command = Command::new(std::env::current_exe()?);
         command
             .env_clear()
             .arg("--clean-npm-cache")
             .arg(&p.cache_dir)
-            .arg(&p.cgroup_root)
+            .arg(groups)
             .kill_on_drop(true);
         linux::as_agent(&mut command, p.agent_uid, p.agent_gid, None, true)?;
         let result = tokio::time::timeout(Duration::from_secs(5), command.output())
