@@ -224,7 +224,7 @@ impl Manager {
     pub(super) fn wake(self: &Arc<Self>, local: &mut Local, id: &str) -> Result<()> {
         let s = &local.sessions[id];
         if s.state == "sleeping" && s.handle.is_none() && s.has_work() && s.can_resume() {
-            self.schedule_resume(local, id)?;
+            self.schedule_resume(local, id, false)?;
         }
         Ok(())
     }

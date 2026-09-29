@@ -969,7 +969,7 @@ impl Manager {
                 return Err(Error::Conflict("service is draining"));
             }
             if matches!(command, "compact" | "rewind") && session.state == "sleeping" {
-                self.schedule_resume(&mut local, id)?;
+                self.schedule_resume(&mut local, id, false)?;
                 return Err(Error::Conflict(
                     "this thread was asleep and is waking up; try again in a few seconds",
                 ));
@@ -1196,7 +1196,7 @@ impl Manager {
                     Next::None
                 }
                 "resume" if retry_startup => {
-                    self.schedule_resume(&mut local, id)?;
+                    self.schedule_resume(&mut local, id, false)?;
                     Next::None
                 }
                 "resume" => {
@@ -1668,7 +1668,7 @@ impl Manager {
             .collect();
         for id in ids {
             if local.sessions[&id].restores_awake(now) {
-                self.schedule_resume(&mut local, &id)
+                self.schedule_resume(&mut local, &id, false)
                     .map_err(|_| io::Error::other("cannot save recovery state"))?;
             } else if local.sessions[&id].state != "sleeping" {
                 local.append(&id, "state", json!({"state":"sleeping"}), None)?;
@@ -1685,10 +1685,21 @@ impl Manager {
         Ok(())
     }
 
-    fn schedule_resume(self: &Arc<Self>, local: &mut Local, id: &str) -> Result<()> {
-        // Claim the attempt durably before spawning; a failed or interrupted attempt
+    fn schedule_resume(
+        self: &Arc<Self>,
+        local: &mut Local,
+        id: &str,
+        recovery: bool,
+    ) -> Result<()> {
+        // Claim a crash recovery durably before spawning; a failed or interrupted attempt
         // cannot trigger an endless restart loop. Completed turns rearm recovery.
-        local.append(id, "state", json!({"state":"resuming"}), None)?;
+        // Planned resumes (wake, restart, teleport) leave the one crash recovery unused.
+        local.append(
+            id,
+            "state",
+            json!({"state":"resuming","recovery":recovery}),
+            None,
+        )?;
         let (manager, id) = (self.clone(), id.to_owned());
         tokio::spawn(async move {
             manager.relaunch(id).await;
@@ -2088,7 +2099,7 @@ impl Manager {
                     local.fail_pending_because(id, Some(&lost))?;
                 }
                 if recover {
-                    self.schedule_resume(&mut local, id)?;
+                    self.schedule_resume(&mut local, id, true)?;
                 }
             }
         }

@@ -39,6 +39,7 @@ Commands, all `POST /v1/sessions/{id}/...` with a `request_id`:
 - `compact`: ask the harness to compact its context.
 - `rewind`: go back to an earlier message (`before` or `last_turn_id`), with an optional `replacement` prompt.
 - `attachments?request_id=ID&name=NAME&kind=image|file`: upload a raw file body (images up to 10 MiB, files up to 25 MiB).
+  With `upload_parts`, add `&offset=N&total=SIZE` to send it in parts of at most 8 MiB (clients use 4 MiB, since some sandbox proxies drop requests over about 8 MB). Earlier parts return `{"received":N}`; the last returns the receipt. Repeated parts are ignored, gaps refused, and unfinished uploads expire after 10 minutes.
 - `close`: end the session and keep its history.
 
 `POST /v1/sessions/{id}/secrets/{request}` answers an agent's secret request with the requested values. It takes no `request_id`.
@@ -74,6 +75,7 @@ Harness logins run on the VM. Responses report status and sign-in links, never t
 - `/v1/previews...`: open cloud web servers on your laptop's localhost ([previews](previews.md)).
 - `POST /v1/teleports`, `POST /v1/teleports/check`, `GET /v1/teleports/{id}`, `POST .../activate`, `.../cancel`, `.../files/{index}`: move a local conversation and its files to the cloud.
 - `GET /v1/mac/jobs`, `POST /v1/mac/results/{id}`, `POST /v1/vm/run`: two-way Mac and VM access for a paired Mac.
+  Large Mac output arrives as `part` reports (`offset` in that stream's hex text) before the final `done`.
 
 ## Errors
 

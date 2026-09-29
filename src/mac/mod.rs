@@ -63,6 +63,9 @@ pub struct Report {
     stderr: String,
     #[serde(default)]
     truncated: bool,
+    /// A `part` report's position in its stream's hex text. Some sandbox proxies drop requests over about 8 MB,
+    /// so the helper sends large output in parts before a final `done` report (`upload_parts`).
+    offset: Option<usize>,
 }
 #[derive(Deserialize)]
 pub struct Device {
@@ -74,6 +77,8 @@ struct Job {
     acked: bool,
     result: Option<Value>,
     at: Instant,
+    /// Hex output received in parts so far: stdout, stderr.
+    parts: [Vec<u8>; 2],
 }
 struct Helper {
     generation: u64,
@@ -232,20 +237,36 @@ async fn report(
             StatusCode::NOT_FOUND,
             "Unknown or expired Mac job".into(),
         ))?;
-    match input.state.as_str() {
-        "running" => job.acked = true,
-        "done"
-            if input.stdout.len() <= 2 * LIMIT
-                && input.stderr.len() <= 2 * LIMIT
-                && unhex(&input.stdout).is_some()
-                && unhex(&input.stderr).is_some() =>
-        {
+    let output = [input.stdout, input.stderr];
+    if output.iter().any(|hex| unhex(hex).is_none()) {
+        return Err(conflict("Invalid Mac job report"));
+    }
+    match (input.state.as_str(), input.offset) {
+        ("running", None) => job.acked = true,
+        ("part", Some(offset)) => {
+            for (parts, hex) in job.parts.iter_mut().zip(&output) {
+                if !hex.is_empty() {
+                    crate::api::append_part(parts, offset, hex.as_bytes(), 2 * LIMIT)
+                        .map_err(conflict)?;
+                }
+            }
             job.acked = true;
             job.at = Instant::now();
-            job.result = Some(
-                json!({"state":"done","code":input.code,"stdout":input.stdout,
-                "stderr":input.stderr,"truncated":input.truncated}),
-            );
+        }
+        ("done", None) => {
+            let [stdout, stderr] = std::mem::take(&mut job.parts);
+            let [stdout, stderr] =
+                [(stdout, &output[0]), (stderr, &output[1])].map(|(mut parts, rest)| {
+                    parts.extend_from_slice(rest.as_bytes());
+                    String::from_utf8(parts).unwrap_or_default()
+                });
+            if stdout.len() > 2 * LIMIT || stderr.len() > 2 * LIMIT {
+                return Err(conflict("Invalid Mac job report"));
+            }
+            job.acked = true;
+            job.at = Instant::now();
+            job.result = Some(json!({"state":"done","code":input.code,"stdout":stdout,
+                "stderr":stderr,"truncated":input.truncated}));
         }
         _ => return Err(conflict("Invalid Mac job report")),
     }
@@ -296,6 +317,7 @@ async fn local_run(
                 acked: false,
                 result: None,
                 at: Instant::now(),
+                parts: Default::default(),
             },
         );
     }

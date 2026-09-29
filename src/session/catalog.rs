@@ -142,7 +142,9 @@ impl Manager {
                         harness[key] = value.clone();
                     }
                     harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
-                    harness["attachments"] = json!({"images":false,"files":true});
+                    // Cursor's print mode has no image input; its agent opens images from the attached path.
+                    harness["attachments"] =
+                        json!({"images":*kind == runtime::Kind::Cursor,"files":true});
                     harness["provider_selection"] = json!(false);
                     if *kind == runtime::Kind::Cursor {
                         harness["models"] = if self.storage.blocks() {

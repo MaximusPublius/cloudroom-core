@@ -300,7 +300,7 @@ impl Local {
             }
             "state" => {
                 session.state = record.data["state"].as_str().unwrap_or("unknown").into();
-                if session.state == "resuming" {
+                if session.state == "resuming" && record.data["recovery"] == true {
                     session.recovery_attempted = true;
                 }
                 if let Some(error) = record.data["startup_error"].as_str() {

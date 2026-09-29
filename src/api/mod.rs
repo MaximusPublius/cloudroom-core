@@ -16,7 +16,12 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{convert::Infallible, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub fn router(manager: Arc<Manager>, token: String) -> Router {
@@ -651,6 +656,9 @@ struct AttachQuery {
     request_id: String,
     name: String,
     kind: String,
+    /// Large files arrive in parts (`upload_parts`): this part's byte offset and the whole file's size.
+    offset: Option<usize>,
+    total: Option<usize>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1039,6 +1047,18 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
+    // A part is read before any reply, so a retried last part gets its receipt instead of a reset connection.
+    let (body, part) = match query.total {
+        Some(_) => (
+            Body::empty(),
+            Some(
+                axum::body::to_bytes(body, PART_BYTES)
+                    .await
+                    .map_err(|_| session::Error::Conflict("upload part exceeds 8 MiB"))?,
+            ),
+        ),
+        None => (body, None),
+    };
     if let Some(receipt) = manager.receipt(&id, &query.request_id) {
         if receipt.command != "attach" {
             return Err(session::Error::Conflict(
@@ -1064,6 +1084,35 @@ async fn attach(
             "storage unsafe; uploads are blocked",
         ));
     }
+    let key = format!("{id}/{}", query.request_id);
+    let body = match (query.offset, query.total, part) {
+        (None, None, _) => body,
+        (Some(offset), Some(total), Some(part)) => {
+            let limit = if query.kind == "image" {
+                10 << 20
+            } else {
+                25 << 20
+            };
+            if total > limit {
+                return Err(session::Error::Conflict(if query.kind == "image" {
+                    "image exceeds the 10 MiB limit"
+                } else {
+                    "file exceeds the 25 MiB limit"
+                }));
+            }
+            match attach_part(&key, offset, total, &part).map_err(session::Error::Conflict)? {
+                (_, Some(whole)) => Body::from(whole),
+                (received, None) => {
+                    return Ok((StatusCode::ACCEPTED, Json(json!({ "received": received }))));
+                }
+            }
+        }
+        _ => {
+            return Err(session::Error::Conflict(
+                "offset and total must be sent together",
+            ));
+        }
+    };
     let written = manager
         .workspaces
         .attach(
@@ -1093,7 +1142,59 @@ async fn attach(
             })
         })?;
     let receipt = manager.command(&id, query.request_id, "attach", written)?;
+    PARTS.lock().unwrap().remove(&key);
     Ok(accepted(&manager, &id, receipt))
+}
+
+/// Attachments arriving in parts, by session and request: (total size, bytes so far, last part). Some sandbox
+/// proxies drop requests over about 8 MB, so clients send large files in 4 MiB parts. Unfinished uploads expire.
+type Partial = (usize, Vec<u8>, Instant);
+static PARTS: LazyLock<Mutex<HashMap<String, Partial>>> = LazyLock::new(Default::default);
+const PART_BYTES: usize = 8 << 20;
+
+/// Adds one part; returns the bytes received and, once complete, the whole file. The partial stays until its
+/// receipt is recorded, so a retried last part can save it again.
+fn attach_part(
+    key: &str,
+    offset: usize,
+    total: usize,
+    part: &[u8],
+) -> std::result::Result<(usize, Option<Vec<u8>>), &'static str> {
+    let mut parts = PARTS.lock().unwrap();
+    parts.retain(|_, (_, _, at)| at.elapsed() < Duration::from_secs(600));
+    if offset == 0 && !parts.contains_key(key) {
+        if parts.len() >= 8 {
+            return Err("too many uploads in progress; try again");
+        }
+        parts.insert(key.to_owned(), (total, Vec::new(), Instant::now()));
+    }
+    let (size, bytes, at) = parts.get_mut(key).ok_or("upload part out of order")?;
+    if *size != total {
+        return Err("upload size changed");
+    }
+    append_part(bytes, offset, part, total)?;
+    *at = Instant::now();
+    Ok((bytes.len(), (bytes.len() == total).then(|| bytes.clone())))
+}
+
+/// Appends one part of an upload that arrives in pieces. A repeated part is ignored, so retrying after a lost
+/// response is safe; a gap or overflow is refused.
+pub(crate) fn append_part(
+    buffer: &mut Vec<u8>,
+    offset: usize,
+    part: &[u8],
+    total: usize,
+) -> std::result::Result<(), &'static str> {
+    let end = offset
+        .checked_add(part.len())
+        .filter(|end| *end <= total)
+        .ok_or("upload part exceeds the upload size")?;
+    if offset == buffer.len() {
+        buffer.extend_from_slice(part);
+    } else if end > buffer.len() {
+        return Err("upload part out of order");
+    }
+    Ok(())
 }
 async fn interrupt(
     State(manager): State<Arc<Manager>>,

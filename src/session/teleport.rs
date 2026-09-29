@@ -834,7 +834,7 @@ impl Manager {
             }
             // This single fsynced record includes all queued work and the ownership decision.
             local.append(&session_id, "teleport", json!({"receipt":receipt,"prompts":prompts,"native_id":manifest.native_id,"native_path":native_path}), None)?;
-            self.schedule_resume(&mut local, &session_id)?;
+            self.schedule_resume(&mut local, &session_id, false)?;
         }
         self.teleport_files_ready(&transfer)?;
         self.transfer_view(&transfer)

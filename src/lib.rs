@@ -43,6 +43,7 @@ pub const FEATURES: &[&str] = &[
     "steer",
     "rewind",
     "attachments",
+    "upload_parts",
     "compact",
     "usage",
     "subagents",
