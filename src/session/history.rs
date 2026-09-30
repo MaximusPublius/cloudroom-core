@@ -81,6 +81,17 @@ impl History {
         Ok(())
     }
 
+    /// Saves a cloud agent's Cloudroom bug report (ADR 0158). The login may only insert reports for its own user.
+    pub async fn report(
+        &self,
+        message: &str,
+        context: &serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO cloudroom_bug_reports (user_id, origin, message, context) VALUES ($1::uuid, 'cloud', $2, $3::jsonb)")
+            .bind(&self.store).bind(message).bind(context.to_string())
+            .execute(&self.pool).await.map(drop)
+    }
+
     pub async fn summary(
         &self,
         id: &str,

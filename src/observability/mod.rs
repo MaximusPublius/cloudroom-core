@@ -78,6 +78,14 @@ pub(crate) enum Signal {
         reason: &'static str,
     },
     Resources(system::Resources),
+    ComputerUse {
+        session_id: String,
+        tool: String,
+        app: Option<String>,
+        outcome: String,
+        effect: Option<String>,
+        duration_ms: u64,
+    },
     Diagnostics {
         dropped: u64,
         local_write_failures: u64,

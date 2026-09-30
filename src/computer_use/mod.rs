@@ -3,10 +3,25 @@
 //! Everything here runs as the agent and starts lazily on the first call. The sandbox is the
 //! boundary, so apps need no per-app approval here (docs/scopes/computer-use.md).
 
+use crate::observability::Signal;
+use crate::preview::Peer;
+use crate::session::{
+    Manager,
+    thread::{Failure, caller, fail},
+};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    http::StatusCode,
+    routing::post,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const SKILL: &str = include_str!("SKILL.md");
@@ -158,7 +173,75 @@ fn ensure_desktop() -> Result<String, Error> {
     Ok(socket)
 }
 
-fn call(tool: &str, json: Option<&String>) -> Result<i32, Error> {
+/// One `cloudroom computer-use call`, for product diagnostics. Never screen content or typed text.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Event {
+    tool: String,
+    app: Option<String>,
+    outcome: String,
+    effect: Option<String>,
+    ms: u64,
+}
+
+/// Served on the agent-only socket that `cloudroom mac` also uses.
+pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
+    Router::new().route("/computer-use/event", post(event))
+}
+
+async fn event(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(input): Json<Event>,
+) -> Result<Json<Value>, Failure> {
+    let session_id = caller(&m, peer, "computer-use")?;
+    let short = |value: String| value.chars().take(120).collect::<String>();
+    if input.tool.is_empty() || input.outcome.is_empty() {
+        return Err(fail(StatusCode::CONFLICT, "tool and outcome are required"));
+    }
+    m.observability.record(Signal::ComputerUse {
+        session_id,
+        tool: short(input.tool),
+        app: input.app.map(short),
+        outcome: short(input.outcome),
+        effect: input.effect.map(short),
+        duration_ms: input.ms,
+    });
+    Ok(Json(json!({"recorded":true})))
+}
+
+/// The app a call targets: the process name for a pid, or the name `launch_app` got.
+fn target(args: &serde_json::Map<String, Value>) -> Option<String> {
+    if let Some(pid) = args.get("pid").and_then(Value::as_u64) {
+        return std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|name| name.trim().to_owned());
+    }
+    args.get("bundle_id")
+        .or(args.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Reports one call without ever failing or slowing the command noticeably.
+async fn report(tool: &str, app: Option<String>, stdout: &[u8], code: i32, started: Instant) {
+    let parsed: Value = serde_json::from_slice(stdout).unwrap_or(Value::Null);
+    let field = |key: &str| parsed.get(key).and_then(Value::as_str).map(str::to_owned);
+    let outcome = field("error")
+        .or(field("code"))
+        .unwrap_or_else(|| if code == 0 { "ok" } else { "error" }.into());
+    let body = json!({"tool":tool,"app":app,"outcome":outcome,"effect":field("effect"),"ms":started.elapsed().as_millis() as u64});
+    let send = crate::mac::request(
+        crate::mac::SOCKET,
+        "POST",
+        "/computer-use/event",
+        Some(body),
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), send).await;
+}
+
+async fn call(tool: &str, json: Option<&String>) -> Result<i32, Error> {
+    let started = Instant::now();
     if BLOCKED_TOOLS.contains(&tool) {
         return Err(
             format!("{tool} changes Cua Driver itself and is not available to agents.").into(),
@@ -184,8 +267,16 @@ fn call(tool: &str, json: Option<&String>) -> Result<i32, Error> {
             format!("{STATE}/shots/{tool}-{stamp}.png").into(),
         );
     }
-    let socket = ensure_desktop()?;
-    let status = desktop_env(&mut Command::new(DRIVER))
+    let app = target(&args);
+    let socket = match ensure_desktop() {
+        Ok(socket) => socket,
+        Err(error) => {
+            let failure = json!({"error":"desktop_unavailable"}).to_string();
+            report(tool, app, failure.as_bytes(), 1, started).await;
+            return Err(error);
+        }
+    };
+    let output = desktop_env(&mut Command::new(DRIVER))
         .args([
             "call",
             "--socket",
@@ -193,11 +284,15 @@ fn call(tool: &str, json: Option<&String>) -> Result<i32, Error> {
             tool,
             &serde_json::Value::Object(args).to_string(),
         ])
-        .status()?;
-    Ok(status.code().unwrap_or(1))
+        .stderr(Stdio::inherit())
+        .output()?;
+    std::io::Write::write_all(&mut std::io::stdout(), &output.stdout)?;
+    let code = output.status.code().unwrap_or(1);
+    report(tool, app, &output.stdout, code, started).await;
+    Ok(code)
 }
 
-pub fn cli(args: &[String]) -> Result<i32, Error> {
+pub async fn cli(args: &[String]) -> Result<i32, Error> {
     match args.first().map(String::as_str) {
         Some("status") => {
             let installed = Path::new(DRIVER).exists();
@@ -232,7 +327,7 @@ pub fn cli(args: &[String]) -> Result<i32, Error> {
             };
             Ok(desktop_env(&mut command).status()?.code().unwrap_or(1))
         }
-        Some("call") => call(args.get(1).ok_or(USAGE)?, args.get(2)),
+        Some("call") => call(args.get(1).ok_or(USAGE)?, args.get(2)).await,
         _ => Err(USAGE.into()),
     }
 }

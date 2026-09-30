@@ -15,7 +15,7 @@ use std::{io, sync::Arc};
 const USAGE: &str = "cloudroom thread update --self --title TITLE
 cloudroom thread archive --self
 cloudroom thread stop --self";
-type Failure = (StatusCode, Json<Value>);
+pub(crate) type Failure = (StatusCode, Json<Value>);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,10 +26,6 @@ pub struct Rename {
 fn valid(title: &str) -> bool {
     !title.is_empty() && title.chars().count() <= 200 && !title.chars().any(char::is_control)
 }
-fn fail(status: StatusCode, error: &str) -> Failure {
-    (status, Json(json!({"error":error})))
-}
-
 /// Served on the agent-only socket that `cloudroom mac` also uses.
 pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
     Router::new()
@@ -37,20 +33,24 @@ pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
         .route("/archive", post(archive))
 }
 
-/// The session whose harness process sent this request.
-fn caller(m: &Manager, peer: Peer) -> Result<String, Failure> {
+/// The session whose harness process sent this `cloudroom <command>` request.
+pub(crate) fn caller(m: &Manager, peer: Peer, command: &str) -> Result<String, Failure> {
     if peer.0.is_none() || m.previews.agent().map(|(_, uid)| uid) != peer.0 {
         return Err(fail(
             StatusCode::FORBIDDEN,
-            "Only the VM agent account may change threads",
+            &format!("Only the VM agent account may run cloudroom {command}"),
         ));
     }
     peer.1
         .and_then(|pid| m.harness_session(&crate::secrets::ancestors(pid)))
         .ok_or(fail(
             StatusCode::CONFLICT,
-            "Run cloudroom thread from a Cloudroom cloud thread",
+            &format!("Run cloudroom {command} from a Cloudroom cloud thread"),
         ))
+}
+
+pub(crate) fn fail(status: StatusCode, error: &str) -> Failure {
+    (status, Json(json!({"error":error})))
 }
 
 fn record(m: &Manager, session: &str, kind: &str, data: Value) -> Result<Json<Value>, Failure> {
@@ -68,7 +68,7 @@ async fn rename(
     ConnectInfo(peer): ConnectInfo<Peer>,
     Json(input): Json<Rename>,
 ) -> Result<Json<Value>, Failure> {
-    let session = caller(&m, peer)?;
+    let session = caller(&m, peer, "thread")?;
     let title = input.title.trim();
     if !valid(title) {
         return Err(fail(
@@ -84,7 +84,7 @@ async fn archive(
     State(m): State<Arc<Manager>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
 ) -> Result<Json<Value>, Failure> {
-    let session = caller(&m, peer)?;
+    let session = caller(&m, peer, "thread")?;
     record(&m, &session, "archive", json!({"archived":true}))
 }
 

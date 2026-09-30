@@ -1,0 +1,88 @@
+//! Cloud agents report Cloudroom bugs by themselves (ADR 0158). The core saves each report straight
+//! to the database with its own login, so reports arrive even while the user's Mac is offline.
+use super::{
+    Manager,
+    thread::{Failure, caller, fail},
+};
+use crate::preview::Peer;
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    http::StatusCode,
+    routing::post,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{io, sync::Arc};
+
+const USAGE: &str = "cloudroom report MESSAGE
+Reports a Cloudroom bug to the Cloudroom team: what you did, what happened, what you expected, and the exact error. Never include secrets, personal data, or the user's code.";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Report {
+    message: String,
+}
+
+/// Served on the agent-only socket that `cloudroom mac` also uses.
+pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
+    Router::new().route("/report", post(report))
+}
+
+async fn report(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(input): Json<Report>,
+) -> Result<Json<Value>, Failure> {
+    let session = caller(&m, peer, "report")?;
+    let message = input.message.trim();
+    if message.is_empty() || message.chars().count() > 4000 {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "Use a message of 1-4000 characters",
+        ));
+    }
+    let harness = m
+        .local
+        .lock()
+        .unwrap()
+        .sessions
+        .get(&session)
+        .map(|s| s.harness);
+    let context = json!({"core":crate::VERSION,"instance":m.config.instance,"session":session,"harness":harness});
+    m.history.report(message, &context).await.map_err(|error| {
+        let limited = error
+            .as_database_error()
+            .is_some_and(|e| e.code().as_deref() == Some("P0429"));
+        fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            if limited {
+                "Too many bug reports. Try again later."
+            } else {
+                "Could not save the bug report"
+            },
+        )
+    })?;
+    Ok(Json(json!({"sent":true})))
+}
+
+/// `cloudroom report MESSAGE`, the cloud twin of `room-cli report`.
+pub async fn cli(args: &[String]) -> io::Result<i32> {
+    let [message] = args else {
+        println!("{USAGE}");
+        return Ok(if args.is_empty() { 0 } else { 2 });
+    };
+    if message == "--help" {
+        println!("{USAGE}");
+        return Ok(0);
+    }
+    let answer = crate::mac::request(
+        crate::mac::SOCKET,
+        "POST",
+        "/report",
+        Some(json!({"message":message})),
+    )
+    .await?;
+    println!("{answer}");
+    Ok(0)
+}

@@ -7,6 +7,7 @@ mod catalog;
 mod guard;
 mod history;
 mod prompt;
+pub mod report;
 mod sleep;
 mod state;
 pub mod thread;
