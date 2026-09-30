@@ -40,6 +40,9 @@ const BODY: usize = 5 * LIMIT;
 /// A connected helper must confirm each job quickly; a sleeping Mac must not hang agents.
 const ACK: Duration = Duration::from_secs(10);
 const KEEP: Duration = Duration::from_secs(3600);
+/// A new sandbox's helper needs a few seconds to find and pair with it, so early calls wait for it.
+const FRESH: Duration = Duration::from_secs(60);
+const ATTACH: Duration = Duration::from_secs(30);
 const UNAVAILABLE: &str = "Mac unavailable: the paired Mac is offline, asleep, or has Mac access turned off. Continue cloud work and try again later.";
 pub const SKILL: &str = include_str!("cloud-mac/SKILL.md");
 pub const ROOM_CLI_SKILL: &str = include_str!("room-cli/SKILL.md");
@@ -92,6 +95,7 @@ pub struct Mac {
     helper: Mutex<Option<Helper>>,
     changed: watch::Sender<u64>,
     next: AtomicU64,
+    started: Instant,
 }
 impl Default for Mac {
     fn default() -> Self {
@@ -100,6 +104,7 @@ impl Default for Mac {
             helper: Mutex::default(),
             changed: watch::channel(0).0,
             next: AtomicU64::new(0),
+            started: Instant::now(),
         }
     }
 }
@@ -298,14 +303,20 @@ async fn local_run(
     local_auth(&m, peer)?;
     validate(&run)?;
     let mac = &m.mac;
-    let Some((generation, device, events)) = mac
-        .helper
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|h| (h.generation, h.device.clone(), h.events.clone()))
-    else {
-        return Err(conflict(UNAVAILABLE));
+    let mut changed = mac.changed.subscribe();
+    let fresh = mac.started.elapsed() < FRESH;
+    let wait = Instant::now() + if fresh { ATTACH } else { Duration::ZERO };
+    let (generation, device, events) = loop {
+        if let Some(h) = mac.helper.lock().unwrap().as_ref() {
+            break (h.generation, h.device.clone(), h.events.clone());
+        }
+        if Instant::now() >= wait {
+            return Err(conflict(UNAVAILABLE));
+        }
+        tokio::select! {
+            _ = changed.changed() => {},
+            _ = tokio::time::sleep_until(wait.into()) => {},
+        }
     };
     let id = format!(
         "{}-{}",
@@ -340,7 +351,6 @@ async fn local_run(
         events,
         armed: true,
     };
-    let mut changed = mac.changed.subscribe();
     let started = Instant::now();
     loop {
         let connected = mac.connected(generation);

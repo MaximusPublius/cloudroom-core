@@ -30,7 +30,8 @@ const DRIVER: &str = "/usr/local/lib/cloudroom/cua-driver/cua-driver";
 const DISPLAY: &str = ":99";
 const X_SOCKET: &str = "/tmp/.X11-unix/X99";
 const STATE: &str = "/tmp/cloudroom-computer-use";
-const SESSION: &str = "cloudroom";
+// Cua Driver colors a session ending in "-8" with its lime palette slot, our brand color.
+const SESSION: &str = "cloudroom-8";
 // Upstream tools that accept a `session` label. One label keeps screenshots valid across calls.
 const SESSION_TOOLS: &[&str] = &[
     "browser_click",
