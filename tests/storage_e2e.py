@@ -300,6 +300,9 @@ def main():
         request('POST','/v1/sessions',{'request_id':'blocked'},409)
         request('POST','/v1/sessions/'+ids[0]+'/prompts',{'request_id':'blocked-input','text':'never run'},409)
         assert request('GET','/v1/sessions/'+ids[0]+'/events')['events']
+        # The pause may never lift on its own, so the sandbox must still be allowed to sleep.
+        assert request('POST','/v1/drain',{'hold':True})['drained'] is True
+        request('POST','/v1/drain',{'hold':False})
         passed('emergency pause blocks new writes but leaves core and saved history readable')
         (work/'final-output').unlink();filler.unlink();extra.unlink()
         wait(ready,'operator recovery',30)

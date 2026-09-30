@@ -195,8 +195,8 @@ Any VM or sandbox provider can run Core if its machines give all of this. `evals
 - **Writable cgroup v2.** Core creates its own cgroup with `cgroup.freeze` and `cgroup.kill` to stop whole agent process trees.
 - **Capabilities** `setuid`, `setgid`, `dac_read_search` and `kill` in the bounding set, plus `setpcap` to hand them to Core's service account.
 - **Or, without those two, sudo for agents:** a container whose agents may have sudo runs Core in [container mode](storage.md#containers) instead.
-- **One disk** for `/code`, `/tmp`, `/var/tmp`, `/var/cache`, `/var/lib/cloudroom` and the agent's home, kept across stops. Core watches free space there, so a separate memory-backed `/tmp` fails. Container mode allows a memory-backed `/var/tmp` and `/var/cache`.
-- **A public HTTPS URL for port 9840** that passes the `Authorization` or `X-Cloudroom-Token` header unchanged, streams server-sent events without buffering, keeps idle streams open (Core sends a keep-alive every 15 seconds), and forwards `Upgrade: cloudroom-tunnel` for previews and Mac access.
+- **One disk** for `/code`, `/tmp`, `/var/tmp`, `/var/cache`, `/var/lib/cloudroom` and the agent's home, kept across stops. Core watches free space there. A memory-backed `/tmp` is fine: `sandbox-start.sh` then gives Core its own mount namespace with a folder on that disk over `/tmp`. Container mode allows a memory-backed `/var/tmp` and `/var/cache`.
+- **A public HTTPS URL for port 9840** that passes the `Authorization` or `X-Cloudroom-Token` header unchanged, streams server-sent events without buffering, keeps idle streams open (Core sends a keep-alive every 15 seconds), and forwards `Upgrade: websocket` for previews and Mac access.
 - **The database nearby.** Every history write waits one round trip to the database pooler, over IPv4.
 - **No process kills while agents work.** A stop may end every process; `sandbox-start.sh` restarts Core from its saved state on the next start.
 

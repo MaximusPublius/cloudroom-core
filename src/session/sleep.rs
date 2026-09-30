@@ -103,10 +103,11 @@ impl Manager {
             return json!({"drained": false});
         }
         // Closed sessions keep their close request forever, but nothing of theirs is running.
+        // A low-disk pause may never lift on its own, so it must not keep the machine awake.
         let busy = local
             .sessions
             .values()
-            .filter(|s| s.state != "closed")
+            .filter(|s| s.state != "closed" && !s.storage_paused)
             .find(|s| {
                 s.busy()
                     || s.compacting

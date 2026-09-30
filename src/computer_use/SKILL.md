@@ -1,6 +1,6 @@
 ---
 name: cloud-computer-use
-description: 'See and control desktop apps on this Cloud sandbox’s virtual Linux screen with `cloudroom computer-use`: launch GUI apps you build or install, read their UI, click, type, and take screenshots. Use for visual QA and GUI testing when no API, CLI, or headless browser fits.'
+description: 'See and control desktop apps on this Cloud sandbox’s virtual Linux screen with `cloudroom computer-use`: launch GUI apps you build or install, read their UI, click, type, and take screenshots. Use for visual QA and GUI testing when no API, CLI, or headless browser fits, and before rendering 3D, WebGL, or WebGPU in a browser here (no GPU).'
 ---
 
 # Computer use in a Cloud thread
@@ -31,6 +31,18 @@ cloudroom computer-use status
 3. Act once. Prefer `element_token`: `click`, `set_value`, `type_text`, `press_key`, `hotkey`, `scroll`. Pixels come from the latest screenshot of that window. Never guess.
 4. Verify with a fresh `get_window_state`. A success reply alone proves nothing. `effect:"unverifiable"` means check the screenshot.
 5. Re-observe after every action. Snapshots go stale.
+
+## 3D and WebGL in a browser
+
+This sandbox has no GPU, so Chrome draws 3D on the CPU. Its default renderer is slow: a heavy Three.js scene takes over 3 seconds per frame. Mesa's renderer is about 4x faster, but needs the virtual screen and two flags.
+
+1. `cloudroom computer-use start` for the screen.
+2. Launch Chrome headed with `DISPLAY=:99` and `--use-angle=gl --ignore-gpu-blocklist`. In Playwright: `chromium.launch({ headless: false, args: ['--use-angle=gl', '--ignore-gpu-blocklist'] })`.
+3. For WebGPU, also add `--enable-unsafe-webgpu --use-webgpu-adapter=swiftshader`.
+
+- Don't drop a flag: `--use-angle=gl` alone, or without the screen, silently turns WebGL off.
+- Verify: `WEBGL_debug_renderer_info` must report `llvmpipe`, and the screenshot must show the scene. A successful screenshot call proves nothing.
+- Games, long videos, and big scenes stay slow. Ask the user to run those on their Mac with `cloudroom mac run`.
 
 ## Rules
 

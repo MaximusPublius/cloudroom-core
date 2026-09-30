@@ -12,6 +12,12 @@ root=/usr/local/lib/cloudroom config=/etc/cloudroom log=/var/log/cloudroom
 cgroup=/sys/fs/cgroup/cloudroom pidfile=/run/cloudroom-supervisor.pid
 if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then echo 'Core already running'; exit 0; fi
 [ -x "$root/cloudroom" ] && [ -f "$config/core.env" ] && [ -f "$config/storage.json" ] || { echo 'Core is not configured' >&2; exit 1; }
+# Core needs /tmp on the disk it monitors (docs/storage.md). Where /tmp is a memory disk, Core and its agents get
+# their own mount namespace with a folder on that disk over /tmp; the rest of the machine keeps its /tmp.
+if [ -z "${CLOUDROOM_DISK_TMP:-}" ] && [ "$(stat -c %d /tmp)" != "$(stat -c %d /code)" ]; then
+  install -d -m 1777 /var/lib/cloudroom-tmp
+  CLOUDROOM_DISK_TMP=1 exec unshare --mount --propagation private bash -c 'mount --bind /var/lib/cloudroom-tmp /tmp && exec "$0"' "$0"
+fi
 
 # Only CLOUDROOM_ settings, never shell code: the files are parsed, not sourced.
 settings=()

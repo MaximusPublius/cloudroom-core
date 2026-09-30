@@ -558,17 +558,22 @@ async fn tunnel(
     Query(input): Query<TunnelDevice>,
     mut request: Request,
 ) -> Result<Response> {
-    if request
+    // Some sandbox proxies relay bytes only after a WebSocket handshake, so `websocket` names the same raw tunnel.
+    // No WebSocket frames follow either way.
+    let protocol = match request
         .headers()
         .get(header::UPGRADE)
         .and_then(|v| v.to_str().ok())
-        != Some("cloudroom-tunnel")
     {
-        return Err(Failure(
-            StatusCode::BAD_REQUEST,
-            "Send Upgrade: cloudroom-tunnel".into(),
-        ));
-    }
+        Some("cloudroom-tunnel") => "cloudroom-tunnel",
+        Some("websocket") => "websocket",
+        _ => {
+            return Err(Failure(
+                StatusCode::BAD_REQUEST,
+                "Send Upgrade: websocket or cloudroom-tunnel".into(),
+            ));
+        }
+    };
     let mut upstream = m.previews.connect(port, &input.device).await?;
     let upgrade = hyper::upgrade::on(&mut request);
     let task = tokio::spawn(async move {
@@ -587,7 +592,7 @@ async fn tunnel(
     Ok(Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(header::CONNECTION, "upgrade")
-        .header(header::UPGRADE, "cloudroom-tunnel")
+        .header(header::UPGRADE, protocol)
         .body(Body::empty())
         .unwrap())
 }
