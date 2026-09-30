@@ -115,6 +115,51 @@ impl Workload {
             Group::Marked(id) => members(Some(id)).ok().map(|m| m.len()),
         }
     }
+    /// Kills the process group, other than the harness's own, that wrote the most to disk: a tool command,
+    /// never the harness or the helpers it did not detach. The youngest group wins when write counts are
+    /// unreadable. Returns the heaviest writer's command line, or None when nothing but the harness remains.
+    pub fn kill_top_writer(&self, harness: u32) -> io::Result<Option<String>> {
+        let pids: Vec<i32> = match &self.group {
+            Group::Cgroup(directory) => fs::read_to_string(directory.join("cgroup.procs"))?
+                .lines()
+                .filter_map(|line| line.parse().ok())
+                .collect(),
+            Group::Marked(id) => members(Some(id))?.into_iter().map(|m| m.pid).collect(),
+        };
+        let own_group = stat(harness as i32).map(|(group, _)| group);
+        let mut groups: std::collections::HashMap<i32, Vec<(i32, u64, u64)>> = Default::default();
+        for pid in pids {
+            if let Some((group, started)) = stat(pid)
+                && pid != harness as i32
+                && Some(group) != own_group
+            {
+                groups
+                    .entry(group)
+                    .or_default()
+                    .push((pid, written(pid), started));
+            }
+        }
+        let Some(members) = groups.into_values().max_by_key(|m| {
+            (
+                m.iter().map(|p| p.1).sum::<u64>(),
+                m.iter().map(|p| p.2).max(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        let heaviest = members.iter().max_by_key(|p| (p.1, p.2)).map(|p| p.0);
+        let command = heaviest
+            .and_then(|pid| fs::read(format!("/proc/{pid}/cmdline")).ok())
+            .map(|raw| {
+                String::from_utf8_lossy(&raw)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        members.iter().for_each(|p| signal(p.0, SIGKILL));
+        Ok(Some(command))
+    }
     pub fn terminate(&self) -> io::Result<()> {
         match &self.group {
             // The directory is created exclusively by this Runtime, never supplied by a client.
@@ -221,6 +266,22 @@ fn members(id: Option<&str>) -> io::Result<Vec<Member>> {
     }
     Ok(found)
 }
+/// A process's group and start time, from `/proc/PID/stat`.
+fn stat(pid: i32) -> Option<(i32, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    Some((fields.get(2)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+/// Bytes a process sent to disk. Zero when unreadable: another account's counters need ptrace rights.
+fn written(pid: i32) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()
+        .and_then(|io| {
+            io.lines()
+                .find_map(|line| line.strip_prefix("write_bytes: ")?.parse().ok())
+        })
+        .unwrap_or(0)
+}
 fn signal(pid: i32, number: i32) {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
@@ -310,5 +371,57 @@ pub(super) async fn reply<T>(
             }
             remaining = remaining.saturating_sub(start.elapsed());
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_disk_stops_the_writing_tool_command_not_the_harness() {
+        let id = format!("disk-test-{}", std::process::id());
+        // A real disk: writes to a memory disk are not counted as disk writes.
+        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(&id);
+        let spawn = |script: String, detach: bool| {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &script]).env("CLOUDROOM_WORKLOAD", &id);
+            if detach {
+                command.process_group(0);
+            }
+            command.spawn().unwrap()
+        };
+        let mut harness = spawn("sleep 30".into(), false);
+        // The shell itself writes 64 MB, then stays alive. The idle group starts last, so only the
+        // write counts can single out the writer.
+        let mut writer = spawn(
+            format!(
+                "i=0; while [ $i -lt 1000 ]; do printf '%065536d' 0; i=$((i+1)); done > {}; sleep 30",
+                file.display()
+            ),
+            true,
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        let mut idle = spawn("sleep 30".into(), true);
+        std::thread::sleep(Duration::from_millis(200));
+        let workload = Workload {
+            group: Group::Marked(id),
+            paused: watch::channel(false).0,
+        };
+        let stopped = workload.kill_top_writer(harness.id()).unwrap().unwrap();
+        assert!(stopped.starts_with("sh -c i=0"), "{stopped}");
+        assert!(
+            writer.wait().unwrap().code().is_none(),
+            "the writer was killed"
+        );
+        assert!(harness.try_wait().unwrap().is_none() && idle.try_wait().unwrap().is_none());
+        for mut child in [harness, idle] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_file(file);
     }
 }

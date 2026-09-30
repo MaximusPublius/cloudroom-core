@@ -319,6 +319,13 @@ def main():
         request('POST','/v1/sessions',{'request_id':'missing-disk'},409)
         missing.rename(work); wait(ready,'filesystem measurements recover')
         passed('failed filesystem measurements pause work; restored measurements permit recovery')
+        # Frozen work never frees space, so a pause that cannot recover stops the writer and resumes work.
+        write_as_agent(work/'rescue-output',shutil.disk_usage(base).free//1048576-75)
+        wait(lambda:all(session(s)['storage_paused'] for s in ids),'pause before rescue')
+        wait(lambda:all(not session(s)['storage_paused'] for s in ids),'rescue resumes work',60)
+        for sid in ids:assert any(r['kind']=='storage_warning' and r['data'].get('reason')=='rescue' for r in events(sid))
+        (work/'rescue-output').unlink()
+        passed('a pause that cannot recover stops the writing command and resumes work')
     except Exception:
         subprocess.run(['journalctl','--unit='+unit,'--no-pager','--lines=80'],check=False)
         try: print('Core health:',json.dumps(request('GET','/v1/health')),flush=True)

@@ -145,10 +145,16 @@ impl Policy {
         Ok(())
     }
 
-    fn level(&self, available: u64, previous: Level) -> Level {
-        if available < self.pause_bytes
-            || (previous == Level::Blocked && available <= self.resume_bytes)
-        {
+    /// `floor` replaces the pause threshold after a rescue (`Guard::rescue`).
+    fn level(&self, available: u64, previous: Level, floor: Option<u64>) -> Level {
+        let blocked = match floor {
+            Some(floor) => available < floor,
+            None => {
+                available < self.pause_bytes
+                    || (previous == Level::Blocked && available <= self.resume_bytes)
+            }
+        };
+        if blocked {
             Level::Blocked
         } else if available <= self.warning_bytes {
             Level::LowSpace
@@ -203,6 +209,7 @@ pub struct Guard {
     policy: Option<Policy>,
     value: Mutex<(Snapshot, Instant)>,
     writers: Mutex<Vec<Weak<linux::Workload>>>,
+    floor: Mutex<Option<u64>>,
 }
 impl Guard {
     pub fn new(config: &Config) -> io::Result<Self> {
@@ -212,6 +219,7 @@ impl Guard {
         Ok(Self {
             policy: config.storage.clone(),
             writers: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
             value: Mutex::new((
                 Snapshot::unavailable(config.storage.is_some()),
                 Instant::now(),
@@ -229,13 +237,41 @@ impl Guard {
     pub fn blocks(&self) -> bool {
         self.snapshot().level == Level::Blocked
     }
+    /// Frozen work never frees space. Once Cloudroom has stopped the command filling the disk, work continues
+    /// until half of the space left is used, then pauses again. Space above `resume_bytes` ends the rescue.
+    pub fn rescue(&self) {
+        let (snapshot, _) = &*self.value.lock().unwrap();
+        if let (Some(workspace), Some(history)) = (
+            snapshot.workspace_available_bytes,
+            snapshot.history_available_bytes,
+        ) {
+            *self.floor.lock().unwrap() = Some(workspace.min(history) / 2);
+        }
+    }
     pub(crate) fn spawn_writer(
         &self,
         command: &mut Command,
     ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
+        self.spawn(command, true)
+    }
+
+    /// Emergency operator access: runs while storage is blocked and is never frozen,
+    /// so a person can read work back and free space.
+    pub(crate) fn spawn_operator(
+        &self,
+        command: &mut Command,
+    ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
+        self.spawn(command, false)
+    }
+
+    fn spawn(
+        &self,
+        command: &mut Command,
+        gated: bool,
+    ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
         // Serialize admission with pause snapshots so a just-started writer is never missed.
         let mut writers = self.writers.lock().unwrap();
-        if self.blocks() {
+        if gated && self.blocks() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "storage unsafe; file writes are blocked",
@@ -252,7 +288,7 @@ impl Guard {
             .transpose()?;
         let child = command.spawn()?;
         writers.retain(|writer| writer.strong_count() > 0);
-        if let Some(group) = &workload {
+        if let Some(group) = workload.as_ref().filter(|_| gated) {
             writers.push(Arc::downgrade(group));
         }
         Ok((child, workload))
@@ -286,10 +322,14 @@ impl Guard {
             let (workspace, history) =
                 tokio::join!(disk(workspaces.root()), disk(&config.state_dir));
             let (workspace, history) = (workspace?, history?);
-            let level = p.level(
-                workspace.available_bytes.min(history.available_bytes),
-                previous,
-            );
+            let available = workspace.available_bytes.min(history.available_bytes);
+            let level = {
+                let mut floor = self.floor.lock().unwrap();
+                if available > p.resume_bytes {
+                    *floor = None;
+                }
+                p.level(available, previous, *floor)
+            };
             Ok::<_, io::Error>(Snapshot {
                 enabled: true,
                 level,
@@ -568,11 +608,12 @@ mod tests {
             (5_000_000_000, Level::Blocked, Level::LowSpace),
             (5_000_000_001, Level::Blocked, Level::Normal),
         ] {
-            let level = policy.level(available, before);
+            let level = policy.level(available, before, None);
             assert_eq!(level, expected, "{available} bytes, previously {before:?}");
             let guard = Guard {
                 policy: None,
                 writers: Mutex::new(Vec::new()),
+                floor: Mutex::new(None),
                 value: Mutex::new((
                     Snapshot {
                         enabled: true,
@@ -590,10 +631,50 @@ mod tests {
     }
 
     #[test]
+    fn a_rescue_resumes_work_until_half_the_space_left_is_used() {
+        let policy: Policy = serde_json::from_str(
+            r#"{"agent_uid":1001,"agent_gid":1001,"cache_dir":"/cache","cgroup_root":"/agents"}"#,
+        )
+        .unwrap();
+        let floor = Some(900_000_000);
+        assert_eq!(
+            policy.level(1_800_000_000, Level::Blocked, floor),
+            Level::LowSpace
+        );
+        assert_eq!(
+            policy.level(900_000_000, Level::Blocked, floor),
+            Level::LowSpace
+        );
+        assert_eq!(
+            policy.level(899_999_999, Level::LowSpace, floor),
+            Level::Blocked
+        );
+        let guard = Guard {
+            policy: None,
+            writers: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
+            value: Mutex::new((
+                Snapshot {
+                    enabled: true,
+                    level: Level::Blocked,
+                    workspace_available_bytes: Some(1_900_000_000),
+                    history_available_bytes: Some(1_800_000_000),
+                    reason: "disk_capacity",
+                    ..Snapshot::unavailable(true)
+                },
+                Instant::now(),
+            )),
+        };
+        guard.rescue();
+        assert_eq!(*guard.floor.lock().unwrap(), floor);
+    }
+
+    #[test]
     fn missing_or_stale_measurements_do_not_authorize_writes() {
         let guard = Guard {
             policy: None,
             writers: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
             value: Mutex::new((Snapshot::unavailable(true), Instant::now())),
         };
         assert!(guard.blocks());

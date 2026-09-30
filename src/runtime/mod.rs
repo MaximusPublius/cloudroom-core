@@ -652,6 +652,10 @@ impl Handle {
     pub async fn pause(&self, paused: bool) -> io::Result<()> {
         self.process.pause(paused).await
     }
+    /// Stops the tool command filling the disk; see `linux::Workload::kill_top_writer`.
+    pub fn kill_top_writer(&self) -> io::Result<Option<String>> {
+        self.process.kill_top_writer()
+    }
     pub fn request_shutdown(&self) {
         self.process.request_shutdown();
     }

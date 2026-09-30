@@ -447,20 +447,21 @@ async fn capped(mut reader: impl AsyncRead + Unpin, kept: Arc<Mutex<(Vec<u8>, bo
 /// The paired Mac runs a shell command as the VM agent account.
 async fn vm_run(State(m): State<Arc<Manager>>, Json(run): Json<Run>) -> Result<Json<Value>> {
     let stdin = validate(&run)?;
-    execute(&m, run, stdin).await
+    execute(&m, run, stdin, false).await
 }
 
 /// Like `vm_run`, with the command in the query and stdin as the raw body: half the bytes of hex.
+/// Bulk project copies use it, so it stays blocked while disk space is critically low.
 async fn vm_run_raw(
     State(m): State<Arc<Manager>>,
     Query(run): Query<Run>,
     stdin: Bytes,
 ) -> Result<Json<Value>> {
     validate(&run)?;
-    execute(&m, run, stdin.into()).await
+    execute(&m, run, stdin.into(), true).await
 }
 
-async fn execute(m: &Manager, run: Run, stdin: Vec<u8>) -> Result<Json<Value>> {
+async fn execute(m: &Manager, run: Run, stdin: Vec<u8>, gated: bool) -> Result<Json<Value>> {
     let home = &m.config.account_home;
     let folder = run.cwd.as_ref().map_or(home.clone(), |d| home.join(d));
     if !folder.is_dir() {
@@ -478,7 +479,13 @@ async fn execute(m: &Manager, run: Run, stdin: Vec<u8>) -> Result<Json<Value>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let (mut child, _workload) = m.storage.spawn_writer(&mut command).map_err(|error| {
+    // Plain commands are the emergency way in: they still run while storage is blocked.
+    let spawned = if gated {
+        m.storage.spawn_writer(&mut command)
+    } else {
+        m.storage.spawn_operator(&mut command)
+    };
+    let (mut child, _workload) = spawned.map_err(|error| {
         Failure(
             StatusCode::CONFLICT,
             format!("VM command could not start: {error}"),

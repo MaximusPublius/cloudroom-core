@@ -1,6 +1,9 @@
 //! Background loops: the disk safety guard and the history uploader.
 use super::*;
 
+/// How long work stays frozen before Cloudroom stops the command filling the disk.
+const RESCUE_AFTER: Duration = Duration::from_secs(30);
+
 impl Manager {
     pub async fn check_storage(&self) -> Snapshot {
         self.storage.refresh(&self.config, &self.workspaces).await
@@ -23,6 +26,7 @@ impl Manager {
         tokio::spawn(async move {
             let mut last_cleanup = Instant::now() - Duration::from_secs(60);
             let mut was_blocked = manager.storage.blocks();
+            let mut blocked_since: Option<Instant> = None;
             while !manager.is_stopping() {
                 let snapshot = manager.check_storage().await;
                 if snapshot.level != Level::Normal {
@@ -41,9 +45,9 @@ impl Manager {
                             let text = if snapshot.reason == "measurement_unavailable" {
                                 "Cloudroom: disk space could not be measured. Work is paused until storage can be verified. Your files and history are preserved."
                             } else if snapshot.level == Level::Blocked {
-                                "Cloudroom: disk space is critically low. Work is paused until storage recovers. Your files and history are preserved."
+                                "Cloudroom: the disk is almost full, so work is paused. If space does not recover within 30 seconds, Cloudroom stops the command filling it. Your files and history are preserved."
                             } else {
-                                "Cloudroom: disk space is running low. Work and sync continue. Remove disposable files or add storage; large writes may trigger an emergency pause."
+                                "Cloudroom: disk space is running low. Work and sync continue. Delete files you no longer need; if the disk fills, Cloudroom pauses work and stops the command filling it."
                             };
                             // Persist before delivery. A timed-out native notification is not blindly repeated.
                             if local
@@ -104,7 +108,7 @@ impl Manager {
                                         json!({"paused":true,"reason":snapshot.reason,"text":if snapshot.reason == "measurement_unavailable" {
                                             "Cloudroom: disk space could not be measured. Work is paused until storage can be verified."
                                         } else {
-                                            "Cloudroom: work paused because disk space is critically low. Work resumes automatically when space recovers."
+                                            "Cloudroom: work paused because the disk is almost full. If space does not recover within 30 seconds, Cloudroom stops the command filling it."
                                         }}),
                                         None,
                                     );
@@ -116,6 +120,14 @@ impl Manager {
                     if all_paused && last_cleanup.elapsed() >= Duration::from_secs(30) {
                         let _ = manager.storage.clean().await;
                         last_cleanup = Instant::now();
+                    }
+                    let since = *blocked_since.get_or_insert_with(Instant::now);
+                    if all_paused
+                        && snapshot.reason == "disk_capacity"
+                        && since.elapsed() >= RESCUE_AFTER
+                    {
+                        manager.rescue().await;
+                        blocked_since = None;
                     }
                     was_blocked = true;
                 } else if was_blocked
@@ -146,10 +158,56 @@ impl Manager {
                     // Resume only workloads this guard actually paused. Process-loss
                     // recovery remains the separate lifecycle owner's responsibility.
                     was_blocked = !writers_resumed;
+                    blocked_since = None;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+    }
+
+    /// Frozen work never frees space, so a pause could last forever. Stops the command filling the disk in
+    /// each session and tells its agent to clean up. The lowered threshold (`Guard::rescue`) then lets the
+    /// guard loop thaw everything.
+    async fn rescue(&self) {
+        let handles: Vec<_> = self
+            .local
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .filter_map(|s| s.handle.clone().map(|h| (s.session_id.clone(), h)))
+            .collect();
+        self.storage.rescue();
+        for (id, handle) in handles {
+            let text = match handle.kill_top_writer() {
+                Ok(Some(command)) => {
+                    let command: String = command.replace('`', "'").chars().take(160).collect();
+                    format!(
+                        "Cloudroom: the disk is full, so Cloudroom stopped `{command}`, which was filling it. Free space before continuing: delete files you no longer need, like build output, caches, or node_modules, and check with `df -h`. Do not rerun that command as is."
+                    )
+                }
+                _ => "Cloudroom: the disk is full. Work resumes so you can free space: delete files you no longer need, like build output, caches, or node_modules, and check with `df -h`.".into(),
+            };
+            // Recorded now for the user; the agent reads it once the guard loop thaws it.
+            if self
+                .local
+                .lock()
+                .unwrap()
+                .append(
+                    &id,
+                    "storage_warning",
+                    json!({"text":text,"reason":"rescue"}),
+                    None,
+                )
+                .is_ok()
+            {
+                tokio::spawn(async move {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(10), handle.system_message(&text))
+                            .await;
+                });
+            }
+        }
     }
 
     pub fn start_uploader(self: &Arc<Self>) {
