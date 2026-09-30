@@ -2,6 +2,7 @@
 use crate::{preview::Peer, session::Manager};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Path as RoutePath, Query, State},
     http::StatusCode,
     response::{
@@ -189,6 +190,10 @@ pub fn routes() -> Router<Arc<Manager>> {
         .route(
             "/v1/vm/run",
             post(vm_run).layer(DefaultBodyLimit::max(BODY)),
+        )
+        .route(
+            "/v1/vm/run/raw",
+            post(vm_run_raw).layer(DefaultBodyLimit::max(LIMIT)),
         )
 }
 
@@ -442,6 +447,20 @@ async fn capped(mut reader: impl AsyncRead + Unpin, kept: Arc<Mutex<(Vec<u8>, bo
 /// The paired Mac runs a shell command as the VM agent account.
 async fn vm_run(State(m): State<Arc<Manager>>, Json(run): Json<Run>) -> Result<Json<Value>> {
     let stdin = validate(&run)?;
+    execute(&m, run, stdin).await
+}
+
+/// Like `vm_run`, with the command in the query and stdin as the raw body: half the bytes of hex.
+async fn vm_run_raw(
+    State(m): State<Arc<Manager>>,
+    Query(run): Query<Run>,
+    stdin: Bytes,
+) -> Result<Json<Value>> {
+    validate(&run)?;
+    execute(&m, run, stdin.into()).await
+}
+
+async fn execute(m: &Manager, run: Run, stdin: Vec<u8>) -> Result<Json<Value>> {
     let home = &m.config.account_home;
     let folder = run.cwd.as_ref().map_or(home.clone(), |d| home.join(d));
     if !folder.is_dir() {
