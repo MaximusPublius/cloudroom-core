@@ -28,6 +28,7 @@ use tokio::sync::{mpsc, watch};
 const CAPACITY: usize = 1024;
 const LOCAL_BYTES: u64 = 8 * 1024 * 1024;
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+const HEARTBEAT_UPLOAD_INTERVAL: Duration = Duration::from_secs(300);
 const SLOW_API_MS: u64 = 1000;
 const PRUNE_BATCH: i64 = 1000;
 const STDERR_CAPACITY: usize = 32;
@@ -269,6 +270,7 @@ impl Observability {
         let mut summaries = BTreeMap::new();
         let mut summary_at = Instant::now() + SUMMARY_INTERVAL;
         let mut prune_at = Instant::now();
+        let mut upload_at = Instant::now() + HEARTBEAT_UPLOAD_INTERVAL;
         let (mut local_write_failures, mut upload_failures) = (0, 0);
         loop {
             if !*stop.borrow() {
@@ -383,7 +385,18 @@ impl Observability {
             if stopping && !captures.is_empty() {
                 continue;
             }
-            if !pending.is_empty() {
+            // Idle cores (e.g. hot spares) only produce heartbeat samples. Batch those so
+            // hundreds of sandboxes don't each hold a connection to the shared database.
+            let due = stopping
+                || Instant::now() >= upload_at
+                || pending.iter().any(|record| {
+                    !matches!(
+                        record.signal,
+                        Signal::Resources(_) | Signal::Diagnostics { .. }
+                    )
+                });
+            if !pending.is_empty() && due {
+                upload_at = Instant::now() + HEARTBEAT_UPLOAD_INTERVAL;
                 let payload = serde_json::to_string(&pending).expect("diagnostic serialization");
                 let upload = sqlx::query(
                     "INSERT INTO cloudroom_diagnostics (store, run_id, sequence, timestamp_ms, record) \

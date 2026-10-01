@@ -173,8 +173,8 @@ test("requires secure explicit connection settings", () => {
   assert.equal(JSON.stringify(client), "{}");
 });
 
-test("keeps the Boat gate in a cookie for commands and SSE, never in URLs or errors", async (t) => {
-  const gateToken = "boat-fixture-secret";
+test("keeps the gate token in a cookie for commands and SSE, never in URLs or errors", async (t) => {
+  const gateToken = "gate-fixture-secret";
   const service = await fixture((req, res, body) => {
     assert.equal(req.headers.cookie, `_port_auth=${gateToken}`);
     assert.ok(!req.url!.includes(gateToken));

@@ -22,7 +22,7 @@ Service shutdown signals all harnesses before waiting. Session recording and bes
 
 ## Sleep idle sessions
 
-- After 30 minutes without activity ([ADR 0031](../../docs/adr/0031-automatic-box-pause-and-resume.md)), Core stops the session's harness process and marks it `sleeping`. History stays on disk. A running turn, queued work, busy child sessions, pending interrupts, or new background processes in its workload keep it awake. Unprotected local runs cannot see background processes.
+- After 30 minutes without activity, Core stops the session's harness process and marks it `sleeping`. History stays on disk. A running turn, queued work, busy child sessions, pending interrupts, or new background processes in its workload keep it awake. Unprotected local runs cannot see background processes.
 - `POST /v1/sessions/{id}/sleep` (same body as close) asks for sleep now. It applies once a running turn or interrupt settles. The GUI sends Stop, then Sleep, on Archive.
 - The next prompt, Teleport update, or `resume` of a paused queue resumes the same native conversation, then delivers the work. Compact or rewind on a sleeping session wakes it and returns 409; retry once it is idle.
 - Restart relaunches only sessions with queued work or activity in the last 30 minutes. Other resumable sessions stay or become `sleeping`, so a reboot does not refill memory.

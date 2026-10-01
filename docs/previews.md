@@ -15,15 +15,15 @@ Commands return JSON. Only `state: "ready"` includes a current laptop URL, such 
 
 The open command waits briefly for the helper, then returns pending rather than blocking cloud work. Readiness expires after 15 seconds without a helper report. Readiness checks the browser-facing local proxy through SSH to an HTTP server, not merely the SSH process. It does not mean the application passed its tests.
 
-## Sandboxes
+## Machines without inbound SSH
 
-Cloud sandboxes have no inbound SSH. Their image writes `previews/setup.json` with `"tunnel": true` and no SSH fields. Pairing then returns `{"tunnel":true}`. The helper opens each preview connection as `GET /v1/previews/PORT/tunnel?device=ID` with `Upgrade: websocket` and the core bearer token; cores before 0.1.35 answer that with `400`, so the helper retries with `Upgrade: cloudroom-tunnel`. Either name opens the same raw tunnel, with no WebSocket frames: the `websocket` name only gets it through proxies that relay nothing else. Core rechecks the device, the registration, and the agent's listener, answers `101`, and joins the connection to `127.0.0.1:PORT`. Closing a preview or revoking the device ends its tunnels. Mac access uses the same pairing. The helper finds awake sandboxes through the website with the desktop token.
+Write `previews/setup.json` with `"tunnel": true` and no SSH fields. Pairing then returns `{"tunnel":true}`. The helper opens each preview connection as `GET /v1/previews/PORT/tunnel?device=ID` with `Upgrade: websocket` and the core bearer token; cores before 0.1.35 answer that with `400`, so the helper retries with `Upgrade: cloudroom-tunnel`. Either name opens the same raw tunnel, with no WebSocket frames: the `websocket` name only gets it through proxies that relay nothing else. Core rechecks the device, the registration, and the agent's listener, answers `101`, and joins the connection to `127.0.0.1:PORT`. Closing a preview or revoking the device ends its tunnels. Mac access uses the same pairing.
 
 ## Ownership
 
 - `src/preview/mod.rs`: registry, agent-only Unix socket, authenticated HTTP API, public SSH-key authorization, and CLI. Runs inside the existing core service. Registry writes stay in the protected state directory; no SQL.
 - `src/preview/client.py`: independent Mac helper. Reuses authenticated HTTPS, prepares managed SSH metadata automatically, owns forwarding/local listeners, and reports actual URLs. Closing the GUI does not stop it. Sign-out stops it and revokes access; desktop updates pause it without losing pairing.
-- `install/previews.py`: operator-only setup of the dedicated forwarding account and SSH policy. Fresh managed templates run it before being saved. Existing VM upgrades require an explicit operator setup; ordinary `configure.py` retries do not change SSH.
+- `install/previews.py`: operator-only setup of the dedicated forwarding account and SSH policy. Existing VM upgrades require an explicit operator setup; ordinary `configure.py` retries do not change SSH.
 - `src/preview/cloud-preview/SKILL.md`: instructions for agents. The installer copies it into supported harness skill directories without overwriting existing files.
 
 ## Installation
@@ -38,7 +38,7 @@ sudo python3 /usr/local/lib/cloudroom/previews.py /var/lib/cloudroom/history
 
 The script installs only the preview account's SSH policy and a root-owned `/etc/ssh/cloudroom-preview-keys` entry point. This works when the provider owns `/usr/local/lib`; it does not change shared directory permissions. It validates SSH configuration before reloading SSH, without restarting the core. The updated core must subsequently start under the normal approved deployment process. `RuntimeDirectory=cloudroom` recreates its socket directory on boot. The public SSH host key is read at pairing time, not copied from a template's machine identity.
 
-Managed provisioning and the helper's authenticated preparation request obtain the SSH IP from the customer's owned VM record. The helper retries missing/stale metadata without requiring another sign-in. Preparation failures do not block sign-in or cloud sessions. Hosting credentials stay in the hosting backend, never the helper or agent.
+The helper retries missing/stale metadata without requiring another sign-in. Preparation failures do not block sign-in or cloud sessions.
 
 Self-hosters set the reachable IP through authenticated `POST /v1/previews/host` with `{"host":"VM_IP"}`. SSH defaults to port 22. A different port belongs in the protected `previews/setup.json`.
 

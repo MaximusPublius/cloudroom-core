@@ -29,13 +29,17 @@ command -v systemctl >/dev/null || fail 'systemd is required'
 db=${CLOUDROOM_DATABASE_URL:-}
 if [ -z "$db" ]; then
   [ -r /dev/tty ] || fail 'set CLOUDROOM_DATABASE_URL or run this in a terminal'
-  echo 'PostgreSQL URL for a dedicated database outside this VM, such as postgresql://USER:PASSWORD@HOST/DB' >&2
+  echo 'PostgreSQL URL for a dedicated database, such as postgresql://USER:PASSWORD@HOST/DB (HOST 127.0.0.1 for one on this machine)' >&2
   read -rsp 'URL (input hidden): ' db </dev/tty
   echo >&2
 fi
 case $db in postgres://* | postgresql://*) ;; *) fail 'expected a postgresql:// URL' ;; esac
 [[ $db != *[[:space:]\"\\\$\`]* ]] || fail 'the URL must not contain spaces, quotes, $ or backslashes; URL-encode them'
-if [[ $db != *sslrootcert=* ]]; then
+# A database on this machine is reached over loopback without TLS; any other host needs verified TLS.
+host=${db#*://}; host=${host##*@}; host=${host%%[/?]*}
+[[ $host == *] ]] || host=${host%:*}
+case $host in 127.0.0.1 | localhost | '[::1]') local_db=1 ;; *) local_db='' ;; esac
+if [ -z "$local_db" ] && [[ $db != *sslrootcert=* ]]; then
   # The core always verifies TLS. Default to the system trust store for publicly trusted certificates.
   [[ $db == *\?* ]] && db="$db&sslrootcert=/etc/ssl/certs/ca-certificates.crt" || db="$db?sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 fi
@@ -43,8 +47,6 @@ fi
 echo 'Installing packages...'
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl git ca-certificates python3 postgresql-client openssl >/dev/null
-[ -x /usr/local/bin/node ] || [ -x /usr/bin/node ] ||
-  echo 'Warning: Node.js is not installed system-wide. Codex and Pi need Node.js 24 in /usr/local/bin or /usr/bin.' >&2
 
 echo 'Downloading the release...'
 stage=$(mktemp -d)
@@ -66,6 +68,17 @@ curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 
 tar -xzf "$stage/release.tar.gz" -C "$stage" --no-same-owner
 sum=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha256"])' "$stage/update-manifest.json")
 echo "$sum  $stage/cloudroom" | sha256sum --check --status || fail 'the downloaded binary does not match its manifest'
+
+# Agents and Command Guard need Node.js system-wide, not only in an administrator's nvm.
+if ! [ -x /usr/local/bin/node ] && ! [ -x /usr/bin/node ]; then
+  echo 'Installing Node.js 24...'
+  case $(uname -m) in x86_64) node_arch=x64 ;; aarch64) node_arch=arm64 ;; *) fail "no Node.js build for $(uname -m)" ;; esac
+  node_dist=https://nodejs.org/dist/latest-v24.x
+  node_sum=$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --retry 3 "$node_dist/SHASUMS256.txt" | grep -E " node-v24\.[0-9.]+-linux-$node_arch\.tar\.gz$") || fail 'Node.js 24 was not found on nodejs.org'
+  curl --fail --silent --show-error --proto '=https' --tlsv1.2 --retry 3 -o "$stage/node.tar.gz" "$node_dist/${node_sum##* }"
+  echo "${node_sum%% *}  $stage/node.tar.gz" | sha256sum --check --status || fail 'the Node.js download does not match its checksum'
+  tar -xzf "$stage/node.tar.gz" -C /usr/local --strip-components=1 --no-same-owner --wildcards '*/bin/*' '*/include/*' '*/lib/*' '*/share/*'
+fi
 
 echo 'Creating accounts and folders...'
 id cloudroom >/dev/null 2>&1 ||
@@ -95,6 +108,7 @@ CLOUDROOM_DATABASE_URL="$db"
 CLOUDROOM_STATE_DIR=/var/lib/cloudroom/history
 CLOUDROOM_ACCOUNT_HOME=$agent_home
 EOF
+  [ -z "$local_db" ] || echo 'CLOUDROOM_ALLOW_INSECURE_DATABASE=1' >> $ETC/core.env
 )
 chown cloudroom:cloudroom $ETC/core.env
 python3 $LIB/configure.py --storage-only $ETC

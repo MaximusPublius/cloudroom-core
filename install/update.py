@@ -164,6 +164,8 @@ def mcp_server(pid):
 def gate(values, on):
     """Reject remote and non-root local API traffic while the core is replaced."""
     for tool in ('/usr/sbin/iptables', '/usr/sbin/ip6tables'):
+        if not Path(tool).exists():  # Machines without a firewall tool skip the gate; the core is stopped for the swap anyway.
+            continue
         for chain, *rule in (['INPUT', '!', '-i', 'lo'], ['OUTPUT', '-o', 'lo', '-m', 'owner', '!', '--uid-owner', '0']):
             spec = [*rule, '-p', 'tcp', '--dport', port(values), '-m', 'comment', '--comment', TAG, '-j', 'REJECT', '--reject-with', 'tcp-reset']
             if on:

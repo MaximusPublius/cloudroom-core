@@ -35,7 +35,7 @@ Use **Connect Claude** with Cloud selected. Approve Anthropic's browser sign-in,
 
 The `claude_auth` capability exposes authenticated `GET /v1/accounts/claude` and `POST /v1/accounts/claude/{login,cancel,complete}`. Mutations take `request_id`; `complete` also takes `code` and OAuth `state`. Duplicate starts reuse the pending flow; cancellation targets its ID. The isolated, tool-free CLI process expires after ten minutes and produces no conversation records. Tested with Claude **2.1.280**. Upgrade core and GUI together.
 
-Terminal fallback: run `claude auth login` and `claude auth status` as the configured agent account (`sudo -iu cloudroom-agent` on managed VMs), never root or the protected core account.
+Terminal fallback: run `claude auth login` and `claude auth status` as the configured agent account (`sudo -iu cloudroom-agent`), never root or the protected core account.
 
 Create sessions with `"harness":"claude-code"`. Missing login returns `claude_auth_required` before acceptance; verification failures return `claude_auth_unavailable`. The GUI retains the task and offers **Retry start** after native login. This is login guidance, not an embedded OAuth flow or a live subscription-limit check.
 
@@ -65,7 +65,7 @@ The desktop helper attempts this import before showing sign-in or starting Codex
 
 ## Cloud Pi logins
 
-Only after the user agrees in first-run setup ([ADR 0130](../../docs/adr/0130-reuse-local-logins-and-keys.md)), the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when a Mac Pi file changes. VM logins always win. `!command` and `$VAR` keys are resolved on the Mac first, because the VM cannot run Mac secret managers or see Mac shell variables; unresolved keys are skipped.
+Only after the user agrees in first-run setup, the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when a Mac Pi file changes. VM logins always win. `!command` and `$VAR` keys are resolved on the Mac first, because the VM cannot run Mac secret managers or see Mac shell variables; unresolved keys are skipped.
 
 With `pi_setup`, the helper also copies custom providers from `models.json` (Mac wins per provider; VM-only providers stay), syncs `extensions/`, and sends the `packages` list from `settings.json`. `POST /v1/accounts/pi/setup` saves the providers and runs `pi install` in the background for remote packages the VM lacks. Local-path packages stay on the Mac.
 
@@ -98,7 +98,7 @@ for a session with `command_guard_enabled: false` in `POST /v1/sessions`; this
 choice survives resume and passes to Cloudroom-managed Pi and Claude children. The guard
 runs on the execution machine without the GUI. It never edits personal hooks or
 trusts unrelated Codex hooks. It never blocks a harness from starting, and a
-guard error allows the command ([ADR 0114](../../docs/adr/0114-command-guard-never-blocks-work.md)).
+guard error allows the command.
 
 Rules cover root/home deletion, disk wipes, hosted repository deletion, and fork
 bombs. Blocks return a named reason to the agent. This is regex-based accident

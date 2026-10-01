@@ -8,14 +8,14 @@ Agents run without approval prompts and share their account's files. Do not give
 
 ## Quick install
 
-On an x86_64 VM, one script does most of the manual setup below, using the newest CI-tested release instead of a source build:
+On an x86_64 or arm64 machine (a VPS, a home server, or a spare laptop), one script does most of the manual setup below, using the newest CI-tested release instead of a source build:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/davidondrej/cloudroom-core/main/install/install.sh -o install.sh
 sudo bash install.sh
 ```
 
-It asks for your PostgreSQL URL without showing it, checks the download's checksum, creates both accounts, writes `/etc/cloudroom/core.env` with a new token, and starts the service. It never prints the token or runs SQL. When it finishes, it prints the two remaining steps: apply the database schema and sign in to a harness. Use `--version X.Y.Z` to pick a release. It refuses to run over an existing installation.
+It asks for your PostgreSQL URL without showing it, checks the download's checksum, installs Node.js 24 if it is missing, creates both accounts, writes `/etc/cloudroom/core.env` with a new token, and starts the service. It never prints the token or runs SQL. No database yet? Use [one on the same machine](#database-on-the-same-machine). When it finishes, it prints the two remaining steps: apply the database schema and sign in to a harness. Use `--version X.Y.Z` to pick a release. It refuses to run over an existing installation.
 
 To build from source instead, follow the manual steps below.
 
@@ -61,15 +61,32 @@ sudo -u cloudroom-agent -H /usr/local/bin/codex login --device-auth
 
 Complete the login in your browser. If device login is unavailable for your account, use [Codex's supported login methods](https://developers.openai.com/codex/auth/) under the same `cloudroom-agent` account. Do not put inference credentials in the service environment.
 
-### Retire standalone shell agents on a managed VM
+### Retire standalone shell agents
 
 Keep Codex/Pi setup under the agent account. SSH remains for administration; tasks go through the core API. After shell-owned agents exit, run `sudo python3 install/agent-home.py --shell-user YOUR_SSH_USER` to preview, then repeat with `--apply`.
 
 This preserves the old setup in a root-private archive, copies only missing supported settings, and blocks the administrator's normal Codex/Pi commands and default auth writes. Core logins, processes and histories stay untouched. Conflicts and symlinked settings remain archived for review; do not restore stale tokens automatically. `--check` detects competing shell setup without deleting it. This is an operational guard, not a sandbox against a VM administrator.
 
-New managed templates run `--apply` before service startup: Boat may restore shell settings even with `noEnv`. Recreated files under a previously retired home are archived separately, never used as runtime credentials. Unmarked conflicting setup fails closed. Review provider credential injection separately; do not blindly change a shared environment or erase unrelated credentials.
+Recreated files under a previously retired home are archived separately, never used as runtime credentials. Unmarked conflicting setup fails closed.
 
 ## 3. Prepare PostgreSQL
+
+### Database on the same machine
+
+The simplest setup. History then lives only on this machine, so back it up yourself. Use a password of letters and digits only:
+
+```sh
+sudo apt-get install -y postgresql
+sudo -u postgres createuser --pwprompt cloudroom_db
+sudo -u postgres createdb --owner cloudroom_db cloudroom
+psql 'postgresql://cloudroom_db@127.0.0.1/cloudroom' -W -v ON_ERROR_STOP=1 \
+  -f /usr/local/lib/cloudroom/sql/0001-session-records.sql \
+  -f /usr/local/lib/cloudroom/sql/0002-diagnostics.sql
+```
+
+Give the installer `postgresql://cloudroom_db:PASSWORD@127.0.0.1:5432/cloudroom`. For a loopback address it adds `CLOUDROOM_ALLOW_INSECURE_DATABASE=1` to `core.env`, so Core connects without TLS. Core accepts that setting only for `127.0.0.1`, `localhost`, or `[::1]`. A manual install needs that line too. Source builds find the SQL files in `docs/database/`.
+
+### Database on another machine
 
 Supply a **dedicated PostgreSQL database outside this VM**, with an owner login and TLS. Any compatible PostgreSQL provider works; Supabase is optional. Never share this database login across unrelated users.
 
@@ -164,7 +181,7 @@ api --json '{"request_id":"close-quickstart"}' http://127.0.0.1:9840/v1/sessions
 ## Use your repository and connect an app
 
 - Start sessions in [cloud folders](#cloud-folders) without cloning or copying first. Requests without a workspace keep using `CLOUDROOM_REPOSITORY` (or the configured agent home). Existing sessions retain their recorded directory.
-- The API serves plaintext HTTP and defaults to the VM's loopback address. For remote apps, put it behind an HTTPS reverse proxy that supports SSE without buffering and forwards `Authorization`. Keep port 9840 private; never send bearer tokens over public HTTP.
+- The API serves plaintext HTTP and defaults to the VM's loopback address. For remote apps, use [Tailscale](#reach-it-from-your-other-devices), or an HTTPS reverse proxy that supports SSE without buffering and forwards `Authorization`. Keep port 9840 private; never send bearer tokens over public HTTP.
 - Restarting the core interrupts running work. [Session lifecycle](session-lifecycle.md) explains recovery and uncertain outcomes. History saved externally survives VM loss; files in your workspace and pending history uploads do not have that guarantee.
 
 ### Non-loopback backends and upgrades
@@ -172,6 +189,35 @@ api --json '{"request_id":"close-quickstart"}' http://127.0.0.1:9840/v1/sessions
 A proxy or hosting gateway outside the VM's loopback interface may need a non-loopback `CLOUDROOM_LISTEN`. Set `CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP=1` in the protected service environment only after restricting backend access to that proxy over a protected connection. This applies to private IPs and IPv6 too. The setting permits plaintext HTTP; it does not enable TLS, configure a firewall, or verify the proxy. Storage protection is separate, and unprotected test mode remains loopback-only.
 
 **Before upgrading an existing non-loopback installation**, review its HTTPS and backend access controls, then add this setting to its existing `core.env`. Without it, the new binary refuses startup. Loopback installations need no change. For fresh installations, `configure.py` copies an explicitly supplied value of `1`; retries never add it to or overwrite existing configuration.
+
+## Reach it from your other devices
+
+[Tailscale](https://tailscale.com) gives Core an HTTPS address inside your private network: no domain, no open ports, and no proxy to configure.
+
+1. Install Tailscale on this machine and on your laptop, signed in to the same account: `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`.
+2. In the Tailscale admin console, under **DNS**, turn on MagicDNS and HTTPS certificates.
+3. Run `sudo tailscale serve --bg 9840`. Core keeps listening on localhost.
+4. `tailscale serve status` shows your Core's URL, like `https://my-server.tail1234.ts.net`. Only your devices can reach it, and every request still needs the token.
+
+Never use `tailscale funnel` for Core: it opens the API to the whole internet.
+
+## Connect the desktop app
+
+In the [Cloudroom app](https://github.com/davidondrej/cloudroom-gui/releases) (v83 or newer), open **Settings → Cloudroom account → Connect your own Core**. Enter the HTTPS URL and the token from `sudo grep ^CLOUDROOM_TOKEN= /etc/cloudroom/core.env`. No Cloudroom account is needed. Cloud threads then run on this machine and share its files.
+
+## Upgrade
+
+Pick a version from the [releases](https://github.com/davidondrej/cloudroom-core/releases), then:
+
+```sh
+v=X.Y.Z; a=$(uname -m)
+curl -fsSLO https://github.com/davidondrej/cloudroom-core/releases/download/core-v$v/cloudroom-core-$v-linux-$a.tar.gz
+mkdir core-$v && tar -xzf cloudroom-core-$v-linux-$a.tar.gz -C core-$v
+sudo python3 core-$v/install/update.py upgrade "$PWD/core-$v"
+sudo cat /var/lib/cloudroom-update/state.json
+```
+
+The script waits until agents are idle, backs up the old core, swaps it, checks every session, and rolls back on failure. Your settings, logins, and history stay. `"result": "updated"` means done; `waiting` means agents were busy, so run it again later. It never downgrades.
 
 ## If something fails
 
@@ -183,22 +229,9 @@ sudo -u cloudroom-agent -H /usr/local/bin/codex login status
 
 A failed readiness check usually means the database, TLS certificate, migrations, or disk protection needs attention. A failed agent start may mean login or model configuration. There is no fixed limit on open harness sessions; actual concurrency depends on available VM resources. Keep logs private when asking for help.
 
-## Sandboxes without systemd
+## Machines without systemd
 
-Cloud sandboxes have no systemd ([scope](../../docs/scopes/sandboxes.md)). The web app writes `/etc/cloudroom/core.env` on every wake, then starts `install/sandbox-start.sh` as root, detached. It parses (never sources) `image.env` and `core.env`, creates the agents' cgroup, runs Core as `cloudroom` with only the capabilities it needs, and restarts it after a crash. Containers without cgroups run Core in [container mode](storage.md#containers). A second start is a no-op. The log is `/var/log/cloudroom/core.log`. With `"agent_sudo": true` in `storage.json`, agents keep sudo inside their own sandbox. Before a stop, `POST /v1/drain {"hold":true}` refuses new work and reports whether anything still runs; `{"hold":false}` reopens it.
-
-## What Core needs from a machine
-
-Any VM or sandbox provider can run Core if its machines give all of this. `evals/sandbox-perf/tests/core-prod.mjs` checks a provider in a few minutes.
-
-- **Linux on x86_64 or arm64**, with root or passwordless sudo and the tools the image uses: `useradd`, a standard `visudo`, `setpriv`, `curl` and Node.js.
-- **Writable cgroup v2.** Core creates its own cgroup with `cgroup.freeze` and `cgroup.kill` to stop whole agent process trees.
-- **Capabilities** `setuid`, `setgid`, `dac_read_search` and `kill` in the bounding set, plus `setpcap` to hand them to Core's service account.
-- **Or, without those two, sudo for agents:** a container whose agents may have sudo runs Core in [container mode](storage.md#containers) instead.
-- **One disk** for `/code`, `/tmp`, `/var/tmp`, `/var/cache`, `/var/lib/cloudroom` and the agent's home, kept across stops. Core watches free space there. A memory-backed `/tmp` is fine: `sandbox-start.sh` then gives Core its own mount namespace with a folder on that disk over `/tmp`. Container mode allows a memory-backed `/var/tmp` and `/var/cache`.
-- **A public HTTPS URL for port 9840** that passes the `Authorization` or `X-Cloudroom-Token` header unchanged, streams server-sent events without buffering, keeps idle streams open (Core sends a keep-alive every 15 seconds), and forwards `Upgrade: websocket` for previews and Mac access.
-- **The database nearby.** Every history write waits one round trip to the database pooler, over IPv4.
-- **No process kills while agents work.** A stop may end every process; `sandbox-start.sh` restarts Core from its saved state on the next start.
+Run `install/sandbox-start.sh` as root, detached, on every boot. It parses (never sources) `image.env` and `/etc/cloudroom/core.env`, creates the agents' cgroup, runs Core as `cloudroom` with only the capabilities it needs, and restarts it after a crash. Containers without cgroups run Core in [container mode](storage.md#containers). A second start is a no-op. The log is `/var/log/cloudroom/core.log`. With `"agent_sudo": true` in `storage.json`, agents keep sudo on that machine. Before a stop, `POST /v1/drain {"hold":true}` refuses new work and reports whether anything still runs; `{"hold":false}` reopens it.
 
 ## Cloud folders
 

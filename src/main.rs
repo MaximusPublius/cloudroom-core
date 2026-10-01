@@ -40,7 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if args.first().map(String::as_str) == Some("report") {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("feedback" | "report")
+    ) {
         match cloudroom::session::report::cli(&args[1..]).await {
             Ok(code) => std::process::exit(code),
             Err(error) => {

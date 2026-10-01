@@ -173,7 +173,10 @@ async fn claude_account(
         })
     };
     let token = secret(&input.token, "sk-ant-oat");
-    let key = secret(&input.api_key, "sk-ant-api");
+    let key = input
+        .api_key
+        .as_deref()
+        .is_some_and(crate::runtime::claude_login::is_api_key);
     if !matches!(
         action.as_str(),
         "login" | "cancel" | "complete" | "token" | "key"

@@ -35,6 +35,17 @@ fn save_token(config: &Config, token: &str, plan: Option<&str>) -> io::Result<()
     save_private(&claude::token_path(config), &contents)?;
     remove(&claude::key_path(config))
 }
+/// Console API keys come in several prefixes (`sk-ant-api…`, `sk-ant-usr…`), so only
+/// subscription, refresh and admin tokens are refused here. `save_key` proves the rest.
+pub(crate) fn is_api_key(value: &str) -> bool {
+    value.len() <= 1024
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        && value.strip_prefix("sk-ant-").is_some_and(|rest| {
+            !rest.is_empty() && !["oat", "ort", "admin"].iter().any(|p| rest.starts_with(p))
+        })
+}
 /// `auth status` accepts any key, so one tiny request proves it works before
 /// the subscription token is dropped. A rejected key leaves the old login intact.
 async fn save_key(config: &Config, key: &str) -> Result<(), &'static str> {

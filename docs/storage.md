@@ -39,7 +39,7 @@ The policy retains `agent_uid`, `agent_gid`, `cache_dir`, and `cgroup_root`. Opt
 
 ## Containers
 
-Some sandboxes are containers without cgroup delegation or the capabilities above, such as Upstash Box. If their agents may have sudo, the sandbox is the security boundary anyway, and the image writes `"cgroup_root": null` with `"agent_sudo": true` (`web/sandbox-image.sh` picks the mode). Core then:
+Some machines are containers without cgroup delegation or the capabilities above. If their agents may have sudo, the container is the security boundary anyway, so write `"cgroup_root": null` with `"agent_sudo": true`. Core then:
 
 - runs as the agent account, so it needs no capabilities. The image makes `cloudroom` an alias of that account.
 - tags each workload's processes with `CLOUDROOM_WORKLOAD`, and stops, freezes and counts them with signals. Processes that clear their environment or switch user through sudo escape.

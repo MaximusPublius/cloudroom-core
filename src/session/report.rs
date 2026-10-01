@@ -1,4 +1,4 @@
-//! Cloud agents report Cloudroom bugs by themselves (ADR 0158). The core saves each report straight
+//! Cloud agents send Cloudroom feedback straight to David by themselves (ADR 0158). The core saves each report straight
 //! to the database with its own login, so reports arrive even while the user's Mac is offline.
 use super::{
     Manager,
@@ -15,8 +15,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{io, sync::Arc};
 
-const USAGE: &str = "cloudroom report MESSAGE
-Reports a Cloudroom bug to the Cloudroom team: what you did, what happened, what you expected, and the exact error. Never include secrets, personal data, or the user's code.";
+const USAGE: &str = "cloudroom feedback MESSAGE
+Sends David, Cloudroom's founder, a bug, friction, or idea: what you did, what happened, and the exact error. Never include secrets, personal data, or the user's code.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,7 +66,7 @@ async fn report(
     Ok(Json(json!({"sent":true})))
 }
 
-/// `cloudroom report MESSAGE`, the cloud twin of `room-cli report`.
+/// `cloudroom feedback MESSAGE` (old name: `report`), the cloud twin of `room-cli feedback`.
 pub async fn cli(args: &[String]) -> io::Result<i32> {
     let [message] = args else {
         println!("{USAGE}");

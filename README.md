@@ -14,7 +14,8 @@ Don't want to host it yourself? Hosted Cloudroom is invite-only for now. [Join t
 
 ## Get started
 
-- [Install on Ubuntu 24.04](docs/setup.md) with one script, or build from source.
+- [Install on Ubuntu 24.04](docs/setup.md) with one script, on a VPS, a home server, or a spare laptop. A database on the same machine works.
+- [Reach it from your laptop](docs/setup.md#reach-it-from-your-other-devices) with Tailscale, and [upgrade](docs/setup.md#upgrade) in place.
 - [HTTP API](docs/api.md): every endpoint, event, and error code.
 - [Linux builds](https://github.com/davidondrej/cloudroom-core/releases): tested binaries for each release.
 
@@ -23,7 +24,7 @@ Don't want to host it yourself? Hosted Cloudroom is invite-only for now. [Join t
 - Agents run as a separate Linux user, with no admin rights and no `sudo`.
 - Agents can't read the core's token, database password, or history files.
 - Every API request needs a secret token. The API listens only on localhost unless you put it behind HTTPS.
-- History is saved to PostgreSQL outside the machine, over verified TLS.
+- History is saved to PostgreSQL: on the same machine, or on another one over verified TLS.
 - Command Guard blocks a few disastrous commands, like wiping a home folder.
 
 Agents run without approval prompts, so give each trusted user their own machine.
@@ -31,7 +32,7 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ## Desktop app
 
-[Download the Cloudroom app](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs (Linux alpha). The core works without it.
+[Download the Cloudroom app](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs (Linux alpha). [Connect it to your own core](docs/setup.md#connect-the-desktop-app) with a URL and token, no account needed. The core also works without it.
 
 ## Build and test
 
