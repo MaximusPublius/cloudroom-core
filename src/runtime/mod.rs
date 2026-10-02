@@ -177,6 +177,8 @@ pub enum Event {
     Started {
         request: String,
         native_turn: Option<String>,
+        /// The harness began this turn by itself, without a Cloudroom prompt.
+        auto: bool,
     },
     Finished {
         request: String,
@@ -224,6 +226,7 @@ struct Progress {
     last_text: String,
     model: Option<String>,
     processes: HashSet<String>,
+    auto: bool,
 }
 impl Progress {
     fn started(&mut self) -> Option<Event> {
@@ -235,6 +238,7 @@ impl Progress {
         Some(Event::Started {
             request,
             native_turn: self.native_turn.clone(),
+            auto: self.auto,
         })
     }
     fn finished(&mut self, status: &str, error: Option<String>) -> Option<Event> {
@@ -502,7 +506,7 @@ impl Handle {
         }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
             "steer":self.kind!=Kind::Claude,"compact":true,"rewind":true,"attachments":true,
-            "service_tier":self.kind.fast(),"subagents":true,"usage":true})
+            "service_tier":self.kind.fast(),"subagents":true,"usage":true,"goal":self.kind==Kind::Codex})
     }
     pub async fn start_session(&self) -> io::Result<String> {
         let mut startup = self.clone();
@@ -526,14 +530,19 @@ impl Handle {
         Ok(())
     }
     pub async fn send(&self, request: &str, text: &str) -> io::Result<()> {
-        self.send_prompt(request, &json!({"text": text})).await
+        self.send_prompt(request, &json!({"text": text}))
+            .await
+            .map(drop)
     }
-    pub async fn send_prompt(&self, request: &str, input: &Value) -> io::Result<()> {
+    /// Delivers a prompt. Returns warnings the user should see, such as a skill that could not load.
+    pub async fn send_prompt(&self, request: &str, input: &Value) -> io::Result<Vec<Value>> {
         match self.kind {
-            Kind::Codex => codex::send(self, request, input).await,
-            Kind::Pi => pi::send(self, request, input).await,
+            Kind::Codex => codex::send(self, request, input).await.map(|()| Vec::new()),
+            Kind::Pi => pi::send(self, request, input).await.map(|()| Vec::new()),
             Kind::Claude => claude::send(self, request, input).await,
-            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::send(self, request, input).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::send(self, request, input)
+                .await
+                .map(|()| Vec::new()),
         }
     }
     pub async fn steer(&self, request: &str, text: &str) -> io::Result<()> {
@@ -562,6 +571,16 @@ impl Handle {
             Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ACP compaction is not supported",
+            )),
+        }
+    }
+    /// Sets, pauses, resumes, or clears the harness's durable goal as the user.
+    pub async fn goal(&self, input: &Value) -> io::Result<()> {
+        match self.kind {
+            Kind::Codex => codex::goal(self, input).await,
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "goal controls are only supported for Codex",
             )),
         }
     }

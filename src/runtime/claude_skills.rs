@@ -1,5 +1,5 @@
 use super::{Handle, files, process::MAX_LINE};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     fs,
@@ -141,14 +141,18 @@ fn load(handle: &Handle, name: &str, origin: &str) -> io::Result<(PathBuf, Strin
     Ok((directory, body(&content, name)?))
 }
 
-pub(super) fn expand(handle: &Handle, input: &Value) -> io::Result<String> {
+/// Returns the prompt text and a warning for each selected skill that could not load.
+/// A missing skill never fails the turn: the agent gets a short note instead.
+pub(super) fn expand(handle: &Handle, input: &Value) -> io::Result<(String, Vec<Value>)> {
     let original = input["text"].as_str().unwrap_or_default();
     let Some(parts) = input["content"].as_array() else {
-        return Ok(original.into());
+        return Ok((original.into(), Vec::new()));
     };
     let mut texts = Vec::new();
     let mut originals = Vec::new();
     let mut instructions = Vec::new();
+    let mut missing = Vec::new();
+    let mut warnings = Vec::new();
     let mut loaded = HashSet::new();
     let mut selections = HashSet::new();
     let mut remaining = MAX_LINE.saturating_sub(original.len());
@@ -193,19 +197,24 @@ pub(super) fn expand(handle: &Handle, input: &Value) -> io::Result<String> {
                 ));
             }
             if selections.insert((name, origin)) {
-                let (directory, body) = load(handle, name, origin)
-                    .map_err(|error| invalid(format!("Cannot load /{name}: {error}")))?;
-                if loaded.insert(directory.clone()) {
-                    let block = format!(
-                        "Skill: /{name}\nBase directory: {}\n\n{body}",
-                        directory.display()
-                    );
-                    remaining = remaining.checked_sub(block.len()).ok_or_else(|| {
-                        invalid(
-                            "Selected skills exceed the Claude input limit; select fewer skills",
-                        )
-                    })?;
-                    instructions.push(block);
+                match load(handle, name, origin) {
+                    Ok((directory, body)) if loaded.insert(directory.clone()) => {
+                        let block = format!(
+                            "Skill: /{name}\nBase directory: {}\n\n{body}",
+                            directory.display()
+                        );
+                        remaining = remaining.checked_sub(block.len()).ok_or_else(|| {
+                            invalid(
+                                "Selected skills exceed the Claude input limit; select fewer skills",
+                            )
+                        })?;
+                        instructions.push(block);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        missing.push(format!("/{name}"));
+                        warnings.push(json!({"message":format!("Skill /{name} was not loaded. The agent will look for it."),"detail":error.to_string()}));
+                    }
                 }
             }
             rendered.push_str(&text[cursor..start]);
@@ -215,17 +224,30 @@ pub(super) fn expand(handle: &Handle, input: &Value) -> io::Result<String> {
         rendered.push_str(&text[cursor..]);
         texts.push(rendered);
     }
-    if instructions.is_empty() {
-        return Ok(original.into());
+    if instructions.is_empty() && missing.is_empty() {
+        return Ok((original.into(), warnings));
     }
     if originals.join("\n") != original {
         return Err(invalid(
             "Selected skill content does not match the prompt text",
         ));
     }
+    let mut sections = Vec::new();
+    if !instructions.is_empty() {
+        sections.push(format!(
+            "The user explicitly selected these skills. Their instructions are already loaded below; do not invoke them again with the Skill tool. Resolve relative paths from each skill's base directory.\n\n{}",
+            instructions.join("\n\n")
+        ));
+    }
+    if !missing.is_empty() {
+        sections.push(format!(
+            "The user selected {}, but Cloudroom could not load it on this machine. If the project is still being copied here, wait briefly, then read its SKILL.md from .claude/skills/. Otherwise the skill is probably only on the user's computer: tell the user and ask before copying it over. Answer the request either way.",
+            missing.join(", ")
+        ));
+    }
     let expanded = format!(
-        "The user explicitly selected these skills. Their instructions are already loaded below; do not invoke them again with the Skill tool. Resolve relative paths from each skill's base directory.\n\n{}\n\nUser request:\n{}",
-        instructions.join("\n\n"),
+        "{}\n\nUser request:\n{}",
+        sections.join("\n\n"),
         texts.join("\n")
     );
     if expanded.len() > MAX_LINE {
@@ -233,5 +255,5 @@ pub(super) fn expand(handle: &Handle, input: &Value) -> io::Result<String> {
             "Selected skills exceed the Claude input limit; select fewer skills",
         ));
     }
-    Ok(expanded)
+    Ok((expanded, warnings))
 }

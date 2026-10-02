@@ -327,6 +327,11 @@ impl Local {
             "harness" => {
                 session.harness_pid = record.data["pid"].as_u64().map(|pid| pid as u32);
             }
+            "reasoning" => {
+                if let Some(level) = record.data["reasoning"].as_str() {
+                    session.reasoning = Some(level.into());
+                }
+            }
             "launch_reasoning" => {
                 if session.reasoning.is_none() {
                     session.reasoning = record.data["reasoning"].as_str().map(str::to_owned);

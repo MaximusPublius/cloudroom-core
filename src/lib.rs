@@ -45,6 +45,7 @@ pub const FEATURES: &[&str] = &[
     "attachments",
     "upload_parts",
     "compact",
+    "goal",
     "usage",
     "subagents",
     "child_threads",

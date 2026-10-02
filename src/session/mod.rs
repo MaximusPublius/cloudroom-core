@@ -949,6 +949,7 @@ impl Manager {
             Interrupt(runtime::Handle, String),
             Steer(runtime::Handle, String, String),
             Compact(runtime::Handle, String),
+            Goal(runtime::Handle, Value, String),
             Rewind(runtime::Handle, Value, String),
             Close(Option<runtime::Handle>),
             Resume,
@@ -971,7 +972,7 @@ impl Manager {
             if local.draining && !matches!(command, "interrupt" | "close" | "stop" | "cancel") {
                 return Err(Error::Conflict("service is draining"));
             }
-            if matches!(command, "compact" | "rewind") && session.state == "sleeping" {
+            if matches!(command, "compact" | "rewind" | "goal") && session.state == "sleeping" {
                 self.schedule_resume(&mut local, id, false)?;
                 return Err(Error::Conflict(
                     "this thread was asleep and is waking up; try again in a few seconds",
@@ -1001,6 +1002,7 @@ impl Manager {
                     | "reorder"
                     | "steer"
                     | "compact"
+                    | "goal"
                     | "rewind"
                     | "attach"
             ) {
@@ -1081,7 +1083,7 @@ impl Manager {
                     "steer target is no longer the active request",
                 ));
             }
-            if matches!(command, "compact" | "rewind" | "steer")
+            if matches!(command, "compact" | "rewind" | "steer" | "goal")
                 && session.capabilities[command] == false
             {
                 return Err(Error::Conflict("operation is unsupported by this harness"));
@@ -1100,6 +1102,11 @@ impl Manager {
                 if !session.ready || handle.is_none() {
                     return Err(Error::Conflict("harness is not ready for compaction"));
                 }
+            }
+            if command == "goal" && (!session.ready || handle.is_none()) {
+                return Err(Error::Conflict(
+                    "the agent is starting; try again in a few seconds",
+                ));
             }
             if command == "rewind" {
                 if local.sessions.values().any(|child| {
@@ -1222,6 +1229,11 @@ impl Manager {
                     local.append(id, "state", json!({"state":"running"}), None)?;
                     Next::Compact(handle.expect("validated compact harness"), request.clone())
                 }
+                "goal" => Next::Goal(
+                    handle.expect("validated goal harness"),
+                    input,
+                    request.clone(),
+                ),
                 "rewind" => Next::Rewind(
                     handle.expect("validated rewind harness"),
                     input,
@@ -1258,6 +1270,28 @@ impl Manager {
                 self.clone().steer(id.to_owned(), request, target, handle)
             }
             Next::Compact(handle, request) => self.clone().compact(id.to_owned(), request, handle),
+            Next::Goal(handle, input, request) => {
+                let manager = self.clone();
+                let id = id.to_owned();
+                tokio::spawn(async move {
+                    let result = handle.goal(&input).await;
+                    let mut local = manager.local.lock().unwrap();
+                    if let Err(error) = &result
+                        && let Some(receipt) = local
+                            .sessions
+                            .get_mut(&id)
+                            .and_then(|session| session.receipts.get_mut(&request))
+                    {
+                        receipt.error = Some(error.to_string());
+                    }
+                    let state = if result.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
+                    let _ = local.finish_receipt(&id, &request, state);
+                });
+            }
             Next::Rewind(handle, input, request) => {
                 self.clone().rewind(id.to_owned(), request, input, handle)
             }
@@ -1351,6 +1385,11 @@ impl Manager {
                 .is_some_and(|current| current.same_process(&handle))
             {
                 return;
+            }
+            for warning in result.as_ref().map(Vec::as_slice).unwrap_or_default() {
+                let mut data = warning.clone();
+                data["request_id"] = json!(request);
+                let _ = local.append(&id, "prompt_warning", data, None);
             }
             if let Err(error) = &result
                 && let Some(receipt) = local
@@ -1970,7 +2009,31 @@ impl Manager {
             runtime::Event::Started {
                 request,
                 native_turn,
+                auto,
             } => {
+                let session = &local.sessions[id];
+                // A turn the harness began itself gets a receipt, so it can finish, stop and recover like a prompt.
+                if auto
+                    && session.ready
+                    && session.current_request.is_none()
+                    && session.close_request.is_none()
+                    && session.rewind_request.is_none()
+                    && !session.compacting
+                {
+                    let receipt = Receipt {
+                        request_id: request.clone(),
+                        command: "auto".into(),
+                        input: json!({}),
+                        state: "running".into(),
+                        model: None,
+                        provider: None,
+                        workspace: None,
+                        error: None,
+                    };
+                    let receipt = serde_json::to_value(receipt).map_err(io::Error::other)?;
+                    local.append(id, "receipt", receipt, None)?;
+                    self.begin_turn(&mut local, id, &request)?;
+                }
                 let session = &local.sessions[id];
                 if !session.ready || session.current_request.as_deref() != Some(&request) {
                     return Ok(());

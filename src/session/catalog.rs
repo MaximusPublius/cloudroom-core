@@ -128,6 +128,7 @@ impl Manager {
                         }
                     };
                     harness["steer"] = json!(*kind == runtime::Kind::Codex);
+                    harness["goal"] = json!(*kind == runtime::Kind::Codex);
                     harness["compact"] = json!(true);
                     harness["service_tier"] = json!(kind.fast());
                     harness["skill_mentions"] = json!(*kind == runtime::Kind::Claude);

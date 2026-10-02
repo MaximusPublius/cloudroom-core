@@ -171,7 +171,7 @@ impl Process {
                             continue;
                         }
                         if let Some(request) = &call.request {
-                            if state.request.is_some() && !state.finished { let _ = call.reply.map(|r| r.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "harness is busy")))); continue; }
+                            if state.request.is_some() && !state.finished && !state.auto { let _ = call.reply.map(|r| r.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "harness is busy")))); continue; }
                             state = Progress { native: state.native.clone(), model: state.model.clone(), request: Some(request.clone()), ..Progress::default() };
                             progress.send_replace(state.clone());
                         }

@@ -650,6 +650,11 @@ export class CloudroomClient {
     return this.#command(`${sessionPath(sessionId)}/compact`, "compact", { request_id: id }, sessionId);
   }
 
+  /** The user's goal control: pause or resume (`status`), replace the `objective`, or `clear`. */
+  goal(sessionId: string, id: string, goal: { status?: "active" | "paused"; objective?: string; clear?: boolean }) {
+    return this.#command(`${sessionPath(sessionId)}/goal`, "goal", { request_id: id, ...goal }, sessionId);
+  }
+
   rewind(sessionId: string, id: string, before?: string, lastTurnId?: string, replacement?: { request_id: string; text: string; content?: Json; attachments?: Json; reasoning?: string; service_tier?: string }) {
     return this.#command(
       `${sessionPath(sessionId)}/rewind`,

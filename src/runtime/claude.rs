@@ -306,7 +306,8 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     Ok(id)
 }
 
-pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<()> {
+/// Returns a warning for each selected skill that could not load.
+pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<Vec<Value>> {
     let text = input["text"].as_str().unwrap_or_default();
     if text.split_whitespace().next() == Some("/fast") {
         return Err(io::Error::new(
@@ -316,9 +317,10 @@ pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::R
     }
     let reader = handle.clone();
     let payload = input.clone();
-    let text = tokio::task::spawn_blocking(move || super::claude_skills::expand(&reader, &payload))
-        .await
-        .map_err(io::Error::other)??;
+    let (text, warnings) =
+        tokio::task::spawn_blocking(move || super::claude_skills::expand(&reader, &payload))
+            .await
+            .map_err(io::Error::other)??;
     let mut settings = json!({"fastMode":false,"effortLevel":null});
     if let Some(reasoning) = input["reasoning"].as_str().or(handle.reasoning.as_deref()) {
         settings["effortLevel"] = if reasoning == "none" {
@@ -375,7 +377,7 @@ pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::R
         .process
         .call("prompt", json!({"content":content}), Some(request))
         .await?;
-    Ok(())
+    Ok(warnings)
 }
 
 pub(super) async fn compact(handle: &Handle) -> io::Result<()> {
@@ -811,6 +813,26 @@ impl Adapter for Protocol {
             self.compacted = true;
             self.context = value["compact_metadata"]["post_tokens"].as_u64();
         }
+        // Claude starts its own turn when a background task or wakeup fires. Track it like a prompt.
+        if self.active.is_none()
+            && kind == "stream_event"
+            && value["event"]["type"] == "message_start"
+            && !self.users.values().any(|call| call.kind == "compact")
+        {
+            let request = format!("auto_{}", uuid()?);
+            self.active = Some((String::new(), request.clone()));
+            self.interrupting = false;
+            self.streamed.clear();
+            self.tools.clear();
+            *state = Progress {
+                native: state.native.clone(),
+                model: state.model.clone(),
+                request: Some(request),
+                auto: true,
+                ..Progress::default()
+            };
+            events.extend(state.started());
+        }
         let request = self.active.as_ref().map(|(_, id)| id.clone());
         let mut data = json!({"harness":"claude-code","type":kind,"request_id":request});
         let event_kind = if kind == "stream_event" {
@@ -966,6 +988,8 @@ impl Adapter for Protocol {
                 .filter_map(Value::as_str)
                 .chain(value["user_message_uuid"].as_str())
                 .collect();
+            let auto = self.active.as_ref().is_some_and(|(id, _)| id.is_empty())
+                && !ids.iter().any(|id| self.users.contains_key(*id));
             for id in &ids {
                 if let Some(call) = self.users.remove(*id) {
                     if call.kind == "bootstrap" {
@@ -989,10 +1013,11 @@ impl Adapter for Protocol {
                     }
                 }
             }
-            if self
-                .active
-                .as_ref()
-                .is_some_and(|(id, _)| ids.contains(id.as_str()))
+            if auto
+                || self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(id, _)| ids.contains(id.as_str()))
             {
                 state.last_usage = usage(value, self.context);
                 data["usage"] = state.last_usage.clone();

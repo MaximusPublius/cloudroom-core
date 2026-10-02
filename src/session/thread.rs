@@ -1,4 +1,4 @@
-//! Cloud agents rename or archive their own thread, and start child threads in their own sandbox. Each request
+//! Cloud agents rename or archive their own thread, change its effort, and start child threads in their own sandbox. Each request
 //! is a session record, so the app applies it whenever it next reads the thread, including after it was offline.
 use super::Manager;
 use crate::preview::Peer;
@@ -16,6 +16,7 @@ use std::{
 };
 
 const USAGE: &str = "cloudroom thread update --self --title TITLE
+cloudroom thread update --self --reasoning-level LEVEL
 cloudroom thread archive --self
 cloudroom thread stop --self
 cloudroom thread spawn --provider codex|claude-code|pi [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] --prompt TEXT|--prompt-file PATH
@@ -44,6 +45,12 @@ pub struct SpawnBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Effort {
+    reasoning: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tell {
     text: String,
 }
@@ -55,6 +62,7 @@ fn valid(title: &str) -> bool {
 pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
     Router::new()
         .route("/title", post(rename))
+        .route("/reasoning", post(set_reasoning))
         .route("/archive", post(archive))
         .route("/children", get(list).post(spawn))
         .route("/children/{id}", get(output))
@@ -105,6 +113,24 @@ async fn rename(
         ));
     }
     record(&m, &session, "title", json!({"title":title}))
+}
+
+/// The new effort applies from this session's next turn; the app shows it as the thread's effort.
+async fn set_reasoning(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(input): Json<Effort>,
+) -> Result<Json<Value>, Failure> {
+    let session = caller(&m, peer, "thread")?;
+    m.check_prompt_reasoning(&session, Some(&input.reasoning))
+        .await
+        .map_err(session_failure)?;
+    record(
+        &m,
+        &session,
+        "reasoning",
+        json!({"reasoning":input.reasoning}),
+    )
 }
 
 /// The app archives the thread and its children, which also stops this session.
@@ -315,6 +341,10 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         ["update", "--self", "--title", title] | ["update", "--title", title, "--self"] => {
             ("/title", Some(json!({"title":title})))
         }
+        ["update", "--self", "--reasoning-level", level]
+        | ["update", "--reasoning-level", level, "--self"] => {
+            ("/reasoning", Some(json!({"reasoning":level})))
+        }
         ["archive", "--self"] => ("/archive", None),
         ["stop", "--self"] => {
             println!(
@@ -325,7 +355,7 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         }
         _ => {
             println!(
-                "{USAGE}\nRenames or archives this cloud thread, or starts and checks child threads in this sandbox."
+                "{USAGE}\nRenames, archives or changes the effort of this cloud thread, or starts and checks child threads in this sandbox."
             );
             return Ok(if matches!(words.as_slice(), [] | ["--help"]) {
                 0

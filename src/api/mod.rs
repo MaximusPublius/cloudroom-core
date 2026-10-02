@@ -81,6 +81,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/sessions/{id}/reorder", post(reorder))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/compact", post(compact))
+        .route("/v1/sessions/{id}/goal", post(goal))
         .route("/v1/sessions/{id}/rewind", post(rewind))
         .route(
             "/v1/sessions/{id}/attachments",
@@ -1038,6 +1039,42 @@ async fn steer(
         "steer",
         json!({"target_request_id":body.target_request_id,"text":body.text}),
     )?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Goal {
+    request_id: String,
+    status: Option<String>,
+    objective: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+/// The user's goal control: pause, resume, replace the objective, or clear.
+async fn goal(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Goal>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    if body
+        .status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "active" | "paused"))
+        || body
+            .objective
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty() || text.len() > 4000)
+        || (body.clear == (body.status.is_some() || body.objective.is_some()))
+    {
+        return Err(session::Error::Conflict(
+            "goal needs clear, or an active/paused status and/or an objective of 1-4000 bytes",
+        ));
+    }
+    let input = json!({"status":body.status,"objective":body.objective,"clear":body.clear});
+    let receipt = manager.command(&id, body.request_id, "goal", input)?;
     Ok(accepted(&manager, &id, receipt))
 }
 
