@@ -26,8 +26,10 @@ impl History {
         } else {
             options = options.ssl_mode(PgSslMode::VerifyFull);
         }
+        // Many sandboxes share one database pooler: release idle connections quickly.
         let pool = PgPoolOptions::new()
             .max_connections(2)
+            .idle_timeout(Duration::from_secs(60))
             .acquire_timeout(Duration::from_secs(2))
             .connect_lazy_with(options);
         Ok(Self {
@@ -50,22 +52,44 @@ impl History {
                 .is_ok()
     }
 
+    /// One statement per batch: a distant database costs one round trip, not one per record.
     pub async fn upload(&self, records: &[Record]) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        for record in records {
-            let text = serde_json::to_string(record).map_err(|e| sqlx::Error::Decode(e.into()))?;
-            // A lost commit reply may cause retransmission. Only identical content is a retry.
-            let matches: bool = sqlx::query_scalar(
-                "INSERT INTO cloudroom_records (store, session_id, sequence, record) VALUES ($1,$2,$3,$4) \
-                 ON CONFLICT (store, session_id, sequence) DO UPDATE SET record=cloudroom_records.record \
-                 RETURNING record=$4")
-                .bind(&self.store).bind(&record.session_id).bind(record.sequence as i64)
-                .bind(text).fetch_one(&mut *tx).await?;
-            if !matches {
-                return Err(sqlx::Error::Protocol("conflicting history record".into()));
-            }
+        let texts = records
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
+        let sessions: Vec<&str> = records.iter().map(|r| r.session_id.as_str()).collect();
+        let sequences: Vec<i64> = records.iter().map(|r| r.sequence as i64).collect();
+        // A lost commit reply may cause retransmission. Only identical content is a retry.
+        // Insert-only, so the database login never needs permission to change history.
+        // The final SELECT sees rows from before this statement, so rows it inserted are excluded by `added`.
+        let conflicts: i64 = sqlx::query_scalar(
+            "WITH incoming AS (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::text[]) AS i(session_id, sequence, record)), \
+             added AS (INSERT INTO cloudroom_records (store, session_id, sequence, record) \
+               SELECT $1, session_id, sequence, record FROM incoming \
+               ON CONFLICT (store, session_id, sequence) DO NOTHING RETURNING session_id, sequence) \
+             SELECT count(*) FROM incoming i \
+             WHERE NOT EXISTS (SELECT 1 FROM added a WHERE a.session_id=i.session_id AND a.sequence=i.sequence) \
+               AND NOT EXISTS (SELECT 1 FROM cloudroom_records r WHERE r.store=$1 AND r.session_id=i.session_id \
+                 AND r.sequence=i.sequence AND r.record=i.record)")
+            .bind(&self.store).bind(&sessions).bind(&sequences).bind(&texts)
+            .fetch_one(&self.pool).await?;
+        if conflicts > 0 {
+            return Err(sqlx::Error::Protocol("conflicting history record".into()));
         }
-        tx.commit().await
+        Ok(())
+    }
+
+    /// Saves a cloud agent's Cloudroom bug report (ADR 0158). The login may only insert reports for its own user.
+    pub async fn report(
+        &self,
+        message: &str,
+        context: &serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO cloudroom_bug_reports (user_id, origin, message, context) VALUES ($1::uuid, 'cloud', $2, $3::jsonb)")
+            .bind(&self.store).bind(message).bind(context.to_string())
+            .execute(&self.pool).await.map(drop)
     }
 
     pub async fn summary(

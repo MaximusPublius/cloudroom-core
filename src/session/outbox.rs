@@ -82,6 +82,10 @@ impl Journal {
         fs::read(self.directory.join(format!("{id:020}.record")))
     }
 
+    pub fn writable(&self) -> bool {
+        self.writable
+    }
+
     pub fn last(&self) -> u64 {
         self.next - 1
     }

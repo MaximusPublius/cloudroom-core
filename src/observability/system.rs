@@ -11,6 +11,7 @@ pub(crate) struct Resources {
     memory_used_bytes: Option<u64>,
     workspace_disk: Option<Disk>,
     state_disk: Option<Disk>,
+    pub(super) agents: Option<super::metrics::AgentCounts>,
 }
 
 impl Resources {
@@ -22,7 +23,10 @@ impl Resources {
         };
         json!({"cpu": self.cpu_used_percent,
             "memory": percent(self.memory_used_bytes, self.memory_total_bytes),
-            "disk": self.workspace_disk.as_ref().and_then(|d| percent(Some(d.used_bytes), Some(d.total_bytes)))})
+            "disk": self.workspace_disk.as_ref().and_then(|d| percent(Some(d.used_bytes), d.used_bytes.checked_add(d.available_bytes))),
+            "memoryUsedBytes": self.memory_used_bytes, "memoryTotalBytes": self.memory_total_bytes,
+            "diskAvailableBytes": self.workspace_disk.as_ref().map(|d| d.available_bytes),
+            "diskTotalBytes": self.workspace_disk.as_ref().map(|d| d.total_bytes)})
     }
 }
 
@@ -49,16 +53,40 @@ impl Sampler {
         let memory_used_bytes = memory_total_bytes
             .zip(memory_field(&memory, "MemAvailable:"))
             .and_then(|(total, available)| total.checked_sub(available));
-        let (workspace_disk, state_disk) =
-            tokio::join!(disk(&config.repository), disk(&config.state_dir));
         Resources {
             cpu_used_percent,
             memory_total_bytes,
             memory_used_bytes,
-            workspace_disk: workspace_disk.ok(),
-            state_disk: state_disk.ok(),
+            workspace_disk: disk(&config.repository).ok(),
+            state_disk: disk(&config.state_dir).ok(),
+            agents: None,
         }
     }
+}
+
+#[test]
+fn disk_percentage_excludes_reserved_blocks() {
+    let mut resources = Resources {
+        cpu_used_percent: None,
+        memory_total_bytes: None,
+        memory_used_bytes: None,
+        workspace_disk: Some(Disk {
+            total_bytes: 80,
+            used_bytes: 77,
+            available_bytes: 0,
+        }),
+        state_disk: None,
+        agents: None,
+    };
+    assert_eq!(resources.dashboard()["disk"], 100.0);
+    resources.workspace_disk = Some(Disk {
+        total_bytes: 80,
+        used_bytes: 38,
+        available_bytes: 38,
+    });
+    assert_eq!(resources.dashboard()["disk"], 50.0);
+    resources.workspace_disk = None;
+    assert!(resources.dashboard()["disk"].is_null());
 }
 
 fn cpu(text: &str) -> Option<(u64, u64)> {
