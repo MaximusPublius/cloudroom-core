@@ -47,6 +47,7 @@ pub const FEATURES: &[&str] = &[
     "compact",
     "usage",
     "subagents",
+    "child_threads",
     "session_list",
     "drain",
 ];

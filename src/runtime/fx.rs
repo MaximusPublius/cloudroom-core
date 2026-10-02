@@ -8,8 +8,7 @@ use tokio::process::Command;
 pub(super) const FX: cursor::Flavor = cursor::Flavor {
     harness: "fx",
     name: "fx",
-    sessions: "sessions",
-    meta: "session.json",
+    native_path: |home, id| home.join("sessions").join(id).join("session.json"),
     valid_id,
     capture: false,
     notices: &["[context] ", "skill discovery warning: "],
@@ -67,8 +66,8 @@ pub(super) fn validate(
     saved: &Resume,
     identity: super::files::Identity,
 ) -> io::Result<()> {
-    let root = profile.home.join(FX.sessions);
-    if !valid_id(&saved.id) || saved.path != root.join(&saved.id).join(FX.meta) {
+    let root = profile.home.join("sessions");
+    if !valid_id(&saved.id) || saved.path != (FX.native_path)(&profile.home, &saved.id) {
         return Err(io::Error::other(
             "fx native path does not match its session",
         ));

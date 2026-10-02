@@ -6,6 +6,7 @@ description: 'Inspect and control the user’s Cloudroom threads, projects, and 
 # Cloudroom from the cloud
 
 - Here, `cloudroom thread update --self --title TITLE` and `cloudroom thread archive --self` rename or archive this thread.
+- Start a subagent with `cloudroom thread spawn --provider codex|claude-code|pi [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] --prompt TEXT`. It runs in this sandbox and folder, and shows under this thread. Cloudroom messages you each time it finishes, so keep working. `cloudroom thread list`, `output CHILD_ID`, and `tell CHILD_ID TEXT` check on and steer your children. Never start threads through Mac access.
 - Everything else (other threads, projects, settings, plugins) lives in the Cloudroom app on the user’s Mac. Run `room-cli` there through Mac access (see the `cloud-mac` skill):
 
   ```sh

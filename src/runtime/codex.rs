@@ -365,6 +365,13 @@ impl Adapter for Protocol {
             .or_else(|| params.get("usage"))
             .cloned()
             .filter(|value| !value.is_null());
+        if root
+            && method == "item/completed"
+            && params["item"]["type"] == "agentMessage"
+            && let Some(text) = params["item"]["text"].as_str()
+        {
+            state.last_text = text.to_owned();
+        }
         let mut events = vec![Event::Record {
             kind: if root { kind } else { "native_event" },
             data: json!({"method":method,"item_id":params["itemId"].as_str().or_else(||params.pointer("/item/id").and_then(Value::as_str)),"request_id":params["item"]["clientId"],"delta":params["delta"],"text":params["item"]["text"],"tool_name":params["item"]["command"],"output":params["item"]["aggregatedOutput"],"status":params["item"]["status"],"usage":usage}),

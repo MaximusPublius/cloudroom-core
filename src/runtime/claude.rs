@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::process::Command;
 
-const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Delegate work with mcp__cloudroom__delegate; each child has its own Cloudroom session and saved history. Do not use native subagents, workflows, or agent teams. Messages are queued; live steering and Fast mode are unavailable. Rewinding changes conversation history only, never files.";
+const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Start child threads with `cloudroom thread spawn` (any harness and model; see `cloudroom thread --help`); each runs in this sandbox, shows under this thread, and Cloudroom messages you when it finishes. Do not use native subagents, workflows, or agent teams. Messages are queued; live steering and Fast mode are unavailable. Rewinding changes conversation history only, never files.";
 
 fn uuid() -> io::Result<String> {
     let mut bytes = [0u8; 16];
@@ -717,7 +717,7 @@ impl Adapter for Protocol {
                 .as_str()
                 .ok_or_else(|| io::Error::other("missing Claude control identity"))?;
             let response = if value["request"]["subtype"] == "hook_callback" {
-                json!({"continue":false,"stopReason":"Native Claude subagents are disabled. Use mcp__cloudroom__delegate for a managed child session."})
+                json!({"continue":false,"stopReason":"Native Claude subagents are disabled. Start a managed child thread with `cloudroom thread spawn`."})
             } else {
                 json!({"behavior":"deny","message":"Interactive requests are unsupported. Ask the user in ordinary chat."})
             };

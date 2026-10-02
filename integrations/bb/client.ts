@@ -5,7 +5,7 @@ export type Json =
   | string
   | Json[]
   | { [key: string]: Json };
-export type Harness = "codex" | "pi" | "cursor" | "claude-code" | "fx";
+export type Harness = "codex" | "pi" | "cursor" | "claude-code" | "fx" | "opencode";
 export type CodexAuthStatus = {
   state: "missing" | "waiting" | "connected" | "limited" | "unavailable" | "error" | "expired";
   email: string | null; plan: string | null; message: string | null;
@@ -563,8 +563,8 @@ export class CloudroomClient {
     }
   }
 
-  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; system_prompt?: string } = {}) {
-    if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx")
+  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; system_prompt?: string; parent_session?: string; prompt?: string; title?: string } = {}) {
+    if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx" && harness !== "opencode")
       throw new CloudroomError("Unsupported Cloudroom harness");
     return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
   }
@@ -761,7 +761,7 @@ export class CloudroomClient {
     );
     if (
       value.session_id !== sessionId ||
-      (value.harness !== "codex" && value.harness !== "pi" && value.harness !== "cursor" && value.harness !== "claude-code" && value.harness !== "fx")
+      (value.harness !== "codex" && value.harness !== "pi" && value.harness !== "cursor" && value.harness !== "claude-code" && value.harness !== "fx" && value.harness !== "opencode")
     ) {
       throw new CloudroomError(
         "Cloudroom session mismatch or unsupported harness",

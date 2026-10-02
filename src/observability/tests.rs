@@ -70,6 +70,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
         .into(),
         storage: None,
         rpc_timeout: Duration::from_secs(30),
+        diagnostic_upload: Duration::from_secs(1),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy(&config.database_url)

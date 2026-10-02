@@ -25,6 +25,7 @@ pub mod cursor_print;
 mod files;
 mod fx;
 pub(crate) mod linux;
+mod opencode;
 mod pi;
 pub(crate) mod pi_auth;
 mod process;
@@ -43,6 +44,8 @@ pub enum Kind {
     #[serde(rename = "claude-code")]
     Claude,
     Fx,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 impl Kind {
     /// Harnesses that accept a per-turn `fast` service tier. Claude Fast stays off (ADR 0133).
@@ -94,6 +97,7 @@ pub fn supports(kind: Kind, models: &[Model], model: &str, reasoning: &str) -> R
 }
 
 pub const PI_REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+pub use opencode::REASONING_LEVELS as OPENCODE_REASONING_LEVELS;
 
 pub async fn claude_auth_ready(config: &Config) -> io::Result<bool> {
     claude::auth_ready(config).await
@@ -399,6 +403,17 @@ impl Handle {
                 None,
                 None,
             ),
+            Kind::OpenCode => (
+                opencode::command(config, &profile)?,
+                Box::new(cursor::Protocol::new(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    opencode::OPENCODE,
+                )),
+                None,
+                None,
+            ),
             Kind::Pi => {
                 let (command, path, helper) = pi::command(
                     config,
@@ -482,7 +497,7 @@ impl Handle {
         Ok(data)
     }
     pub fn capabilities(&self) -> Value {
-        if matches!(self.kind, Kind::Cursor | Kind::Fx) {
+        if matches!(self.kind, Kind::Cursor | Kind::Fx | Kind::OpenCode) {
             return cursor::capabilities(self.kind);
         }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
@@ -498,6 +513,7 @@ impl Handle {
             Kind::Claude => claude::start(&startup).await,
             Kind::Cursor => cursor::start(&startup).await,
             Kind::Fx => fx::start(&startup).await,
+            Kind::OpenCode => opencode::start(&startup).await,
         }
     }
     /// Pi confirms the turn's thinking level before the prompt. Codex sends effort with turn/start.
@@ -517,7 +533,7 @@ impl Handle {
             Kind::Codex => codex::send(self, request, input).await,
             Kind::Pi => pi::send(self, request, input).await,
             Kind::Claude => claude::send(self, request, input).await,
-            Kind::Cursor | Kind::Fx => cursor::send(self, request, input).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::send(self, request, input).await,
         }
     }
     pub async fn steer(&self, request: &str, text: &str) -> io::Result<()> {
@@ -535,7 +551,7 @@ impl Handle {
                 io::ErrorKind::InvalidInput,
                 "Claude live steering is not supported",
             )),
-            Kind::Cursor | Kind::Fx => cursor::steer(self, request, text).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::steer(self, request, text).await,
         }
     }
     pub async fn compact(&self) -> io::Result<()> {
@@ -543,7 +559,7 @@ impl Handle {
             Kind::Codex => codex::compact(self).await,
             Kind::Pi => pi::compact(self).await,
             Kind::Claude => claude::compact(self).await,
-            Kind::Cursor | Kind::Fx => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ACP compaction is not supported",
             )),
@@ -556,7 +572,7 @@ impl Handle {
             Kind::Claude => Err(io::Error::other(
                 "Claude rewind requires native process replacement",
             )),
-            Kind::Cursor | Kind::Fx => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ACP rewind is not supported",
             )),
@@ -609,7 +625,7 @@ impl Handle {
         Ok(())
     }
     pub async fn last_text(&self) -> io::Result<String> {
-        if self.kind == Kind::Claude {
+        if self.kind != Kind::Pi {
             return Ok(self.process.progress.borrow().last_text.clone());
         }
         let result = self.call("get_last_assistant_text", json!({})).await?;
@@ -620,7 +636,7 @@ impl Handle {
             Kind::Codex => Ok(None),
             Kind::Pi => pi::usage(self).await,
             Kind::Claude => Ok(Some(self.process.progress.borrow().last_usage.clone())),
-            Kind::Cursor | Kind::Fx => Ok(None),
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Ok(None),
         }
     }
     pub async fn interrupt(&self, request: &str) -> io::Result<()> {
@@ -635,7 +651,7 @@ impl Handle {
             Kind::Codex => codex::interrupt(self, state).await,
             Kind::Pi => pi::interrupt(self, request).await,
             Kind::Claude => claude::interrupt(self, request).await,
-            Kind::Cursor | Kind::Fx => cursor::interrupt(self, state).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::interrupt(self, state).await,
         }
     }
     pub async fn system_message(&self, text: &str) -> io::Result<()> {
@@ -643,7 +659,7 @@ impl Handle {
             Kind::Codex => codex::notice(self, text).await,
             Kind::Pi => pi::notice(self, text).await,
             Kind::Claude => claude::notice(self, text).await,
-            Kind::Cursor | Kind::Fx => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "ACP context-only notices are unavailable",
             )),
@@ -684,6 +700,7 @@ pub fn check_resume_history(
     match kind {
         Kind::Cursor => return cursor::validate(profile, saved, identity),
         Kind::Fx => return fx::validate(profile, saved, identity),
+        Kind::OpenCode => return opencode::validate(profile, saved, identity),
         _ => {}
     }
     let file = files::open(
@@ -715,6 +732,9 @@ pub fn recover_records(
         Kind::Cursor => cursor::recover(profile, saved, policy, emit),
         // fx keeps its own session files; Cloudroom stores the ACP stream only.
         Kind::Fx => fx::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid))),
+        Kind::OpenCode => {
+            opencode::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)))
+        }
         Kind::Codex => codex::recover(
             profile,
             saved,
@@ -754,7 +774,7 @@ pub fn checkpoint(
         Kind::Codex | Kind::Claude => files::checkpoint(previous, data, native),
         Kind::Pi => pi::checkpoint(data, native),
         Kind::Cursor => cursor::checkpoint(previous, data, native),
-        Kind::Fx => Err(io::Error::other("fx has no native records")),
+        Kind::Fx | Kind::OpenCode => Err(io::Error::other("ACP stream has no native records")),
     }
 }
 

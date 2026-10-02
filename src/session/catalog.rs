@@ -136,15 +136,19 @@ impl Manager {
                     harness["subagents"] = json!(true);
                     harness["usage"] = json!(true);
                 }
-                runtime::Kind::Cursor | runtime::Kind::Fx => {
+                runtime::Kind::Cursor | runtime::Kind::Fx | runtime::Kind::OpenCode => {
                     let capabilities = runtime::cursor::capabilities(*kind);
                     for (key, value) in capabilities.as_object().unwrap() {
                         harness[key] = value.clone();
                     }
-                    harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
-                    // Cursor's print mode has no image input; its agent opens images from the attached path.
+                    harness["reasoning_levels"] = json!(if *kind == runtime::Kind::OpenCode {
+                        runtime::OPENCODE_REASONING_LEVELS
+                    } else {
+                        runtime::PI_REASONING_LEVELS
+                    });
+                    // Cursor's print mode has no image input; Cursor and OpenCode open images from the attached path.
                     harness["attachments"] =
-                        json!({"images":*kind == runtime::Kind::Cursor,"files":true});
+                        json!({"images":*kind != runtime::Kind::Fx,"files":true});
                     harness["provider_selection"] = json!(false);
                     if *kind == runtime::Kind::Cursor {
                         harness["models"] = if self.storage.blocks() {
@@ -187,8 +191,10 @@ impl Manager {
         let (kind, model) = {
             let local = self.local.lock().unwrap();
             let session = local.sessions.get(id).ok_or(Error::NotFound)?;
-            if matches!(session.harness, runtime::Kind::Cursor | runtime::Kind::Fx)
-                && session.reasoning.as_deref() != Some(reasoning)
+            if matches!(
+                session.harness,
+                runtime::Kind::Cursor | runtime::Kind::Fx | runtime::Kind::OpenCode
+            ) && session.reasoning.as_deref() != Some(reasoning)
             {
                 return Err(Error::Conflict("invalid reasoning effort"));
             }
@@ -208,6 +214,7 @@ impl Manager {
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)
             }
+            runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));

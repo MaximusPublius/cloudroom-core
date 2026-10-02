@@ -22,8 +22,8 @@ fn invalid(message: &str) -> io::Error {
 pub(super) struct Flavor {
     pub harness: &'static str,
     pub name: &'static str,
-    pub sessions: &'static str,
-    pub meta: &'static str,
+    /// Where the agent keeps a session, from its home and session ID, when Core does not capture it.
+    pub native_path: fn(&Path, &str) -> PathBuf,
     pub valid_id: fn(&str) -> bool,
     pub capture: bool,
     /// Diagnostics the agent sends as message text; never part of the reply.
@@ -32,8 +32,7 @@ pub(super) struct Flavor {
 pub(super) const CURSOR: Flavor = Flavor {
     harness: "cursor",
     name: "Cursor",
-    sessions: "chats",
-    meta: "meta.json",
+    native_path: |home, id| home.join("chats").join(id).join("meta.json"),
     valid_id,
     capture: true,
     notices: &[],
@@ -404,10 +403,7 @@ impl Adapter for Protocol {
                 self.capture.id = Some(id.clone());
                 path
             } else {
-                self.home
-                    .join(self.flavor.sessions)
-                    .join(&id)
-                    .join(self.flavor.meta)
+                (self.flavor.native_path)(&self.home, &id)
             };
             self.expected = Some(id.clone());
             state.native = Some(id.clone());

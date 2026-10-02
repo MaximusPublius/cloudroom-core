@@ -127,6 +127,14 @@ Chats live at `.cursor/chats/<md5 of the working folder>/<chat ID>`. The adapter
 
 Initial sync discovery includes Cursor skills, global rules and the `notifications`, `hints`, and `suggestNextPrompt` preferences. Existing paired roots are preserved. Credentials, session stores, hooks, plugins and MCP configuration do not sync.
 
+## OpenCode
+
+Core discovers `opencode` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.local/share/opencode` data folder, and runs `opencode acp` through the shared ACP adapter. Use `harness: "opencode"` in the API; the GUI provider is `acp-opencode`. No Cloudroom service variables are needed.
+
+Models are OpenCode's `provider/model` values. Launch selects the model, then the reasoning effort the same way Local threads do (`low` falls back to `minimal`, `max` to `xhigh`); a model without that effort keeps OpenCode's default. Reasoning stays fixed for the session. Sessions live in OpenCode's `opencode.db`; resume uses ACP `session/load`. Images are sent as file paths. Compaction, rewind, Fast, subagents and context-only notices are not advertised.
+
+Logins live in the agent account's `.local/share/opencode/auth.json` (`opencode auth login` as that account); Cloudroom's hosted sandboxes copy the user's Mac file there. Free `opencode/*` models need no login. Tested with OpenCode 1.18.31 on Linux: start, a shell tool call, effort selection, and resume after a Core restart.
+
 ## Queue, completion and recovery
 
 There is one durable Cloudroom queue. Pi's memory-only steering/follow-up queue is not used for that backlog. RPC acknowledgement means acceptance, not completion. Pi requests settle only after its full run, including internal retries and compaction; an additional state check guards premature settled signals. Handled extension commands with no agent run are reconciled separately. Interrupt intent is correlated to the active request even when Pi aborts inside a tool without emitting a new assistant message. Interrupt clears Pi's internal continuations first, but preserves Cloudroom's durable future requests.

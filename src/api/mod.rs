@@ -574,6 +574,10 @@ struct Start {
     workspace_name: Option<String>,
     command_guard_enabled: Option<bool>,
     system_prompt: Option<String>,
+    /// Starts a child thread in this parent's folder; it inherits the parent's settings.
+    parent_session: Option<String>,
+    prompt: Option<String>,
+    title: Option<String>,
 }
 
 async fn workspace(
@@ -803,6 +807,44 @@ async fn start(
         .is_some_and(|p| p.trim().is_empty() || p.len() > 32768 || p.contains('\0'))
     {
         return Err(session::Error::Conflict("invalid system prompt"));
+    }
+    if let Some(parent) = body.parent_session {
+        let prompt = body
+            .prompt
+            .filter(|p| !p.trim().is_empty() && p.len() <= 32768);
+        let title = body.title.map(|t| t.trim().to_owned());
+        if body.workspace.is_some()
+            || body.workspace_name.is_some()
+            || body.provider.is_some()
+            || body.command_guard_enabled.is_some()
+            || body.system_prompt.is_some()
+            || title.as_ref().is_some_and(|t| {
+                t.is_empty() || t.chars().count() > 200 || t.chars().any(char::is_control)
+            })
+        {
+            return Err(session::Error::Conflict(
+                "a child takes only harness, model, reasoning, title and prompt",
+            ));
+        }
+        let prompt = prompt.ok_or(session::Error::Conflict(
+            "prompt must contain 1-32768 bytes of text",
+        ))?;
+        let spawn = session::Spawn {
+            harness: body.harness,
+            model: body.model,
+            reasoning: body.reasoning,
+            title,
+            prompt,
+        };
+        let (id, receipt) = manager
+            .spawn_child(&parent, &body.request_id, spawn)
+            .await?;
+        return Ok(accepted(&manager, &id, receipt));
+    }
+    if body.prompt.is_some() || body.title.is_some() {
+        return Err(session::Error::Conflict(
+            "prompt and title require parent_session",
+        ));
     }
     let (id, receipt) = manager
         .start(

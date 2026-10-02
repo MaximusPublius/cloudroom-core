@@ -21,7 +21,8 @@ Every Cloudroom feature is available over this API. It is plain HTTP on `127.0.0
 ## Sessions
 
 - `GET /v1/sessions`: the latest 1,000 sessions, newest activity first, as `{total, sessions}`. Each summary has `session_id`, `harness`, `model`, `provider`, `state`, `workspace`, `parent_session`, `current_request`, `queued`, `last_sequence` and `last_activity_ms`.
-- `POST /v1/sessions`: start a session. Body: `request_id`, plus optional `harness` (`codex`, `claude-code`, `pi`, `cursor`), `model`, `reasoning`, `provider` (Pi only), `workspace`, `workspace_name`, `command_guard_enabled` and `system_prompt` (up to 32768 bytes; added to the harness's system prompt, or to each Cursor prompt, and inherited by children).
+- `POST /v1/sessions`: start a session. Body: `request_id`, plus optional `harness` (`codex`, `claude-code`, `pi`, `cursor`, `opencode`), `model`, `reasoning`, `provider` (Pi only), `workspace`, `workspace_name`, `command_guard_enabled` and `system_prompt` (up to 32768 bytes; added to the harness's system prompt, or to each Cursor prompt, and inherited by children).
+  - With `parent_session` and `prompt` (plus optional `harness`, `model`, `reasoning` and `title`), it starts a child thread instead: session `cr_child_{request_id}`, in the parent's folder, with the parent's guard and system prompt. The parent keeps working. Each time a child turn ends, Core queues the parent a `notice_…` prompt with the child's reply, even while no app is connected. The parent records a `child_thread` with the child's `id`, `harness` and `title`. Agents use the same path through `cloudroom thread spawn|list|output|tell`. Capability: `child_threads`.
 - `GET /v1/sessions/{id}`: full state, including receipts and the queue.
 - `GET /v1/sessions/{id}/workspace`: the session's folder, branch and commit.
 - `GET /v1/sessions/{id}/recovery`: whether a stopped session can resume ([lifecycle](session-lifecycle.md)).
@@ -51,7 +52,7 @@ Commands, all `POST /v1/sessions/{id}/...` with a `request_id`:
 
 Each record is `{sequence, session_id, kind, data, native?, timestamp_ms?}`. `native` holds the harness's original output line.
 
-- **Lifecycle:** `receipt`, `state`, `harness`, `workspace`, `native_identity`, `launch_reasoning`, `checkpoint`, `usage`, `usage_limited`, `child`, `child_result`, `rewind`, `rewind_ready`, `rewind_failed`, `teleport`, `secret_request`, `interaction_cancelled`, `native_history_unavailable`.
+- **Lifecycle:** `receipt`, `state`, `harness`, `workspace`, `native_identity`, `launch_reasoning`, `checkpoint`, `usage`, `usage_limited`, `child`, `child_result`, `child_thread`, `rewind`, `rewind_ready`, `rewind_failed`, `teleport`, `secret_request`, `interaction_cancelled`, `native_history_unavailable`.
 - **Disk safety:** `storage_warning`, `storage_warning_delivery`, `storage_pause`, `storage_recovered`.
 - **Harness output:** `text_delta`, `thinking_delta`, `item_started`, `item_completed`, `tool_delta`, `tool_snapshot`, `native_event` and `native_record`.
 

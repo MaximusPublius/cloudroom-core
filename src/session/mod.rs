@@ -1,4 +1,5 @@
 mod children;
+pub use children::Spawn;
 mod outbox;
 pub mod teleport;
 pub use outbox::Journal;
@@ -631,6 +632,7 @@ impl Manager {
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)
             }
+            runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));
@@ -1683,6 +1685,7 @@ impl Manager {
                 });
             }
         }
+        self.watch_children(&local);
         Ok(())
     }
 

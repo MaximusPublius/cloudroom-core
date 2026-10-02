@@ -319,9 +319,7 @@ impl Guard {
         let measured = async {
             p.check_filesystems(config)?;
             workspaces.check_filesystems()?;
-            let (workspace, history) =
-                tokio::join!(disk(workspaces.root()), disk(&config.state_dir));
-            let (workspace, history) = (workspace?, history?);
+            let (workspace, history) = (disk(workspaces.root())?, disk(&config.state_dir)?);
             let available = workspace.available_bytes.min(history.available_bytes);
             let level = {
                 let mut floor = self.floor.lock().unwrap();
@@ -383,41 +381,35 @@ pub(crate) struct Disk {
     pub used_bytes: u64,
     pub available_bytes: u64,
 }
-pub(crate) async fn disk(path: &Path) -> io::Result<Disk> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(1),
-        Command::new("/bin/df")
-            .env_clear()
-            .env("LC_ALL", "C")
-            .arg("-Pk")
-            .arg(path)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| io::Error::other("filesystem measurement timed out"))??;
-    if !output.status.success() {
-        return Err(io::Error::other("filesystem measurement failed"));
+/// A system call, not `df`: when agents fill the process table, starting `df` fails,
+/// and an unmeasurable disk pauses all work.
+#[cfg(target_os = "linux")]
+pub(crate) fn disk(path: &Path) -> io::Result<Disk> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn statvfs(path: *const std::ffi::c_char, buf: *mut u64) -> i32;
     }
-    let text = String::from_utf8(output.stdout).map_err(io::Error::other)?;
-    let fields: Vec<&str> = text
-        .lines()
-        .nth(1)
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect();
-    let n = |i: usize| {
-        fields
-            .get(i)
-            .and_then(|s| s.parse::<u64>().ok())
-            .and_then(|n| n.checked_mul(1024))
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // 64-bit Linux `struct statvfs` begins f_bsize, f_frsize, f_blocks, f_bfree, f_bavail, each
+    // 8 bytes. The buffer is larger than the whole struct.
+    let mut buf = [0u64; 32];
+    if unsafe { statvfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let [_, unit, blocks, free, available, ..] = buf;
+    let bytes = |n: u64| {
+        n.checked_mul(unit)
             .ok_or_else(|| io::Error::other("invalid filesystem measurement"))
     };
     Ok(Disk {
-        total_bytes: n(1)?,
-        used_bytes: n(2)?,
-        available_bytes: n(3)?,
+        total_bytes: bytes(blocks)?,
+        used_bytes: bytes(blocks.saturating_sub(free))?,
+        available_bytes: bytes(available)?,
     })
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn disk(_: &Path) -> io::Result<Disk> {
+    Err(io::Error::other("disk measurement requires Linux"))
 }
 
 /// Runs only as the agent account, while workloads are frozen or absent. Never traverses

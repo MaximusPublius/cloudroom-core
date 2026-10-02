@@ -53,14 +53,12 @@ impl Sampler {
         let memory_used_bytes = memory_total_bytes
             .zip(memory_field(&memory, "MemAvailable:"))
             .and_then(|(total, available)| total.checked_sub(available));
-        let (workspace_disk, state_disk) =
-            tokio::join!(disk(&config.repository), disk(&config.state_dir));
         Resources {
             cpu_used_percent,
             memory_total_bytes,
             memory_used_bytes,
-            workspace_disk: workspace_disk.ok(),
-            state_disk: state_disk.ok(),
+            workspace_disk: disk(&config.repository).ok(),
+            state_disk: disk(&config.state_dir).ok(),
             agents: None,
         }
     }
