@@ -543,7 +543,6 @@ impl IntoResponse for session::Error {
             "connect Codex before starting cloud work" => "codex_auth_required",
             "connect Claude Code before starting cloud work" => "claude_auth_required",
             "Claude account could not be verified" => "claude_auth_unavailable",
-            "Claude live steering is not supported" => "unsupported_command",
             "Codex usage limit reached" => "codex_usage_limit",
             "Codex account could not be verified" => "codex_auth_unavailable",
             "connect Cursor before starting cloud work" => "cursor_auth_required",

@@ -21,7 +21,7 @@ CLOUDROOM_PI_PROVIDER=openai-codex
 CLOUDROOM_PI_MODEL=gpt-6-astra
 ```
 
-Use the official `@earendil-works/pi-coding-agent` **0.85.1**, with its supported Node runtime on `/usr/local/bin:/usr/bin:/bin`. Provision the harness and its account credentials separately; the core does not install packages or perform login. Adapter startup verifies the resolved model/provider, native identity, and bundled context extension. Protocol compatibility must be tested before upgrading Pi.
+Use the official `@earendil-works/pi-coding-agent` **0.85.1 or newer** (images ship 1.0.0), with its supported Node runtime on `/usr/local/bin:/usr/bin:/bin`. Provision the harness and its account credentials separately; the core does not install packages or perform login. Adapter startup verifies the resolved model/provider, native identity, and bundled context extension. Protocol compatibility must be tested before upgrading Pi.
 
 Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/telemetry are disabled through Pi's process flags. Existing Pi settings/resources and explicit project-trust decisions still apply. Prepare trusted packages before service startup. The account directory is separate from Cloudroom's protected state directory. Every configured harness home must share the monitored filesystem with the workspace. Neither API/database tokens nor administrative environment variables are inherited by either harness. Pi credentials are available to that agent account; this is not isolation of inference credentials from its own tools.
 
@@ -39,7 +39,7 @@ Terminal fallback: run `claude auth login` and `claude auth status` as the confi
 
 Create sessions with `"harness":"claude-code"`. Missing login returns `claude_auth_required` before acceptance; verification failures return `claude_auth_unavailable`. The GUI retains the task and offers **Retry start** after native login. This is login guidance, not an embedded OAuth flow or a live subscription-limit check.
 
-The adapter disables native steering, Fast mode, structured questions and hidden native subagents. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
+Steering writes the message into the running turn, as Local's Claude does; a steer that misses its turn runs as Claude's own turn. The adapter disables Fast mode, structured questions and hidden native subagents. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
 
 ### Selected skills
 
@@ -129,11 +129,11 @@ Initial sync discovery includes Cursor skills, global rules and the `notificatio
 
 ## OpenCode
 
-Core discovers `opencode` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.local/share/opencode` data folder, and runs `opencode acp` through the shared ACP adapter. Use `harness: "opencode"` in the API; the GUI provider is `acp-opencode`. No Cloudroom service variables are needed.
+Core discovers `opencode` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.local/share/opencode` data folder, and runs `opencode acp` through the shared ACP adapter. Use `harness: "opencode"` in the API; the GUI provider is `acp-opencode`. No Cloudroom service variables are needed. OpenCode 1 (npm `opencode-ai`) and OpenCode 2 (npm `@opencode/cli`) both work; both install `opencode`. OpenCode 2's `acp` starts a private server child, which Core's workload containment stops with the harness. Core sets `OPENCODE_CONFIG_CONTENT` to turn off the question tool (it ends OpenCode 2 turns over ACP) and auto-update.
 
 Models are OpenCode's `provider/model` values. Launch selects the model, then the reasoning effort the same way Local threads do (`low` falls back to `minimal`, `max` to `xhigh`); a model without that effort keeps OpenCode's default. Reasoning stays fixed for the session. Sessions live in OpenCode's `opencode.db`; resume uses ACP `session/load`. Images are sent as file paths. Compaction, rewind, Fast, subagents and context-only notices are not advertised.
 
-Logins live in the agent account's `.local/share/opencode/auth.json` (`opencode auth login` as that account); Cloudroom's hosted sandboxes copy the user's Mac file there. Free `opencode/*` models need no login. Tested with OpenCode 1.18.31 on Linux: start, a shell tool call, effort selection, and resume after a Core restart.
+Sign in with `opencode auth login` as the agent account. OpenCode 1 keeps logins in `.local/share/opencode/auth.json`; OpenCode 2 keeps them in `opencode.db` and moves them with `opencode auth export` and `opencode auth import`. Cloudroom's hosted sandboxes copy the user's Mac logins either way. Free `opencode/*` models need no login. Tested on Linux with OpenCode 1.18.34 and 2.0.22: start, effort selection, a shell tool call, a question prompt, and resume after a Core restart.
 
 ## Queue, completion and recovery
 

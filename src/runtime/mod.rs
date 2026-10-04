@@ -505,7 +505,7 @@ impl Handle {
             return cursor::capabilities(self.kind);
         }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
-            "steer":self.kind!=Kind::Claude,"compact":true,"rewind":true,"attachments":true,
+            "steer":true,"compact":true,"rewind":true,"attachments":true,
             "service_tier":self.kind.fast(),"subagents":true,"usage":true,"goal":self.kind==Kind::Codex})
     }
     pub async fn start_session(&self) -> io::Result<String> {
@@ -556,10 +556,7 @@ impl Handle {
         match self.kind {
             Kind::Codex => codex::steer(self, state, text).await,
             Kind::Pi => pi::steer(self, request, text).await,
-            Kind::Claude => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Claude live steering is not supported",
-            )),
+            Kind::Claude => claude::steer(self, request, text).await,
             Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::steer(self, request, text).await,
         }
     }

@@ -13,6 +13,8 @@ use std::{
 use tokio::process::Command;
 
 const CONTEXT: &str = include_str!("pi-context.ts");
+// Oldest tested Pi; sandboxes on older images keep running it while new images ship newer releases.
+const PI_MINIMUM: &str = "0.85.1";
 fn unique() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
@@ -49,16 +51,17 @@ pub(super) fn command(
     // exclusively-created file, making even a pre-first-prompt session resumable.
     let mut command = child_command(Path::new("/bin/sh"), config);
     let helper = directory.join(format!("{}.context.ts", unique()));
-    let script = if saved.is_some() {
-        "set -eu; [ \"$(\"$5\" --version)\" = 0.85.1 ] || { echo 'unsupported Pi version: require 0.85.1' >&2; exit 1; }; umask 077; mkdir -p \"$1\"; set -C; printf '%s' \"$4\" > \"$3\"; shift 4; exec \"$@\""
-    } else {
-        "set -eu; [ \"$(\"$5\" --version)\" = 0.85.1 ] || { echo 'unsupported Pi version: require 0.85.1' >&2; exit 1; }; umask 077; mkdir -p \"$1\"; set -C; : > \"$2\"; printf '%s' \"$4\" > \"$3\"; shift 4; exec \"$@\""
-    };
+    let create = if saved.is_some() { "" } else { ": > \"$2\"; " };
+    let script = format!(
+        "set -eu; v=$(\"$5\" --version); [ \"$(printf '%s\\n' {PI_MINIMUM} \"$v\" | sort -V | head -n 1)\" = {PI_MINIMUM} ] || {{ echo \"unsupported Pi version $v: require {PI_MINIMUM} or newer\" >&2; exit 1; }}; umask 077; mkdir -p \"$1\"; set -C; {create}printf '%s' \"$4\" > \"$3\"; shift 4; exec \"$@\""
+    );
     command
         .env("PI_CODING_AGENT_DIR", &profile.home)
         .env("PI_OFFLINE", "1")
         .env("PI_TELEMETRY", "0")
-        .args(["-c", script, "cloudroom-pi"])
+        .arg("-c")
+        .arg(script)
+        .arg("cloudroom-pi")
         .arg(&directory)
         .arg(&path)
         .arg(&helper)

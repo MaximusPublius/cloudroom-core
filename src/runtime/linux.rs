@@ -106,26 +106,31 @@ impl Workload {
             }
         }
     }
-    pub fn process_count(&self) -> Option<usize> {
-        match &self.group {
-            Group::Cgroup(directory) => {
-                let procs = fs::read_to_string(directory.join("cgroup.procs")).ok()?;
-                Some(procs.lines().filter(|line| !line.is_empty()).count())
-            }
-            Group::Marked(id) => members(Some(id)).ok().map(|m| m.len()),
-        }
-    }
-    /// Kills the process group, other than the harness's own, that wrote the most to disk: a tool command,
-    /// never the harness or the helpers it did not detach. The youngest group wins when write counts are
-    /// unreadable. Returns the heaviest writer's command line, or None when nothing but the harness remains.
-    pub fn kill_top_writer(&self, harness: u32) -> io::Result<Option<String>> {
-        let pids: Vec<i32> = match &self.group {
+    fn pids(&self) -> io::Result<Vec<i32>> {
+        Ok(match &self.group {
             Group::Cgroup(directory) => fs::read_to_string(directory.join("cgroup.procs"))?
                 .lines()
                 .filter_map(|line| line.parse().ok())
                 .collect(),
             Group::Marked(id) => members(Some(id))?.into_iter().map(|m| m.pid).collect(),
+        })
+    }
+    /// Idle sleep treats processes beyond the launch count as background jobs. Codex starts its code-mode
+    /// host on the first command and keeps it for the session, so it is harness, not a background job.
+    pub fn process_count(&self) -> Option<usize> {
+        let helper = |pid: &i32| {
+            fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                let program = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+                program.rsplit(|b| *b == b'/').next() == Some(b"codex-code-mode-host".as_slice())
+            })
         };
+        Some(self.pids().ok()?.iter().filter(|pid| !helper(pid)).count())
+    }
+    /// Kills the process group, other than the harness's own, that wrote the most to disk: a tool command,
+    /// never the harness or the helpers it did not detach. The youngest group wins when write counts are
+    /// unreadable. Returns the heaviest writer's command line, or None when nothing but the harness remains.
+    pub fn kill_top_writer(&self, harness: u32) -> io::Result<Option<String>> {
+        let pids = self.pids()?;
         let own_group = stat(harness as i32).map(|(group, _)| group);
         let mut groups: std::collections::HashMap<i32, Vec<(i32, u64, u64)>> = Default::default();
         for pid in pids {

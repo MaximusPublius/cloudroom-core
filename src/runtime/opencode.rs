@@ -38,8 +38,15 @@ pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Co
         ));
     }
     let mut command = child_command(&profile.binary, config);
-    // The image pins the OpenCode version.
-    command.env("OPENCODE_DISABLE_AUTOUPDATE", "1").arg("acp");
+    // The image pins the OpenCode version. OpenCode 2's question tool ends the turn over ACP, and
+    // Cloudroom asks in plain chat (ADR 0108). OpenCode 1 and 2 both read this config.
+    command
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+        .env(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"autoupdate":false,"permission":{"question":"deny"}}"#,
+        )
+        .arg("acp");
     Ok(command)
 }
 

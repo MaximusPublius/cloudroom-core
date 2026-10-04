@@ -86,6 +86,9 @@ pub struct Session {
     pub startup_error: Option<String>,
     /// The detailed reason recorded with `startup_error`, shown to users verbatim.
     pub startup_reason: Option<String>,
+    // Why the session failed or lost its process, with harness stderr, for `thread output`.
+    #[serde(skip)]
+    failure: Option<String>,
     #[serde(skip)]
     has_dispatched: bool,
     pub last_sequence: u64,
@@ -1070,9 +1073,6 @@ impl Manager {
                         ));
                     }
                 }
-            }
-            if command == "steer" && session.harness == runtime::Kind::Claude {
-                return Err(Error::Conflict("Claude live steering is not supported"));
             }
             if command == "steer"
                 && (!session.ready
@@ -2107,6 +2107,11 @@ impl Manager {
                     && ((session.ready && session.can_resume())
                         || (self.is_stopping() && restoring));
                 let recover = resumable && !self.is_stopping() && !session.recovery_attempted;
+                // Launch already recorded the real cause; stopping its harness must not hide it.
+                let failed = session
+                    .failure
+                    .clone()
+                    .filter(|_| session.state == "failed");
                 session.handle = None;
                 session.ready = false;
                 let request = session.current_request.clone();
@@ -2138,21 +2143,24 @@ impl Manager {
                 if cleaned_up {
                     local.append(id, "harness", json!({"pid":null}), None)?;
                 }
-                let lost = match &cause {
+                let lost = failed.clone().unwrap_or_else(|| match &cause {
                     Some(cause) => format!("{reason}: {cause} ({exit})"),
                     None => format!("{reason} ({exit})"),
-                };
+                });
                 let state = if expected && close.is_some() {
                     "closed"
                 } else if resumable && (self.is_stopping() || recover) {
                     "suspended"
+                } else if failed.is_some() {
+                    "failed"
                 } else {
                     "process_lost"
                 };
+                let lost_or_failed = matches!(state, "process_lost" | "failed");
                 local.append(
                     id,
                     "state",
-                    json!({"state":state,"reason":lost,"diagnostic_id":diagnostic_id,"stderr":(state == "process_lost" && !stderr.is_empty()).then_some(stderr)}),
+                    json!({"state":state,"reason":lost,"diagnostic_id":diagnostic_id,"stderr":(lost_or_failed && !stderr.is_empty()).then_some(stderr)}),
                     None,
                 )?;
                 if let Some(request) = close {

@@ -158,8 +158,10 @@ pub struct Spawn {
     pub prompt: String,
 }
 
-fn notice_id(child: &str, request: &str) -> String {
-    format!("notice_{child}_{request}")
+/// A notice's two delivery attempts: steered into the parent's running turn, then queued as a prompt.
+fn notice_ids(child: &str, request: &str) -> (String, String) {
+    let queued = format!("notice_{child}_{request}");
+    (format!("{queued}_steer"), queued)
 }
 
 fn title(session: &Session) -> Option<String> {
@@ -320,7 +322,8 @@ impl Manager {
         }
     }
 
-    /// Queues a notice to the parent for each finished child turn, until either thread closes.
+    /// Tells the parent about each finished child turn, until either thread closes. A busy parent
+    /// gets the notice in its running turn, as in Local threads; otherwise it waits in the queue.
     fn watch_child(self: &Arc<Self>, local: &Local, child: String) {
         let manager = self.clone();
         let mut changed = local.changed.subscribe();
@@ -341,34 +344,56 @@ impl Manager {
                     if p.close_request.is_some() || p.state == "closed" {
                         return;
                     }
-                    let finished = c.receipts.values().find(|r| {
-                        r.command == "prompt"
-                            && FINISHED.contains(&r.state.as_str())
-                            && !p.receipts.contains_key(&notice_id(&child, &r.request_id))
+                    let finished = c.receipts.values().find_map(|r| {
+                        if r.command != "prompt" || !FINISHED.contains(&r.state.as_str()) {
+                            return None;
+                        }
+                        let (steer, queued) = notice_ids(&child, &r.request_id);
+                        let tried = p.receipts.get(&steer);
+                        // Delivered, or still being steered into the turn it targets.
+                        let settled = p.receipts.contains_key(&queued)
+                            || tried.is_some_and(|s| {
+                                s.state == "completed"
+                                    || (s.state == "accepted"
+                                        && s.input["target_request_id"].as_str()
+                                            == p.current_request.as_deref())
+                            });
+                        (!settled).then(|| (r, tried.is_none()))
                     });
                     match finished {
-                        Some(r) => Some((
+                        Some((r, steer)) => Some((
                             p.session_id.clone(),
                             r.request_id.clone(),
                             r.state.clone(),
                             // A newer turn may already have replaced the harness's last reply.
                             c.handle.clone().filter(|_| c.current_request.is_none()),
                             title(c),
+                            p.current_request.clone().filter(|_| steer),
                         )),
                         None if c.close_request.is_some() || c.state == "closed" => return,
                         None => None,
                     }
                 };
-                if let Some((parent, request, state, handle, title)) = due {
+                if let Some((parent, request, state, handle, title, target)) = due {
                     let reply = match handle {
                         Some(handle) if state == "completed" => handle.last_text().await.ok(),
                         _ => None,
                     };
                     let text = notice(&child, title, &state, reply);
-                    let id = notice_id(&child, &request);
-                    // Storage or a drain can refuse it; retry after a pause, or after the next restart.
-                    if manager
-                        .command(&parent, id, "prompt", json!({"text":text}))
+                    let (steer, queued) = notice_ids(&child, &request);
+                    // A turn that just ended, or a harness that cannot steer, falls back to the queue.
+                    // Storage or a drain can refuse both; retry after a pause, or after the next restart.
+                    if target.is_some_and(|target| {
+                        manager
+                            .command(
+                                &parent,
+                                steer,
+                                "steer",
+                                json!({"text":text,"target_request_id":target}),
+                            )
+                            .is_ok()
+                    }) || manager
+                        .command(&parent, queued, "prompt", json!({"text":text}))
                         .is_ok()
                     {
                         continue;
@@ -402,7 +427,7 @@ impl Manager {
                 .filter(|c| only.is_none_or(|id| c.session_id == id))
                 .map(|c| {
                     let busy = c.current_request.is_some() || c.has_work();
-                    json!({"id":c.session_id,"title":title(c),"harness":c.harness,"model":c.model,"state":c.state,"busy":busy})
+                    json!({"id":c.session_id,"title":title(c),"harness":c.harness,"model":c.model,"state":c.state,"busy":busy,"error":c.failure})
                 })
                 .collect();
             let handle = only

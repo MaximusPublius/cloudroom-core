@@ -127,7 +127,7 @@ impl Manager {
                             Err(_) => Value::Null,
                         }
                     };
-                    harness["steer"] = json!(*kind == runtime::Kind::Codex);
+                    harness["steer"] = json!(true);
                     harness["goal"] = json!(*kind == runtime::Kind::Codex);
                     harness["compact"] = json!(true);
                     harness["service_tier"] = json!(kind.fast());

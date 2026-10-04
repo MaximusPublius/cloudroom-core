@@ -106,9 +106,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The service starts without arguments; anything else is a mistyped agent command.
     if let Some(command) = args.first() {
-        eprintln!(
-            "Unknown command {command}. Use cloudroom preview, cloudroom mac, cloudroom secret, or cloudroom thread."
-        );
+        let commands = "Commands: cloudroom thread, mac, secret, preview, computer-use, feedback. Add --help to any of them.";
+        if matches!(command.as_str(), "--help" | "-h" | "help") {
+            println!("{commands}");
+            return Ok(());
+        }
+        eprintln!("Unknown command {command}. {commands}");
         std::process::exit(2);
     }
     cloudroom::serve(cloudroom::config::Config::from_env()?).await

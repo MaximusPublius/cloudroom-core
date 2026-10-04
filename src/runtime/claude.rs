@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::process::Command;
 
-const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Start child threads with `cloudroom thread spawn` (any harness and model; see `cloudroom thread --help`); each runs in this sandbox, shows under this thread, and Cloudroom messages you when it finishes. Do not use native subagents, workflows, or agent teams. Messages are queued; live steering and Fast mode are unavailable. Rewinding changes conversation history only, never files.";
+const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Start child threads with `cloudroom thread spawn` (any harness and model; see `cloudroom thread --help`); each runs in this sandbox, shows under this thread, and Cloudroom messages you when it finishes. Do not use native subagents, workflows, or agent teams. Fast mode is unavailable. Rewinding changes conversation history only, never files.";
 
 fn uuid() -> io::Result<String> {
     let mut bytes = [0u8; 16];
@@ -390,6 +390,19 @@ pub(super) async fn notice(handle: &Handle, text: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// A message sent mid-turn, which Claude reads at its next step, as Local's Claude steering does.
+pub(super) async fn steer(handle: &Handle, request: &str, text: &str) -> io::Result<()> {
+    handle
+        .process
+        .control(
+            "steer",
+            json!({"content":[{"type":"text","text":text}]}),
+            request,
+        )
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn interrupt(handle: &Handle, request: &str) -> io::Result<()> {
     let response = handle
         .process
@@ -640,7 +653,7 @@ impl Protocol {
 
 impl Adapter for Protocol {
     fn validate(&self, method: &str, params: &Value) -> io::Result<()> {
-        if method == "prompt" {
+        if matches!(method, "prompt" | "steer") {
             let frame = json!({"type":"user","uuid":self.input_namespace,"session_id":self.native,"parent_tool_use_id":null,"message":{"role":"user","content":params["content"]},"isSynthetic":false,"shouldQuery":true});
             if serde_json::to_vec(&frame)?.len() + 1 > MAX_LINE {
                 return Err(io::Error::new(
@@ -652,7 +665,10 @@ impl Adapter for Protocol {
         Ok(())
     }
     fn encode(&mut self, id: u64, method: &str, params: Value, request: Option<&str>) -> Value {
-        if matches!(method, "prompt" | "bootstrap" | "notice" | "compact") {
+        if matches!(
+            method,
+            "prompt" | "steer" | "bootstrap" | "notice" | "compact"
+        ) {
             let wire = format!("{}{:012x}", &self.input_namespace[..24], id);
             self.users.insert(
                 wire.clone(),
@@ -988,8 +1004,11 @@ impl Adapter for Protocol {
                 .filter_map(Value::as_str)
                 .chain(value["user_message_uuid"].as_str())
                 .collect();
+            // A steer that missed its turn runs as Claude's own turn, so it does not claim it.
             let auto = self.active.as_ref().is_some_and(|(id, _)| id.is_empty())
-                && !ids.iter().any(|id| self.users.contains_key(*id));
+                && !ids
+                    .iter()
+                    .any(|id| self.users.get(*id).is_some_and(|call| call.kind != "steer"));
             for id in &ids {
                 if let Some(call) = self.users.remove(*id) {
                     if call.kind == "bootstrap" {

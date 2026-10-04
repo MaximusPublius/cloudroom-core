@@ -1,5 +1,5 @@
 """Real Pi + Rust HTTP, using disposable files and existing credentials. No database changes.
-Requires an installed Pi 0.85.1 and valid credentials. Linux containment/DB upload
+Requires an installed Pi 0.85.1+ and valid credentials. Linux containment/DB upload
 remain separate checks; this intentionally exercises local recording during DB outage.
 """
 import json
@@ -139,7 +139,7 @@ def native_fixture():
     binary = shutil.which('pi')
     node = shutil.which('node')
     if not binary or not node:
-        raise SystemExit('BLOCKED: installed Pi 0.85.1 and Node are required')
+        raise SystemExit('BLOCKED: installed Pi 0.85.1+ and Node are required')
     test = ReplayTests(); test.setUp()
     try:
         home = test.root / 'pi'

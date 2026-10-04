@@ -1,4 +1,4 @@
-//! Cloud agents rename or archive their own thread, change its effort, and start child threads in their own sandbox. Each request
+//! Cloud agents rename or archive their own thread, change its effort, and start, stop and archive child threads in their own sandbox. Each request
 //! is a session record, so the app applies it whenever it next reads the thread, including after it was offline.
 use super::Manager;
 use crate::preview::Peer;
@@ -22,7 +22,9 @@ cloudroom thread stop --self
 cloudroom thread spawn --provider codex|claude-code|pi [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] --prompt TEXT|--prompt-file PATH
 cloudroom thread list
 cloudroom thread output CHILD_ID
-cloudroom thread tell CHILD_ID TEXT";
+cloudroom thread tell CHILD_ID TEXT
+cloudroom thread stop CHILD_ID
+cloudroom thread archive CHILD_ID";
 const SPAWN_NOTE: &str = "Started in this sandbox and folder. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 pub(crate) type Failure = (StatusCode, Json<Value>);
 
@@ -67,6 +69,8 @@ pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
         .route("/children", get(list).post(spawn))
         .route("/children/{id}", get(output))
         .route("/children/{id}/messages", post(tell))
+        .route("/children/{id}/stop", post(stop_child))
+        .route("/children/{id}/archive", post(archive_child))
 }
 
 /// The session whose harness process sent this `cloudroom <command>` request.
@@ -263,6 +267,37 @@ async fn tell(
     ))
 }
 
+/// Stops the child's running turn and pauses its queue, like the app's stop button.
+async fn stop_child(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Failure> {
+    let parent = caller(&m, peer, "thread stop")?;
+    m.own_child(&parent, &id).map_err(session_failure)?;
+    let request =
+        random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
+    let receipt = m
+        .command(&id, request, "stop", json!({}))
+        .map_err(session_failure)?;
+    Ok(Json(json!({"id":id,"state":receipt.state})))
+}
+
+/// Stops the child now; the app archives it, and its own children, whenever it next reads the thread.
+async fn archive_child(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Failure> {
+    let parent = caller(&m, peer, "thread archive")?;
+    m.own_child(&parent, &id).map_err(session_failure)?;
+    let request =
+        random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
+    // A child that already ended has nothing to stop.
+    let _ = m.command(&id, request, "stop", json!({}));
+    record(&m, &id, "archive", json!({"id":id,"archived":true}))
+}
+
 /// Flag value after `name`, for `cloudroom thread spawn`.
 fn flag<'a>(words: &[&'a str], name: &str) -> Option<&'a str> {
     words
@@ -313,7 +348,12 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         .map(String::as_str)
         .filter(|word| *word != "--json")
         .collect();
+    let help = words.iter().any(|word| matches!(*word, "--help" | "-h"));
     let (path, body) = match words.as_slice() {
+        _ if help => {
+            println!("{USAGE}");
+            return Ok(0);
+        }
         ["spawn", rest @ ..] => return spawn_cli(rest).await,
         ["list", ..] => {
             let answer = crate::mac::request(crate::mac::SOCKET, "GET", "/children", None).await?;
@@ -353,15 +393,22 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
             );
             return Ok(0);
         }
+        [action @ ("stop" | "archive"), id] if !id.starts_with('-') => {
+            let answer = crate::mac::request(
+                crate::mac::SOCKET,
+                "POST",
+                &format!("/children/{id}/{action}"),
+                None,
+            )
+            .await?;
+            println!("{answer}");
+            return Ok(0);
+        }
         _ => {
             println!(
-                "{USAGE}\nRenames, archives or changes the effort of this cloud thread, or starts and checks child threads in this sandbox."
+                "{USAGE}\nRenames, archives or changes the effort of this cloud thread, or starts, checks, stops and archives child threads in this sandbox."
             );
-            return Ok(if matches!(words.as_slice(), [] | ["--help"]) {
-                0
-            } else {
-                2
-            });
+            return Ok(if words.is_empty() { 0 } else { 2 });
         }
     };
     let answer = crate::mac::request(crate::mac::SOCKET, "POST", path, body).await?;

@@ -300,6 +300,14 @@ impl Local {
             }
             "state" => {
                 session.state = record.data["state"].as_str().unwrap_or("unknown").into();
+                session.failure =
+                    matches!(session.state.as_str(), "failed" | "process_lost").then(|| {
+                        let reason = record.data["reason"].as_str().unwrap_or("unknown cause");
+                        match record.data["stderr"].as_str() {
+                            Some(stderr) => format!("{reason}\n{stderr}"),
+                            None => reason.into(),
+                        }
+                    });
                 if session.state == "resuming" && record.data["recovery"] == true {
                     session.recovery_attempted = true;
                 }

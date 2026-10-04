@@ -797,6 +797,21 @@ class RecoveryTests(unittest.TestCase):
         self.service.request("POST", "/v1/sessions/cr_seed/resume", {"request_id": "resume"}, 202)
         self.assertEqual((self.repo / (self.native + ".requests")).read_text().splitlines(), ["running", "queued"])
 
+    def test_child_notice_steers_a_busy_parent_and_queues_for_an_idle_one(self):
+        self.seed(); self.start(); self.ready()
+        self.prompt("running", "hold")
+        self.wait(lambda: self.status()["state"] == "running", "running turn")
+        self.service.request("POST", "/v1/sessions", {"request_id": "kid", "parent_session": "cr_seed", "prompt": "hello"}, 202)
+        receipts = lambda: self.status()["receipts"]
+        self.wait(lambda: receipts().get("notice_cr_child_kid_task_kid_steer", {}).get("state") == "completed", "steered notice")
+        self.assertIn("completed", receipts()["notice_cr_child_kid_task_kid_steer"]["input"]["text"])
+        self.assertNotIn("notice_cr_child_kid_task_kid", receipts())
+        self.service.request("POST", "/v1/sessions/cr_seed/interrupt", {"request_id": "halt", "target_request_id": "running"}, 202)
+        self.ready()
+        self.service.request("POST", "/v1/sessions/cr_child_kid/prompts", {"request_id": "again", "text": "hello"}, 202)
+        self.wait(lambda: receipts().get("notice_cr_child_kid_again", {}).get("state") == "completed", "queued notice")
+        self.assertNotIn("notice_cr_child_kid_again_steer", receipts())
+
     def test_codex_goal_turns_are_tracked_paused_by_stop_and_resumed_by_the_user(self):
         self.seed(); self.start(); self.ready()
         self.prompt("first", "goal")
