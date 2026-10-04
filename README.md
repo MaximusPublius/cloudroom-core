@@ -1,8 +1,10 @@
 # Cloudroom core
 
-[Website](https://www.cloudroom.dev) · [Changelog](https://www.cloudroom.dev/changelog) · [Security](https://www.cloudroom.dev/security)
+[Website](https://www.cloudroom.dev) · [Desktop app](https://github.com/davidondrej/cloudroom-gui) · [Changelog](https://www.cloudroom.dev/changelog) · [Security](https://www.cloudroom.dev/security)
 
-Cloudroom core runs coding agents on your own Linux machine and saves their chat history.
+Your agents get their own room in the cloud.
+
+Cloudroom core runs coding agents on your own Linux machine and saves their chat history. It powers the cloud side of the [Cloudroom app](https://github.com/davidondrej/cloudroom-gui), which runs Claude Code, Codex, and Pi on your Mac or in the cloud.
 
 - Works with Codex, Claude Code, Pi, and Cursor.
 - Agents use your own logins to call their models.
