@@ -290,7 +290,7 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     handle
         .call(
             "bootstrap",
-            json!({"text":"Cloudroom session initialized. No user task has been submitted yet."}),
+            json!({"text":"Automatic Cloudroom note: this session has started or resumed. Messages after this note come from the user."}),
         )
         .await?;
     let id = handle.native()?;

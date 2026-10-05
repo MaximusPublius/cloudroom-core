@@ -595,6 +595,18 @@ impl Manager {
                         Error::Conflict("teleport file validation failed")
                     }
                 })?;
+            let written = match native {
+                Some((profile, runtime::Kind::OpenCode, _)) => runtime::import_opencode(
+                    &self.config,
+                    profile,
+                    &written,
+                    &transfer.workspace.path,
+                    &self.storage,
+                )
+                .await
+                .map_err(|_| Error::Conflict("OpenCode session import failed"))?,
+                _ => written,
+            };
             transfer.files.insert(index, written);
             self.transfer_save(&transfer)?;
         }

@@ -224,8 +224,18 @@ impl Manager {
                 ));
             }
             let same = kind == p.harness;
-            let model = spawn
+            // Pi models are `provider/model`, as in the app's picker.
+            let split = spawn
                 .model
+                .as_deref()
+                .filter(|_| kind == runtime::Kind::Pi)
+                .and_then(|m| m.split_once('/'))
+                .filter(|(provider, name)| !provider.is_empty() && !name.is_empty());
+            let (chosen_provider, chosen_model) = match split {
+                Some((provider, name)) => (Some(provider.to_owned()), Some(name.to_owned())),
+                None => (None, spawn.model.clone()),
+            };
+            let model = chosen_model
                 .clone()
                 .or(same.then(|| p.model.clone()).flatten());
             let reasoning = spawn
@@ -234,8 +244,11 @@ impl Manager {
                 .or(same.then(|| p.reasoning.clone()).flatten())
                 .unwrap_or_else(|| "medium".into());
             let mut input = json!({"harness":kind,"parent_session":parent,"prompt":spawn.prompt,"reasoning":reasoning,"notify":true});
-            if let Some(model) = &spawn.model {
+            if let Some(model) = &chosen_model {
                 input["model"] = json!(model);
+            }
+            if let Some(provider) = &chosen_provider {
+                input["provider"] = json!(provider);
             }
             if let Some(title) = &spawn.title {
                 input["title"] = json!(title);
@@ -251,7 +264,7 @@ impl Manager {
                     .map(|r| (id.clone(), r))
                     .ok_or(Error::Conflict("child identity conflict"));
             }
-            let provider = if same { p.provider.clone() } else { None };
+            let provider = chosen_provider.or(same.then(|| p.provider.clone()).flatten());
             (kind, input, model, provider, p.workspace.clone())
         };
         if !self.recording_available() {

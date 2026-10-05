@@ -54,6 +54,9 @@ pub struct Run {
     #[serde(default)]
     stdin: String,
     cwd: Option<String>,
+    /// The command changes the Mac. Below Full access the helper refuses it or asks the user first (ADR 0186).
+    #[serde(default)]
+    write: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +91,8 @@ struct Helper {
     generation: u64,
     device: String,
     events: mpsc::Sender<std::result::Result<Event, Infallible>>,
+    /// A job went unanswered: the Mac likely slept while a proxy kept its stream open.
+    stale: bool,
 }
 
 pub struct Mac {
@@ -219,6 +224,7 @@ async fn stream(
         generation,
         device: input.device,
         events: events.clone(),
+        stale: false,
     });
     m.mac.touch();
     let mac = m.clone();
@@ -281,6 +287,16 @@ async fn report(
         _ => return Err(conflict("Invalid Mac job report")),
     }
     drop(jobs);
+    if let Some(h) = m
+        .mac
+        .helper
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|h| h.device == input.device)
+    {
+        h.stale = false;
+    }
     m.mac.touch();
     Ok(Json(json!({"accepted":true})))
 }
@@ -337,7 +353,9 @@ async fn local_run(
             },
         );
     }
-    let data = json!({"id":id,"command":run.command,"stdin":run.stdin,"cwd":run.cwd}).to_string();
+    let data =
+        json!({"id":id,"command":run.command,"stdin":run.stdin,"cwd":run.cwd,"write":run.write})
+            .to_string();
     if events
         .send(Ok(Event::default().event("job").data(data)))
         .await
@@ -365,6 +383,15 @@ async fn local_run(
             }
             if !job.acked && (!connected || started.elapsed() >= ACK) {
                 jobs.remove(&id);
+                if let Some(h) = mac
+                    .helper
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|h| h.generation == generation)
+                {
+                    h.stale = true;
+                }
                 return Err(conflict(UNAVAILABLE));
             }
             // In-flight work keeps running on the Mac; its helper reports the result after reconnecting.
@@ -403,7 +430,7 @@ async fn local_status(
 ) -> Result<Json<Value>> {
     local_auth(&m, peer)?;
     Ok(Json(
-        json!({"connected":m.mac.helper.lock().unwrap().is_some()}),
+        json!({"connected":m.mac.helper.lock().unwrap().as_ref().is_some_and(|h| !h.stale)}),
     ))
 }
 
@@ -593,8 +620,8 @@ fn finished(value: Value) -> io::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
     ))
 }
 
-async fn copy(socket: &str, command: String, stdin: Vec<u8>) -> io::Result<Vec<u8>> {
-    let body = json!({"command":command,"stdin":hex(&stdin)});
+async fn copy(socket: &str, command: String, stdin: Vec<u8>, write: bool) -> io::Result<Vec<u8>> {
+    let body = json!({"command":command,"stdin":hex(&stdin),"write":write});
     let (code, stdout, stderr) = finished(request(socket, "POST", "/jobs", Some(body)).await?)?;
     if code != Some(0) {
         return Err(io::Error::other(
@@ -612,21 +639,24 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         socket = args.remove(1);
         args.remove(0);
     }
-    let usage = "cloudroom mac run [--cwd DIR] [--stdin] COMMAND
+    let usage = "cloudroom mac run [--cwd DIR] [--stdin] [--write] COMMAND
 cloudroom mac pull MAC_PATH [VM_FOLDER]
 cloudroom mac push VM_PATH [MAC_FOLDER]
 cloudroom mac result JOB
 cloudroom mac status
-Runs on the user's paired Mac as the user, in their home folder by default.";
+Runs on the user's paired Mac as the user, in their home folder by default.
+Add --write when a command changes the Mac. Unless the user gives Full access,
+other commands run read-only, and --write needs their approval.";
     let name = args.first().cloned().unwrap_or_default();
     match (name.as_str(), &args[1.min(args.len())..]) {
         ("run", rest) => {
-            let (mut cwd, mut stdin, mut words) = (None, false, Vec::new());
+            let (mut cwd, mut stdin, mut write, mut words) = (None, false, false, Vec::new());
             let mut rest = rest.iter();
             while let Some(word) = rest.next() {
                 match word.as_str() {
                     "--cwd" if words.is_empty() => cwd = rest.next().cloned(),
                     "--stdin" if words.is_empty() => stdin = true,
+                    "--write" if words.is_empty() => write = true,
                     _ => words.push(word.clone()),
                 }
             }
@@ -637,7 +667,8 @@ Runs on the user's paired Mac as the user, in their home folder by default.";
             if stdin {
                 std::io::Read::read_to_end(&mut std::io::stdin(), &mut input)?;
             }
-            let body = json!({"command":words.join(" "),"stdin":hex(&input),"cwd":cwd});
+            let body =
+                json!({"command":words.join(" "),"stdin":hex(&input),"cwd":cwd,"write":write});
             let value = request(&socket, "POST", "/jobs", Some(body)).await?;
             print_result(value).await
         }
@@ -652,7 +683,7 @@ Runs on the user's paired Mac as the user, in their home folder by default.";
             let target = PathBuf::from(rest.first().map_or(".", String::as_str));
             let archive = copy(&socket, format!(
                 "p={}; cd -- \"$(dirname -- \"$p\")\" && COPYFILE_DISABLE=1 tar --no-xattrs -czf - -- \"$(basename -- \"$p\")\"",
-                quote(source)), Vec::new()).await?;
+                quote(source)), Vec::new(), false).await?;
             fs::create_dir_all(&target)?;
             let mut tar = tokio::process::Command::new("tar")
                 .arg("-xzf")
@@ -700,6 +731,7 @@ Runs on the user's paired Mac as the user, in their home folder by default.";
                     quote(target)
                 ),
                 archive.stdout,
+                true,
             )
             .await?;
             println!("{}", json!({"copied":source,"to":target}));

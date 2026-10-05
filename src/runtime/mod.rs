@@ -98,6 +98,7 @@ pub fn supports(kind: Kind, models: &[Model], model: &str, reasoning: &str) -> R
 
 pub const PI_REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 pub use opencode::REASONING_LEVELS as OPENCODE_REASONING_LEVELS;
+pub use opencode::import as import_opencode;
 
 pub async fn claude_auth_ready(config: &Config) -> io::Result<bool> {
     claude::auth_ready(config).await

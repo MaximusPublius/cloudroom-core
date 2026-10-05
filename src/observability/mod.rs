@@ -411,12 +411,11 @@ impl Observability {
             }
             if Instant::now() >= prune_at {
                 // Scope retention to this store; never touch session history or another owner.
+                // Every kind, resource samples included, lives 7 days: one index range, no row-by-row filter.
                 let prune = sqlx::query(
                     "DELETE FROM cloudroom_diagnostics WHERE store=$1 AND ctid IN (\
                      SELECT ctid FROM cloudroom_diagnostics WHERE store=$1 \
                      AND timestamp_ms < (extract(epoch FROM now() - interval '7 days') * 1000)::bigint \
-                     AND (record->>'kind' IS DISTINCT FROM 'resources' \
-                          OR timestamp_ms < (extract(epoch FROM now() - interval '30 days') * 1000)::bigint) \
                      ORDER BY timestamp_ms LIMIT $2)")
                     .bind(&config.store).bind(PRUNE_BATCH).execute(&pool);
                 let delay = match tokio::time::timeout(Duration::from_secs(2), prune).await {

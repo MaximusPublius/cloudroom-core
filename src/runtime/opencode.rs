@@ -31,6 +31,12 @@ fn invalid(message: String) -> io::Error {
 }
 
 pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Command> {
+    let mut command = base(config, profile)?;
+    command.arg("acp");
+    Ok(command)
+}
+
+fn base(config: &Config, profile: &HarnessConfig) -> io::Result<Command> {
     let home = config.account_home.join(".local/share/opencode");
     if profile.home.canonicalize()? != home.canonicalize()? {
         return Err(invalid(
@@ -40,14 +46,38 @@ pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Co
     let mut command = child_command(&profile.binary, config);
     // The image pins the OpenCode version. OpenCode 2's question tool ends the turn over ACP, and
     // Cloudroom asks in plain chat (ADR 0108). OpenCode 1 and 2 both read this config.
-    command
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-        .env(
-            "OPENCODE_CONFIG_CONTENT",
-            r#"{"autoupdate":false,"permission":{"question":"deny"}}"#,
-        )
-        .arg("acp");
+    command.env("OPENCODE_DISABLE_AUTOUPDATE", "1").env(
+        "OPENCODE_CONFIG_CONTENT",
+        r#"{"autoupdate":false,"permission":{"question":"deny"}}"#,
+    );
     Ok(command)
+}
+
+/// Teleport: OpenCode resumes only sessions in its own database, so the exported session is imported
+/// from the cloud folder, which also rebinds it to that folder. Re-importing adds only new messages.
+pub async fn import(
+    config: &Config,
+    profile: &HarnessConfig,
+    export: &str,
+    cwd: &Path,
+    storage: &crate::workspace::storage::Guard,
+) -> io::Result<String> {
+    let mut command = base(config, profile)?;
+    command
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .args(["import", export]);
+    let (child, _workload) = storage.spawn_writer(&mut command)?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+        .await
+        .map_err(|_| io::Error::other("OpenCode session import timed out"))??;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "OpenCode session import failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(profile.home.join(DATABASE).to_string_lossy().into_owned())
 }
 
 pub(super) async fn start(handle: &Handle) -> io::Result<String> {
