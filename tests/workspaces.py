@@ -220,6 +220,7 @@ class WorkspaceTests(unittest.TestCase):
         pending.write_text(json.dumps({'id':'escape','path':str(root/'escape')}))
         record = self.state/'00000000000000000001.record'
         value=json.loads(record.read_text()); value['data']['workspace']['path']=str(root/'escape');record.write_text(json.dumps(value))
+        (self.state/'snapshot.json').unlink(missing_ok=True)  # Core trusts its snapshot over edited old records.
         self.start()
         until(lambda:self.service.session('cr_escape')['state']=='failed','invalid mapping',10)
         self.assertFalse((outside/'child').exists())

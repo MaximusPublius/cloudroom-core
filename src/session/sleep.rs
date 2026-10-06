@@ -32,7 +32,7 @@ impl Session {
         !self.queue.is_empty() && !self.queue_paused
     }
 
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.current_request.is_some()
             || self.has_work()
             || matches!(
@@ -122,6 +122,8 @@ impl Manager {
             return json!({"drained":false,"reason":"transfer_running"});
         }
         local.draining = true;
+        // The sandbox stops next, so its next start replays almost nothing.
+        local.save_snapshot();
         json!({"drained":true,"pending_records":local.journal.last() - local.journal.saved()})
     }
 

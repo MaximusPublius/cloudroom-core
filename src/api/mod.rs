@@ -27,6 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 pub fn router(manager: Arc<Manager>, token: String) -> Router {
     Router::new()
         .merge(crate::preview::routes())
+        .merge(crate::runtime::terminal::routes())
         .merge(crate::mac::routes())
         .merge(crate::secrets::routes())
         .route("/v1/health", get(health))
@@ -578,6 +579,8 @@ struct Start {
     parent_session: Option<String>,
     prompt: Option<String>,
     title: Option<String>,
+    /// Starts a side chat on a copy of this session's conversation; it inherits the source's settings.
+    fork: Option<session::ForkFrom>,
 }
 
 async fn workspace(
@@ -657,6 +660,8 @@ struct Rewind {
     before: Option<String>,
     #[serde(default)]
     last_turn_id: Option<String>,
+    #[serde(default)]
+    fork: bool,
 }
 #[derive(Deserialize)]
 struct AttachQuery {
@@ -807,6 +812,25 @@ async fn start(
         .is_some_and(|p| p.trim().is_empty() || p.len() > 32768 || p.contains('\0'))
     {
         return Err(session::Error::Conflict("invalid system prompt"));
+    }
+    if let Some(fork) = body.fork {
+        if body.parent_session.is_some()
+            || body.prompt.is_some()
+            || body.title.is_some()
+            || body.model.is_some()
+            || body.reasoning.is_some()
+            || body.workspace.is_some()
+            || body.workspace_name.is_some()
+            || body.provider.is_some()
+            || body.command_guard_enabled.is_some()
+            || body.system_prompt.is_some()
+        {
+            return Err(session::Error::Conflict(
+                "a side chat takes only harness and fork",
+            ));
+        }
+        let (id, receipt) = manager.fork(body.request_id, body.harness, fork).await?;
+        return Ok(accepted(&manager, &id, receipt));
     }
     if let Some(parent) = body.parent_session {
         let prompt = body
@@ -1099,6 +1123,9 @@ async fn rewind(
     }
     if let Some(last_turn_id) = body.last_turn_id {
         input["last_turn_id"] = json!(last_turn_id);
+    }
+    if body.fork {
+        input["fork"] = json!(true);
     }
     if let Some(prompt) = body.replacement {
         key(&prompt.request_id)?;

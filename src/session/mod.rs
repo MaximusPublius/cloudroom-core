@@ -1,5 +1,5 @@
 mod children;
-pub use children::Spawn;
+pub use children::{ForkFrom, Spawn};
 mod outbox;
 pub mod teleport;
 pub use outbox::Journal;
@@ -68,7 +68,7 @@ pub struct Receipt {
     pub error: Option<String>,
 }
 
-#[derive(Default, Clone, Serialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
     #[serde(default)]
@@ -136,6 +136,9 @@ pub struct Session {
     // The harness was asked to exit so this idle session can sleep.
     #[serde(skip)]
     releasing: bool,
+    // A child's latest completed replies by request, so a queued turn cannot hide them from its parent.
+    #[serde(skip)]
+    replies: Vec<(String, String)>,
 }
 
 impl Session {
@@ -251,6 +254,8 @@ struct Local {
     database_available: bool,
     // Set by a drain before the sandbox stops; refuses new work until released.
     draining: bool,
+    // The journal position of the latest replay snapshot (or failed attempt).
+    snapshot_at: u64,
 }
 
 pub struct Manager {
@@ -262,6 +267,7 @@ pub struct Manager {
     pub(crate) workspaces: crate::workspace::Workspaces,
     pub(crate) sync: crate::sync::Sync,
     pub(crate) previews: Arc<crate::preview::Previews>,
+    pub(crate) terminals: runtime::terminal::Terminals,
     pub(crate) mac: crate::mac::Mac,
     pub(crate) secrets: crate::secrets::Secrets,
     codex_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
@@ -278,23 +284,7 @@ pub struct Manager {
 
 impl Manager {
     pub fn open(config: Config) -> io::Result<Arc<Self>> {
-        let journal = Journal::open(&config.state_dir)?;
-        let (changed, _) = watch::channel(journal.last());
-        let mut local = Local {
-            journal,
-            sessions: BTreeMap::new(),
-            sequences: BTreeMap::new(),
-            changed,
-            database_available: false,
-            draining: false,
-        };
-        for sequence in 1..=local.journal.last() {
-            let record: Record = serde_json::from_slice(&local.journal.read(sequence)?)?;
-            if record.sequence != sequence {
-                return Err(io::Error::other("journal sequence mismatch"));
-            }
-            local.apply(&record)?;
-        }
+        let mut local = Local::open(&config.state_dir)?;
         // Resume conversations, not uncertain actions. An interrupted resume attempt
         // is left failed instead of creating a service-restart recovery loop.
         for session in local.sessions.values().cloned().collect::<Vec<_>>() {
@@ -388,6 +378,7 @@ impl Manager {
                 }
             }
         }
+        local.save_snapshot();
         let workspaces = crate::workspace::Workspaces::open(&config)?;
         let sync = crate::sync::Sync::open(&config)?;
         let previews = crate::preview::Previews::open(&config)?;
@@ -407,6 +398,7 @@ impl Manager {
             sync,
             teleports: teleport::Transfers::default(),
             previews,
+            terminals: Default::default(),
             mac: crate::mac::Mac::default(),
             secrets: crate::secrets::Secrets::default(),
             codex_models: tokio::sync::Mutex::new(None),
@@ -840,6 +832,7 @@ impl Manager {
             let workspace = workspace.ok_or_else(|| io::Error::other("session workspace missing"))?;
             self.workspaces.ensure_directory(&workspace).await?;
             failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
+            let fork;
             let (handle, events) = {
                 let mut local = self.local.lock().unwrap();
                 if self.is_stopping() {
@@ -858,9 +851,15 @@ impl Manager {
                 let (kind, reasoning) = (session.harness, session.reasoning.clone());
                 let command_guard_enabled = session.command_guard_enabled();
                 let system_prompt = session.system_prompt();
+                failure_reason = "The side chat's source conversation could not be copied";
+                fork = children::fork_history(&local, &id, &request)?;
+                failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
                 // Claim before spawning: a crash after this point must not repeat uncertain execution.
                 local.append(&id, "state", json!({"state":"starting"}), None)?;
-                let (handle, events) = runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled, system_prompt)?;
+                let (handle, events) = match &fork {
+                    Some(fork) => runtime::Handle::spawn_fork(&config, kind, fork, command_guard_enabled, system_prompt)?,
+                    None => runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled, system_prompt)?,
+                };
                 let handle = handle.with_reasoning(reasoning);
                 let pid = handle.pid();
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
@@ -868,7 +867,10 @@ impl Manager {
                 (handle, events)
             };
             self.watch_events(id.clone(), handle.clone(), events);
-            let native = handle.start_session().await?;
+            let native = match &fork {
+                Some(fork) => handle.start_fork(fork).await?,
+                None => handle.start_session().await?,
+            };
             let mut local = self.local.lock().unwrap();
             self.remember_launch_reasoning(&mut local, &id, &handle)?;
             local.append(&id, "native_identity", handle.native_identity(&native)?, None)?;
@@ -1122,10 +1124,12 @@ impl Manager {
                         "wait for child agents before editing a message",
                     ));
                 }
-                if input["before"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-                    .is_none()
+                // A fork (a new Cloud thread from another's conversation) may copy the whole conversation.
+                if input["fork"] != true
+                    && input["before"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .is_none()
                     && input["last_turn_id"]
                         .as_str()
                         .filter(|id| !id.is_empty())
@@ -2063,6 +2067,14 @@ impl Manager {
                     self.clone().snapshot_usage(id.to_owned(), handle.clone());
                     if let Some(request) = local.sessions[id].current_request.clone() {
                         local.finish_receipt_with(id, &request, &status, error)?;
+                        let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
+                        if status == "completed" && session.parent_session.is_some() {
+                            let text = handle.seen_text().chars().take(32768).collect();
+                            session.replies.push((request, text));
+                            session
+                                .replies
+                                .drain(..session.replies.len().saturating_sub(8));
+                        }
                     }
                     self.advance(&mut local, id, true);
                 }
@@ -2199,6 +2211,8 @@ impl Manager {
             for id in waiting {
                 let _ = local.append(&id, "state", json!({"state":"suspended"}), None);
             }
+            // Before the harness cleanup, which may outlast the deadline. Its few records replay next start.
+            local.save_snapshot();
             local.changed.send_replace(0);
             // Signal all harnesses together; their recorded Exited events confirm cleanup.
             for handle in local.sessions.values().filter_map(|s| s.handle.as_ref()) {

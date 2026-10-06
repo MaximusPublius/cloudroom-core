@@ -42,6 +42,8 @@ pub const FEATURES: &[&str] = &[
     "queue_reorder",
     "steer",
     "rewind",
+    "fork",
+    "side_chat",
     "attachments",
     "upload_parts",
     "compact",
@@ -51,6 +53,7 @@ pub const FEATURES: &[&str] = &[
     "child_threads",
     "session_list",
     "drain",
+    "terminals",
 ];
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {

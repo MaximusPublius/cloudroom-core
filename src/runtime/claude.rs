@@ -85,13 +85,11 @@ pub(super) fn command(
     if let Some(saved) = saved {
         command.arg("--resume").arg(&saved.id);
         if let Some(before) = fork {
-            command.args([
-                "--fork-session",
-                "--session-id",
-                &id,
-                "--resume-session-at",
-                before,
-            ]);
+            command.args(["--fork-session", "--session-id", &id]);
+            // An empty checkpoint forks the whole conversation (a Cloud fork from its last message).
+            if !before.is_empty() {
+                command.args(["--resume-session-at", before]);
+            }
         }
     } else {
         command.args(["--session-id", &id]);
@@ -477,11 +475,42 @@ pub(super) fn validate(
     Err(io::Error::other("Claude transcript identity is missing"))
 }
 
+/// Fork the whole conversation, through the native fork flag.
+pub(super) fn fork_tip(handle: &Handle) -> io::Result<(Resume, String)> {
+    let id = handle.native()?;
+    let path = transcript(&handle.profile, &id)?;
+    validate(&handle.profile, &path, &id, handle.file_identity)?;
+    Ok((resume(handle, id, path), String::new()))
+}
+
+fn resume(handle: &Handle, id: String, path: PathBuf) -> Resume {
+    Resume {
+        id,
+        path,
+        cursor: Value::Null,
+        model: Some(handle.profile.model.clone()),
+        provider: handle.profile.provider.clone(),
+        reasoning: handle.reasoning.clone(),
+    }
+}
+
 /// Fork just before a user checkpoint, through the native resume/fork flags.
 pub(super) fn fork_source(handle: &Handle, before: &str) -> io::Result<(Resume, String)> {
     let id = handle.native()?;
     let path = transcript(&handle.profile, &id)?;
-    let file = validate(&handle.profile, &path, &id, handle.file_identity)?;
+    let saved = resume(handle, id, path);
+    let parent = checkpoint_parent(&handle.profile, &saved, before, handle.file_identity)?;
+    Ok((saved, parent))
+}
+
+/// The message a fork of `saved` resumes at: the saved parent of user message `before`.
+pub(super) fn checkpoint_parent(
+    profile: &HarnessConfig,
+    saved: &Resume,
+    before: &str,
+    identity: files::Identity,
+) -> io::Result<String> {
+    let file = validate(profile, &saved.path, &saved.id, identity)?;
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(0))?;
     loop {
@@ -503,17 +532,7 @@ pub(super) fn fork_source(handle: &Handle, before: &str) -> io::Result<(Resume, 
                     "Claude checkpoint has no saved parent",
                 )
             })?;
-            return Ok((
-                Resume {
-                    id,
-                    path,
-                    cursor: Value::Null,
-                    model: Some(handle.profile.model.clone()),
-                    provider: handle.profile.provider.clone(),
-                    reasoning: handle.reasoning.clone(),
-                },
-                parent.into(),
-            ));
+            return Ok(parent.into());
         }
     }
     Err(io::Error::new(
@@ -851,6 +870,7 @@ impl Adapter for Protocol {
         }
         let request = self.active.as_ref().map(|(_, id)| id.clone());
         let mut data = json!({"harness":"claude-code","type":kind,"request_id":request});
+        let mut keep = true;
         let event_kind = if kind == "stream_event" {
             let event = &value["event"];
             let index = event["index"].as_u64().unwrap_or(0);
@@ -906,7 +926,12 @@ impl Adapter for Protocol {
                     match event["delta"]["type"].as_str() {
                         Some("text_delta") => "text_delta",
                         Some("thinking_delta") => "thinking_delta",
-                        _ => "native_event",
+                        // Tool input arrives a few characters per frame, and `item_started` saves it whole.
+                        // Saving each piece made most of a busy sandbox's history.
+                        _ => {
+                            keep = false;
+                            "native_event"
+                        }
                     }
                 }
                 Some("content_block_stop") => {
@@ -1061,14 +1086,16 @@ impl Adapter for Protocol {
                 self.children.clear();
             }
         }
-        events.insert(
-            0,
-            Event::Record {
-                kind: event_kind,
-                data,
-                native: Some(raw),
-            },
-        );
+        if keep {
+            events.insert(
+                0,
+                Event::Record {
+                    kind: event_kind,
+                    data,
+                    native: Some(raw),
+                },
+            );
+        }
         Ok(events)
     }
     fn response(&self, _: &Value) -> Option<(u64, io::Result<Value>)> {

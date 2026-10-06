@@ -54,6 +54,8 @@ A failed resume exposes `startup_error` (`startup_timeout`, `empty_session`, `mi
 - Native checkpoints are validated before journal persistence. Malformed native history fails that session without writing invalid checkpoints; source history is retained. Already-corrupt journals require explicit repair, never silent deletion.
 - A local journal write failure makes readiness and dashboard runtime readiness false and blocks new mutations. Saved history remains readable. Correct the storage problem and restart for validated recovery; never reset the write guard blindly. A remote database outage alone still permits local buffering.
 - Local replay uses a rebuilt, per-session sequence index. It does not scan other sessions.
+- `snapshot.json` saves the replayed state at a journal position: after startup, on drain and shutdown, and every 20,000 records. Startup restores it and replays only newer records. A missing, unreadable or older snapshot means a full replay. After editing old records by hand, delete it.
+- Claude Code's tool-input deltas are not recorded. `item_started` carries the complete input.
 - Local and database event pages contain at most 256 records. Continue after the last returned sequence; sequences need not be contiguous within a session.
 - Saved-only metadata and the requested latest receipt share one bounded-memory scan, separate from replay pagination. Parsing stays in Rust because native output may contain NUL characters that PostgreSQL JSON processing rejects.
 - New native-event records omit the duplicate `data.value` payload on disk and in PostgreSQL. The existing API field is reconstructed from the original frame on reads. Old records are unchanged, including during upload retries. No schema migration is needed.

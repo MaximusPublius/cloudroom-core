@@ -29,6 +29,7 @@ mod opencode;
 mod pi;
 pub(crate) mod pi_auth;
 mod process;
+pub mod terminal;
 
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
 // Cold Pi handshakes exceeded the ordinary 30s RPC deadline during VM recovery.
@@ -156,6 +157,14 @@ pub struct Resume {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub reasoning: Option<String>,
+}
+
+/// A side chat's history: a copy of another session's conversation, cut before user message
+/// `before` (Claude Code) or after turn `last_turn_id` (Codex). The source is only read.
+pub struct Fork {
+    pub source: Resume,
+    pub before: Option<String>,
+    pub last_turn_id: Option<String>,
 }
 
 pub struct ChildRequest {
@@ -327,6 +336,38 @@ impl Handle {
             command_guard_enabled,
             system_prompt,
             None,
+        )
+    }
+
+    /// Claude Code forks through its resume flags; Codex starts fresh and forks in `start_fork`.
+    pub fn spawn_fork(
+        config: &Config,
+        kind: Kind,
+        fork: &Fork,
+        command_guard_enabled: bool,
+        system_prompt: Option<String>,
+    ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
+        if kind != Kind::Claude {
+            return Self::spawn_guarded(config, kind, None, command_guard_enabled, system_prompt);
+        }
+        let profile = config
+            .harnesses
+            .get(&kind)
+            .ok_or_else(|| io::Error::other("harness not configured"))?;
+        let identity = config.storage.as_ref().map(|p| (p.agent_uid, p.agent_gid));
+        // An empty checkpoint copies the whole conversation.
+        let at = match &fork.before {
+            Some(before) => claude::checkpoint_parent(profile, &fork.source, before, identity)?,
+            None => String::new(),
+        };
+        let resume = Some(fork.source.clone());
+        Self::spawn_inner(
+            config,
+            kind,
+            resume,
+            command_guard_enabled,
+            system_prompt,
+            Some(&at),
         )
     }
 
@@ -513,13 +554,22 @@ impl Handle {
         let mut startup = self.clone();
         startup.rpc_timeout = self.rpc_timeout * STARTUP_RPC_MULTIPLIER;
         match self.kind {
-            Kind::Codex => codex::start(&startup).await,
+            Kind::Codex => codex::start(&startup, None).await,
             Kind::Pi => pi::start(&startup).await,
             Kind::Claude => claude::start(&startup).await,
             Kind::Cursor => cursor::start(&startup).await,
             Kind::Fx => fx::start(&startup).await,
             Kind::OpenCode => opencode::start(&startup).await,
         }
+    }
+    /// Starts a `spawn_fork` harness and returns the side chat's new native ID.
+    pub async fn start_fork(&self, fork: &Fork) -> io::Result<String> {
+        if self.kind != Kind::Codex {
+            return self.start_session().await;
+        }
+        let mut startup = self.clone();
+        startup.rpc_timeout = self.rpc_timeout * STARTUP_RPC_MULTIPLIER;
+        codex::start(&startup, Some(fork)).await
     }
     /// Pi confirms the turn's thinking level before the prompt. Codex sends effort with turn/start.
     pub async fn prepare_turn(&self) -> io::Result<()> {
@@ -603,13 +653,16 @@ impl Handle {
         if self.kind != Kind::Claude {
             return Ok(None);
         }
-        let before = input["before"].as_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Claude requires a user-message checkpoint",
-            )
-        })?;
-        let (saved, parent) = claude::fork_source(self, before)?;
+        let (saved, parent) = match input["before"].as_str() {
+            Some(before) => claude::fork_source(self, before)?,
+            None if input["fork"] == true => claude::fork_tip(self)?,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Claude requires a user-message checkpoint",
+                ));
+            }
+        };
         Self::spawn_inner(
             config,
             self.kind,
@@ -641,9 +694,13 @@ impl Handle {
             .await?;
         Ok(())
     }
+    /// The latest reply text this process has streamed, without asking the harness.
+    pub fn seen_text(&self) -> String {
+        self.process.progress.borrow().last_text.clone()
+    }
     pub async fn last_text(&self) -> io::Result<String> {
         if self.kind != Kind::Pi {
-            return Ok(self.process.progress.borrow().last_text.clone());
+            return Ok(self.seen_text());
         }
         let result = self.call("get_last_assistant_text", json!({})).await?;
         Ok(result["text"].as_str().unwrap_or_default().to_owned())

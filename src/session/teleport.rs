@@ -78,6 +78,10 @@ pub struct Manifest {
     pub handoff: String,
     #[serde(default)]
     pub queued: Vec<QueuedPrompt>,
+    /// A fork copies another Cloud thread's conversation: it starts idle, with no handoff turn,
+    /// and its first message arrives as a rewind that gives it its own native identity.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 /// What Teleport will run in the cloud: the source thread's exact harness, model and effort.
@@ -144,7 +148,7 @@ fn validate(manifest: &Manifest) -> Result<()> {
             .provider
             .as_ref()
             .is_some_and(|p| p.is_empty() || p.len() > 256)
-        || manifest.handoff.is_empty()
+        || manifest.handoff.is_empty() != manifest.fork
         || manifest.handoff.len() > 32768
         || manifest
             .system_prompt
@@ -444,9 +448,17 @@ impl Manager {
                 return Err(Error::Conflict("invalid service tier"));
             }
         }
-        let workspace = self
-            .workspaces
-            .resolve(&manifest.workspace, Some(&manifest.workspace_name))?;
+        // A projectless thread (a fork of one) runs in the workspaces root, unregistered like its start.
+        let workspace = if manifest.workspace == workspace::ROOT {
+            workspace::Workspace {
+                id: "legacy".into(),
+                path: self.workspaces.root().to_path_buf(),
+                parent: None,
+            }
+        } else {
+            self.workspaces
+                .resolve(&manifest.workspace, Some(&manifest.workspace_name))?
+        };
         self.workspaces.ensure_directory(&workspace).await?;
         let transfer = Transfer {
             manifest,
@@ -779,53 +791,15 @@ impl Manager {
             .position(|entry| entry.kind == "native")
             .unwrap();
         let native_path = &transfer.files[&native_index];
-        let index: Vec<_> = manifest.files.iter().filter(|entry| entry.kind != "native").map(|entry| json!({
-            "source":entry.origin.as_deref().unwrap_or(&entry.path),"kind":entry.kind,"symlink":entry.symlink,
-            "path":workspace::transfer_destination(&transfer.workspace,id,entry),"size_hint":entry.size,
-        })).collect();
-        let index = self
-            .workspaces
-            .attach(
-                &transfer.workspace,
-                &format!("teleport_index_{id}"),
-                "files.json",
-                "file",
-                Body::from(serde_json::to_vec(&index).map_err(std::io::Error::other)?),
-                &self.storage,
-            )
-            .await?;
-        let handoff = format!(
-            "[Teleport handoff]\n{}\n\nCloud workspace: {}\nThe local executor and its children are stopped. You are the only continuing parent. Complete their combined work. Old Mac paths, GUI tools and local-only instructions are not usable here. Use your current cloud tools. Never repeat an uncertain tool action blindly. Project dependencies are yours to resolve within existing permissions.\nFull file index: {}. Child context files are already available. Project files and attachments are uploading separately and might never arrive if the laptop disconnects. The index lists expected destinations, not proof of arrival: check whether each needed file exists. Work on whatever you can, and wait only when an essential file is missing. Different cloud originals are never overwritten; incoming versions remain at the indexed paths. An upload-completion follow-up will let you continue any blocked work.\n",
-            manifest.handoff,
-            transfer.workspace.path.display(),
-            index["path"].as_str().unwrap_or_default()
-        );
-        let prompts = std::iter::once(QueuedPrompt::Input {
-            text: handoff,
-            reasoning: manifest.reasoning.clone(),
-            service_tier: manifest.service_tier.clone(),
-        })
-        .chain(manifest.queued.clone())
-        .enumerate()
-        .map(|(index, prompt)| Receipt {
-            request_id: format!("teleport_{id}_{index}"),
-            command: "prompt".into(),
-            input: {
-                let mut input = prompt.input();
-                input["teleport_handoff"] = json!(index == 0);
-                input
-            },
-            state: "accepted".into(),
-            model: None,
-            provider: None,
-            workspace: None,
-            error: None,
-        })
-        .collect::<Vec<_>>();
+        let prompts = if manifest.fork {
+            Vec::new()
+        } else {
+            self.teleport_prompts(&transfer).await?
+        };
         let receipt = Receipt {
             request_id: id.into(),
             command: "start".into(),
-            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"command_guard_enabled":manifest.command_guard_enabled,"system_prompt":manifest.system_prompt}),
+            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"fork":manifest.fork,"command_guard_enabled":manifest.command_guard_enabled,"system_prompt":manifest.system_prompt}),
             state: "completed".into(),
             model: Some(manifest.model.clone()),
             provider: manifest.provider.clone(),
@@ -850,5 +824,54 @@ impl Manager {
         }
         self.teleport_files_ready(&transfer)?;
         self.transfer_view(&transfer)
+    }
+
+    /// The handoff turn and the transferred queue, in order.
+    async fn teleport_prompts(&self, transfer: &Transfer) -> Result<Vec<Receipt>> {
+        let manifest = &transfer.manifest;
+        let id = &manifest.request_id;
+        let index: Vec<_> = manifest.files.iter().filter(|entry| entry.kind != "native").map(|entry| json!({
+            "source":entry.origin.as_deref().unwrap_or(&entry.path),"kind":entry.kind,"symlink":entry.symlink,
+            "path":workspace::transfer_destination(&transfer.workspace,id,entry),"size_hint":entry.size,
+        })).collect();
+        let index = self
+            .workspaces
+            .attach(
+                &transfer.workspace,
+                &format!("teleport_index_{id}"),
+                "files.json",
+                "file",
+                Body::from(serde_json::to_vec(&index).map_err(std::io::Error::other)?),
+                &self.storage,
+            )
+            .await?;
+        let handoff = format!(
+            "[Teleport handoff]\n{}\n\nCloud workspace: {}\nThe local executor and its children are stopped. You are the only continuing parent. Complete their combined work. Old Mac paths, GUI tools and local-only instructions are not usable here. Use your current cloud tools. Never repeat an uncertain tool action blindly. Project dependencies are yours to resolve within existing permissions.\nFull file index: {}. Child context files are already available. Project files and attachments are uploading separately and might never arrive if the laptop disconnects. The index lists expected destinations, not proof of arrival: check whether each needed file exists. Work on whatever you can, and wait only when an essential file is missing. Different cloud originals are never overwritten; incoming versions remain at the indexed paths. An upload-completion follow-up will let you continue any blocked work.\n",
+            manifest.handoff,
+            transfer.workspace.path.display(),
+            index["path"].as_str().unwrap_or_default()
+        );
+        Ok(std::iter::once(QueuedPrompt::Input {
+            text: handoff,
+            reasoning: manifest.reasoning.clone(),
+            service_tier: manifest.service_tier.clone(),
+        })
+        .chain(manifest.queued.clone())
+        .enumerate()
+        .map(|(index, prompt)| Receipt {
+            request_id: format!("teleport_{id}_{index}"),
+            command: "prompt".into(),
+            input: {
+                let mut input = prompt.input();
+                input["teleport_handoff"] = json!(index == 0);
+                input
+            },
+            state: "accepted".into(),
+            model: None,
+            provider: None,
+            workspace: None,
+            error: None,
+        })
+        .collect())
     }
 }

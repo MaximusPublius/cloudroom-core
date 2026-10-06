@@ -563,6 +563,17 @@ impl Adapter for Protocol {
             }
             "message_end" if v["message"]["role"] == "assistant" => {
                 s.last_usage = v["message"]["usage"].clone();
+                let text = v["message"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == "text")
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    s.last_text = text;
+                }
                 if v["message"]["stopReason"] == "error"
                     && v["message"]["errorMessage"]
                         .as_str()

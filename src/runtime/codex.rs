@@ -67,7 +67,8 @@ pub(super) async fn models(handle: &Handle) -> io::Result<Vec<super::Model>> {
     }
 }
 
-pub(super) async fn start(handle: &Handle) -> io::Result<String> {
+/// Starts, resumes, or (for a side chat) forks the session's thread. A fork only reads its source.
+pub(super) async fn start(handle: &Handle, fork: Option<&super::Fork>) -> io::Result<String> {
     initialize(handle).await?;
     let mut params = json!({"cwd":handle.repository,"model":handle.profile.model,"approvalPolicy":"never","sandbox":"danger-full-access","ephemeral":false});
     if let Some(reasoning) = &handle.reasoning {
@@ -76,11 +77,18 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     if let Some(system_prompt) = &handle.system_prompt {
         params["developerInstructions"] = json!(system_prompt);
     }
-    let method = if let Some(saved) = &handle.resume {
+    if let Some(turn) = fork.and_then(|f| f.last_turn_id.as_ref()) {
+        params["lastTurnId"] = json!(turn);
+    }
+    let method = if let Some(saved) = fork.map(|f| &f.source).or(handle.resume.as_ref()) {
         params["threadId"] = json!(saved.id);
         params["path"] = json!(saved.path);
         params["excludeTurns"] = json!(true);
-        "thread/resume"
+        if fork.is_some() {
+            "thread/fork"
+        } else {
+            "thread/resume"
+        }
     } else {
         "thread/start"
     };
@@ -94,6 +102,9 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("missing native identity"))?;
     if handle.resume.as_ref().is_some_and(|s| s.id != id) {
         return Err(io::Error::other("harness resumed a different session"));
+    }
+    if fork.is_some_and(|f| f.source.id == id) {
+        return Err(io::Error::other("harness did not fork the session"));
     }
     Ok(id.into())
 }
@@ -345,7 +356,8 @@ impl Adapter for Protocol {
         if request.is_some() {
             self.prompt_id = Some(id);
         }
-        if method == "thread/fork" {
+        // A side chat's first fork is its start; only a rewind replaces a known thread.
+        if method == "thread/fork" && self.root.is_some() {
             self.forking = Some(id);
         }
         if method == "thread/compact/start" {

@@ -1,7 +1,147 @@
 //! Replays and appends journal records: the session state machine.
 use super::*;
 
+/// Bump when `apply` builds state differently, so older snapshots are replayed from the journal instead.
+const SNAPSHOT_VERSION: u32 = 1;
+/// A busy sandbox wrote up to ~100k records an hour; this bounds the replay after an unplanned stop.
+const SNAPSHOT_EVERY: u64 = 20_000;
+
+/// The replayed state at journal position `sequence`, so startup replays only newer records.
+/// Listing and reading every record took over a minute in a sandbox with ~500k of them.
+#[derive(Serialize, Deserialize)]
+struct Snapshot<S = Vec<Saved>, Q = BTreeMap<String, Vec<u64>>> {
+    version: u32,
+    sequence: u64,
+    sessions: S,
+    sequences: Q,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Saved<S = Session> {
+    session: S,
+    derived: Derived,
+}
+
+/// Fields `apply` builds that the session API leaves out (`serde(skip)`). Any new one belongs here too.
+#[derive(Serialize, Deserialize)]
+struct Derived {
+    failure: Option<String>,
+    has_dispatched: bool,
+    last_activity: Option<u64>,
+    last_prompt_state: Option<String>,
+    model: Option<String>,
+    storage_warned: bool,
+    recovery_attempted: bool,
+    close_request: Option<String>,
+    harness_pid: Option<u32>,
+    usage_limited: bool,
+}
+
+impl Derived {
+    fn of(s: &Session) -> Self {
+        Self {
+            failure: s.failure.clone(),
+            has_dispatched: s.has_dispatched,
+            last_activity: s.last_activity,
+            last_prompt_state: s.last_prompt_state.clone(),
+            model: s.model.clone(),
+            storage_warned: s.storage_warned,
+            recovery_attempted: s.recovery_attempted,
+            close_request: s.close_request.clone(),
+            harness_pid: s.harness_pid,
+            usage_limited: s.usage_limited,
+        }
+    }
+
+    fn restore(self, s: &mut Session) {
+        s.failure = self.failure;
+        s.has_dispatched = self.has_dispatched;
+        s.last_activity = self.last_activity;
+        s.last_prompt_state = self.last_prompt_state;
+        s.model = self.model;
+        s.storage_warned = self.storage_warned;
+        s.recovery_attempted = self.recovery_attempted;
+        s.close_request = self.close_request;
+        s.harness_pid = self.harness_pid;
+        s.usage_limited = self.usage_limited;
+    }
+}
+
 impl Local {
+    /// Opens the journal and rebuilds the sessions: from a usable snapshot, then the records after it.
+    /// A missing, unreadable, older or too-new snapshot means a full replay.
+    pub(super) fn open(directory: &std::path::Path) -> io::Result<Self> {
+        let snapshot = Journal::read_snapshot(directory)
+            .and_then(|bytes| serde_json::from_slice::<Snapshot>(&bytes).ok())
+            .filter(|s| s.version == SNAPSHOT_VERSION);
+        let journal = Journal::open_from(directory, snapshot.as_ref().map_or(0, |s| s.sequence))?;
+        let (changed, _) = watch::channel(journal.last());
+        let mut local = Local {
+            journal,
+            sessions: BTreeMap::new(),
+            sequences: BTreeMap::new(),
+            changed,
+            database_available: false,
+            draining: false,
+            snapshot_at: 0,
+        };
+        if let Some(snapshot) = snapshot.filter(|s| s.sequence <= local.journal.last()) {
+            for Saved {
+                mut session,
+                derived,
+            } in snapshot.sessions
+            {
+                derived.restore(&mut session);
+                local.sessions.insert(session.session_id.clone(), session);
+            }
+            local.sequences = snapshot.sequences;
+            local.snapshot_at = snapshot.sequence;
+        }
+        for sequence in local.snapshot_at + 1..=local.journal.last() {
+            let record: Record = serde_json::from_slice(&local.journal.read(sequence)?)?;
+            if record.sequence != sequence {
+                return Err(io::Error::other("journal sequence mismatch"));
+            }
+            local.apply(&record)?;
+            // A first replay of a large journal can outlast the wake's wait, which then restarts Core.
+            // Saved progress lets that next start continue from here.
+            if sequence >= local.snapshot_at + SNAPSHOT_EVERY {
+                local.snapshot(sequence);
+            }
+        }
+        Ok(local)
+    }
+
+    /// Saves the replayed state. A failure only costs a longer replay at the next start.
+    pub(super) fn save_snapshot(&mut self) {
+        self.snapshot(self.journal.last());
+    }
+
+    /// `sequence` is the last record the state includes.
+    fn snapshot(&mut self, sequence: u64) {
+        if sequence == self.snapshot_at {
+            return;
+        }
+        let snapshot = Snapshot {
+            version: SNAPSHOT_VERSION,
+            sequence,
+            sessions: (self.sessions.values())
+                .map(|session| Saved {
+                    session,
+                    derived: Derived::of(session),
+                })
+                .collect::<Vec<_>>(),
+            sequences: &self.sequences,
+        };
+        // A failure waits for the next scheduled save rather than retrying on every record.
+        self.snapshot_at = sequence;
+        match serde_json::to_vec(&snapshot).map(|bytes| self.journal.write_snapshot(&bytes)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Cloudroom could not save the replay snapshot: {error}"),
+            Err(error) => eprintln!("Cloudroom could not encode the replay snapshot: {error}"),
+        }
+    }
+
     pub(super) fn agent_counts(&self) -> AgentCounts {
         let mut counts = AgentCounts::default();
         for session in self.sessions.values() {
@@ -422,7 +562,88 @@ impl Local {
         };
         self.journal.append(&serde_json::to_vec(&record)?)?;
         self.apply(&record)?;
+        if record.sequence >= self.snapshot_at + SNAPSHOT_EVERY {
+            self.save_snapshot();
+        }
         self.changed.send_replace(record.sequence);
         Ok(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn state(local: &Local) -> Value {
+        let sessions: Vec<_> = (local.sessions.values())
+            .map(|s| json!([s, Derived::of(s)]))
+            .collect();
+        json!([sessions, local.sequences])
+    }
+
+    #[test]
+    fn snapshot_and_newer_records_rebuild_the_full_replay() {
+        let dir = std::env::temp_dir().join(format!("cloudroom-snapshot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut local = Local::open(&dir).unwrap();
+        let receipt = |id: &str, command: &str, state: &str, input: Value| json!({"request_id":id,"command":command,"state":state,"input":input,"model":"m1"});
+        let records = [
+            (
+                "a",
+                "receipt",
+                receipt(
+                    "s1",
+                    "start",
+                    "accepted",
+                    json!({"harness":"claude-code","reasoning":"high"}),
+                ),
+            ),
+            (
+                "a",
+                "receipt",
+                receipt("p1", "prompt", "accepted", json!({"text":"hi"})),
+            ),
+            ("a", "harness", json!({"pid":42})),
+            (
+                "a",
+                "state",
+                json!({"state":"starting_turn","request_id":"p1"}),
+            ),
+            (
+                "b",
+                "receipt",
+                receipt("c1", "close", "accepted", json!({})),
+            ),
+            ("a", "text_delta", json!({"delta":"hello"})),
+            (
+                "a",
+                "receipt",
+                receipt("p1", "prompt", "completed", json!({"text":"hi"})),
+            ),
+            ("a", "storage_warning", json!({"text":"low"})),
+            (
+                "b",
+                "state",
+                json!({"state":"failed","reason":"boom","stderr":"trace"}),
+            ),
+            ("b", "usage_limited", json!({})),
+            ("b", "state", json!({"state":"resuming","recovery":true})),
+        ];
+        for (i, (id, kind, data)) in records.into_iter().enumerate() {
+            local.append(id, kind, data, None).unwrap();
+            if i == 5 {
+                local.save_snapshot();
+            }
+        }
+        let expected = state(&local);
+        drop(local);
+        let restored = Local::open(&dir).unwrap();
+        assert_eq!(restored.snapshot_at, 6);
+        assert_eq!(state(&restored), expected);
+        drop(restored);
+        fs::remove_file(dir.join("snapshot.json")).unwrap();
+        assert_eq!(state(&Local::open(&dir).unwrap()), expected);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

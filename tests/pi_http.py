@@ -150,6 +150,7 @@ class MixedHarnessTests(unittest.TestCase):
         self.assertEqual(record['data']['request_id'], 'pi')
         record['data']['input']['reasoning'] = 'high'
         path.write_text(json.dumps(record))
+        (self.state / 'snapshot.json').unlink()  # Core trusts its snapshot over edited old records.
         self.start()
         until(lambda:self.service.session('cr_pi')['state']=='idle','Pi with selected thinking',10)
         self.assertEqual(self.service.session('cr_pi')['reasoning'], 'high')
@@ -267,6 +268,7 @@ class MixedHarnessTests(unittest.TestCase):
             record = json.loads(path.read_text())
             record['data']['input']['reasoning'] = 'high'
             path.write_text(json.dumps(record))
+        (self.state / 'snapshot.json').unlink()  # Core trusts its snapshot over edited old records.
         self.start()
         for kind in ['codex', 'pi']:
             until(lambda kind=kind: self.service.session('cr_'+kind)['state'] == 'idle' and self.service.session('cr_'+kind)['reasoning'] == 'high', 'launch '+kind, 10)

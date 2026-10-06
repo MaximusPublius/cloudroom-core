@@ -32,7 +32,8 @@ impl Manager {
             "diskThresholds":self.config.storage.as_ref().map(|policy| json!({"warningBytes":policy.warning_bytes,"pauseBytes":policy.pause_bytes})),
             "onboarding":{"localConnected":null,"offlineTaskVerified":null},
             "capabilities":{"settings":true,"updates":false},
-            "sessionCount":sessions.len(),"agents":local.agent_counts(),"sessions":summaries})
+            "sessionCount":sessions.len(),"agents":local.agent_counts(),"sessions":summaries,
+            "terminals":self.terminals.summary()})
     }
 
     /// The latest 1,000 sessions, newest activity first. Prompts, receipts and records stay

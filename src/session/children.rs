@@ -158,6 +158,57 @@ pub struct Spawn {
     pub prompt: String,
 }
 
+/// A side chat's source (ADR 0189): `session`'s conversation, cut before user message `before`
+/// (Claude Code) or after turn `last_turn_id` (Codex). Without either, the whole conversation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkFrom {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_id: Option<String>,
+}
+
+/// The session a side chat was forked from.
+fn fork_of(session: &Session) -> Option<&str> {
+    let start = session.receipts.values().find(|r| r.command == "start")?;
+    start.input["fork"]["session"].as_str()
+}
+
+/// A side chat may use the child threads of the thread it was forked from, like its own.
+fn may_use(local: &Local, caller: &str, child: &Session) -> bool {
+    let Some(parent) = child.parent_session.as_deref() else {
+        return false;
+    };
+    parent == caller || local.sessions.get(caller).and_then(fork_of) == Some(parent)
+}
+
+/// The latest saved history of a side chat's source, read as the side chat launches.
+pub(super) fn fork_history(
+    local: &Local,
+    id: &str,
+    request: &str,
+) -> io::Result<Option<runtime::Fork>> {
+    let Some(fork) = local.sessions[id]
+        .receipts
+        .get(request)
+        .map(|r| &r.input["fork"])
+    else {
+        return Ok(None);
+    };
+    if fork.is_null() {
+        return Ok(None);
+    }
+    let fork: ForkFrom = serde_json::from_value(fork.clone())?;
+    let source = local.sessions.get(&fork.session).and_then(|s| s.resume());
+    Ok(Some(runtime::Fork {
+        source: source.ok_or_else(|| io::Error::other("the side chat's source is unavailable"))?,
+        before: fork.before,
+        last_turn_id: fork.last_turn_id,
+    }))
+}
+
 /// A notice's two delivery attempts: steered into the parent's running turn, then queued as a prompt.
 fn notice_ids(child: &str, request: &str) -> (String, String) {
     let queued = format!("notice_{child}_{request}");
@@ -322,6 +373,105 @@ impl Manager {
         Ok((id, receipt))
     }
 
+    /// Starts a side chat: a new session on a copy of another session's conversation, in its folder,
+    /// with its harness, model and settings. The source keeps working and is only read.
+    pub async fn fork(
+        self: &Arc<Self>,
+        request: String,
+        harness: Option<runtime::Kind>,
+        fork: ForkFrom,
+    ) -> Result<(String, Receipt)> {
+        let id = format!("cr_{request}");
+        let invalid = |v: &Option<String>| {
+            v.as_ref()
+                .is_some_and(|v| v.is_empty() || v.len() > 256 || v.chars().any(char::is_control))
+        };
+        let (kind, input, model, provider, workspace) = {
+            let local = self.local.lock().unwrap();
+            let s = local.sessions.get(&fork.session).ok_or(Error::Conflict(
+                "the side chat's source thread was not found",
+            ))?;
+            let checkpoint_fits = match s.harness {
+                runtime::Kind::Claude => fork.last_turn_id.is_none(),
+                runtime::Kind::Codex => fork.before.is_none(),
+                _ => return Err(Error::Conflict("side chats support Claude Code and Codex")),
+            };
+            if !checkpoint_fits
+                || invalid(&fork.before)
+                || invalid(&fork.last_turn_id)
+                || harness.is_some_and(|kind| kind != s.harness)
+            {
+                return Err(Error::Conflict("invalid side chat request"));
+            }
+            let mut input = json!({"harness":s.harness,"fork":fork,"reasoning":s.reasoning});
+            if !s.command_guard_enabled() {
+                input["command_guard_enabled"] = json!(false);
+            }
+            if let Some(system_prompt) = s.system_prompt() {
+                input["system_prompt"] = json!(system_prompt);
+            }
+            if let Some(existing) = local.sessions.get(&id) {
+                return Self::retry(existing, &request, "start", &input)?
+                    .map(|r| (id.clone(), r))
+                    .ok_or(Error::Conflict("session already exists"));
+            }
+            if s.resume().is_none() || s.rewind_request.is_some() {
+                return Err(Error::Conflict(
+                    "the source thread has no saved conversation yet",
+                ));
+            }
+            if fork.before.is_none() && fork.last_turn_id.is_none() && (s.busy() || s.compacting) {
+                return Err(Error::Conflict(
+                    "the source agent is busy; fork from an earlier message or try again shortly",
+                ));
+            }
+            (
+                s.harness,
+                input,
+                s.model.clone(),
+                s.provider.clone(),
+                s.workspace.clone(),
+            )
+        };
+        if !self.recording_available() {
+            return Err(Error::Storage(JOURNAL_UNWRITABLE.into()));
+        }
+        if !self.config.harnesses.contains_key(&kind) {
+            return Err(Error::Conflict("harness is not configured"));
+        }
+        self.harness_ready(kind).await?;
+        let receipt = Receipt {
+            request_id: request.clone(),
+            command: "start".into(),
+            input,
+            state: "accepted".into(),
+            model: Some(model.unwrap_or_else(|| self.config.harnesses[&kind].model.clone())),
+            provider,
+            workspace,
+            error: None,
+        };
+        {
+            let mut local = self.local.lock().unwrap();
+            if let Some(existing) = local.sessions.get(&id) {
+                return Self::retry(existing, &request, "start", &receipt.input)?
+                    .map(|r| (id.clone(), r))
+                    .ok_or(Error::Conflict("session already exists"));
+            }
+            if self.is_stopping() || local.draining || self.storage.blocks() {
+                return Err(Error::Conflict(
+                    "new execution is paused; try again shortly",
+                ));
+            }
+            let value = serde_json::to_value(&receipt).map_err(io::Error::other)?;
+            local.append(&id, "receipt", value, None)?;
+        }
+        let (manager, session) = (self.clone(), id.clone());
+        tokio::spawn(async move {
+            manager.launch(session, request).await;
+        });
+        Ok((id, receipt))
+    }
+
     /// Resumes parent notices for spawned children after a restart.
     pub(super) fn watch_children(self: &Arc<Self>, local: &Local) {
         for child in local.sessions.values() {
@@ -378,8 +528,10 @@ impl Manager {
                             p.session_id.clone(),
                             r.request_id.clone(),
                             r.state.clone(),
-                            // A newer turn may already have replaced the harness's last reply.
-                            c.handle.clone().filter(|_| c.current_request.is_none()),
+                            c.replies
+                                .iter()
+                                .find(|(id, _)| *id == r.request_id)
+                                .map(|(_, text)| text.clone()),
                             title(c),
                             p.current_request.clone().filter(|_| steer),
                         )),
@@ -387,11 +539,7 @@ impl Manager {
                         None => None,
                     }
                 };
-                if let Some((parent, request, state, handle, title, target)) = due {
-                    let reply = match handle {
-                        Some(handle) if state == "completed" => handle.last_text().await.ok(),
-                        _ => None,
-                    };
+                if let Some((parent, request, state, reply, title, target)) = due {
                     let text = notice(&child, title, &state, reply);
                     let (steer, queued) = notice_ids(&child, &request);
                     // A turn that just ended, or a harness that cannot steer, falls back to the queue.
@@ -424,33 +572,40 @@ impl Manager {
     pub(crate) fn own_child(&self, parent: &str, child: &str) -> Result<()> {
         let local = self.local.lock().unwrap();
         match local.sessions.get(child) {
-            Some(c) if c.parent_session.as_deref() == Some(parent) => Ok(()),
+            Some(c) if may_use(&local, parent, c) => Ok(()),
             _ => Err(Error::Conflict("not a child thread of this thread")),
         }
     }
 
-    /// The caller's children, or one child with its latest reply when its harness is attached.
+    /// The caller's children, or one child with its latest reply: live when idle, else its last completed one.
     pub(crate) async fn children(&self, parent: &str, only: Option<&str>) -> Value {
-        let (mut items, handle) = {
+        let (mut items, handle, kept) = {
             let local = self.local.lock().unwrap();
             let items: Vec<_> = local
                 .sessions
                 .values()
-                .filter(|c| c.parent_session.as_deref() == Some(parent))
+                .filter(|c| may_use(&local, parent, c))
                 .filter(|c| only.is_none_or(|id| c.session_id == id))
                 .map(|c| {
                     let busy = c.current_request.is_some() || c.has_work();
                     json!({"id":c.session_id,"title":title(c),"harness":c.harness,"model":c.model,"state":c.state,"busy":busy,"error":c.failure})
                 })
                 .collect();
-            let handle = only
-                .and_then(|id| local.sessions.get(id))
+            let child = only.and_then(|id| local.sessions.get(id));
+            let handle = child
                 .filter(|c| c.current_request.is_none())
                 .and_then(|c| c.handle.clone());
-            (items, handle)
+            let kept = child
+                .and_then(|c| c.replies.last())
+                .map(|(_, text)| text.clone());
+            (items, handle, kept)
         };
-        if let (Some(item), Some(handle)) = (items.first_mut(), handle) {
-            item["reply"] = json!(handle.last_text().await.ok());
+        let reply = match handle {
+            Some(handle) => handle.last_text().await.ok(),
+            None => kept,
+        };
+        if let (Some(item), Some(reply)) = (items.first_mut(), reply) {
+            item["reply"] = json!(reply);
         }
         json!({"children":items})
     }
