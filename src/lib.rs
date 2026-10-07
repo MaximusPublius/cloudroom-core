@@ -28,6 +28,7 @@ pub const FEATURES: &[&str] = &[
     "root_workspace",
     "teleport",
     "command_guard",
+    "strip_ai_co_authors",
     "system_prompt",
     "computer_use",
     "codex_auth",

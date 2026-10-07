@@ -1,5 +1,6 @@
 //! Background loops: the disk safety guard and the history uploader.
 use super::*;
+use crate::workspace::storage::FRESH;
 
 /// How long work stays frozen before Cloudroom stops the command filling the disk.
 const RESCUE_AFTER: Duration = Duration::from_secs(30);
@@ -27,8 +28,16 @@ impl Manager {
             let mut last_cleanup = Instant::now() - Duration::from_secs(60);
             let mut was_blocked = manager.storage.blocks();
             let mut blocked_since: Option<Instant> = None;
+            let mut measured = Instant::now();
             while !manager.is_stopping() {
                 let snapshot = manager.check_storage().await;
+                if measured.elapsed() > FRESH {
+                    let gap_ms = elapsed_ms(measured);
+                    manager
+                        .observability
+                        .record(Signal::StorageStale { gap_ms });
+                }
+                measured = Instant::now();
                 if snapshot.level != Level::Normal {
                     let warnings = {
                         let mut local = manager.local.lock().unwrap();

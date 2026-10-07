@@ -34,6 +34,7 @@ pub(super) fn command(
     saved: Option<&Resume>,
     fork: Option<&str>,
     guarded: bool,
+    strip_ai_co_authors: bool,
     system_prompt: Option<&str>,
 ) -> io::Result<(Command, String)> {
     let id = match saved.filter(|_| fork.is_none()) {
@@ -82,6 +83,9 @@ pub(super) fn command(
             "--mcp-config",
             r#"{"mcpServers":{"cloudroom":{"type":"sdk","name":"cloudroom"}}}"#,
         ]);
+    if strip_ai_co_authors {
+        command.args(["--settings", r#"{"attribution":{"commit":"","pr":""}}"#]);
+    }
     if let Some(saved) = saved {
         command.arg("--resume").arg(&saved.id);
         if let Some(before) = fork {

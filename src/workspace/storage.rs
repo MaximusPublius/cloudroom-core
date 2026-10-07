@@ -1,12 +1,12 @@
 //! Disk policy and explicitly disposable npm download-cache cleanup, not history retention.
-use crate::{config::Config, runtime::linux};
+use crate::{config::Config, observability::now_ms, runtime::linux};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::process::Command;
 
@@ -205,8 +205,12 @@ impl Snapshot {
     }
 }
 
+/// How long a guard-loop measurement stays valid.
+pub(crate) const FRESH: Duration = Duration::from_secs(5);
+
 pub struct Guard {
     policy: Option<Policy>,
+    history: PathBuf,
     value: Mutex<(Snapshot, Instant)>,
     writers: Mutex<Vec<Weak<linux::Workload>>>,
     floor: Mutex<Option<u64>>,
@@ -218,6 +222,7 @@ impl Guard {
         }
         Ok(Self {
             policy: config.storage.clone(),
+            history: config.state_dir.clone(),
             writers: Mutex::new(Vec::new()),
             floor: Mutex::new(None),
             value: Mutex::new((
@@ -228,10 +233,23 @@ impl Guard {
     }
     pub fn snapshot(&self) -> Snapshot {
         let (value, sampled) = &*self.value.lock().unwrap();
-        if value.enabled && sampled.elapsed() > Duration::from_secs(5) {
-            Snapshot::unavailable(true)
-        } else {
-            value.clone()
+        if !value.enabled || sampled.elapsed() <= FRESH {
+            return value.clone();
+        }
+        // A busy core can delay the guard loop. Re-measure instead of blocking on a stale reading.
+        // History shares the workspace filesystem (`check_filesystems`); failed checks stay blocked.
+        let measured = (self.policy.as_ref())
+            .filter(|_| value.reason == "disk_capacity")
+            .and_then(|p| Some((p, disk(&self.history).ok()?)));
+        let Some((p, d)) = measured else {
+            return Snapshot::unavailable(true);
+        };
+        Snapshot {
+            level: p.level(d.available_bytes, value.level, *self.floor.lock().unwrap()),
+            workspace_available_bytes: Some(d.available_bytes),
+            history_available_bytes: Some(d.available_bytes),
+            sampled_at: Some(now_ms()),
+            ..value.clone()
         }
     }
     pub fn blocks(&self) -> bool {
@@ -335,12 +353,7 @@ impl Guard {
                 history_available_bytes: Some(history.available_bytes),
                 workspace_total_bytes: Some(workspace.total_bytes),
                 history_total_bytes: Some(history.total_bytes),
-                sampled_at: Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                ),
+                sampled_at: Some(now_ms()),
                 reason: "disk_capacity",
             })
         }
@@ -604,6 +617,7 @@ mod tests {
             assert_eq!(level, expected, "{available} bytes, previously {before:?}");
             let guard = Guard {
                 policy: None,
+                history: PathBuf::new(),
                 writers: Mutex::new(Vec::new()),
                 floor: Mutex::new(None),
                 value: Mutex::new((
@@ -643,6 +657,7 @@ mod tests {
         );
         let guard = Guard {
             policy: None,
+            history: PathBuf::new(),
             writers: Mutex::new(Vec::new()),
             floor: Mutex::new(None),
             value: Mutex::new((
@@ -665,6 +680,7 @@ mod tests {
     fn missing_or_stale_measurements_do_not_authorize_writes() {
         let guard = Guard {
             policy: None,
+            history: PathBuf::new(),
             writers: Mutex::new(Vec::new()),
             floor: Mutex::new(None),
             value: Mutex::new((Snapshot::unavailable(true), Instant::now())),

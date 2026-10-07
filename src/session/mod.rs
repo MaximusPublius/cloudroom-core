@@ -107,6 +107,9 @@ pub struct Session {
     pub checkpoint: Option<Value>,
     pub rewind_request: Option<String>,
     pub parent_session: Option<String>,
+    // Archived by `cloudroom thread archive`; `thread list` hides it unless asked.
+    #[serde(default)]
+    pub archived: bool,
     pub reasoning: Option<String>,
     pub workspace: Option<crate::workspace::Workspace>,
     #[serde(skip)]
@@ -166,6 +169,14 @@ impl Session {
             .values()
             .find(|r| r.command == "start")
             .and_then(|r| r.input["command_guard_enabled"].as_bool())
+            .unwrap_or(true)
+    }
+
+    fn strip_ai_co_authors(&self) -> bool {
+        self.receipts
+            .values()
+            .find(|r| r.command == "start")
+            .and_then(|r| r.input["strip_ai_co_authors"].as_bool())
             .unwrap_or(true)
     }
 
@@ -642,8 +653,9 @@ impl Manager {
         model: Option<String>,
         reasoning: Option<String>,
         (workspace, workspace_name): (Option<String>, Option<String>),
-        (provider, command_guard_enabled, system_prompt): (
+        (provider, command_guard_enabled, strip_ai_co_authors, system_prompt): (
             Option<String>,
+            Option<bool>,
             Option<bool>,
             Option<String>,
         ),
@@ -666,6 +678,9 @@ impl Manager {
         };
         if command_guard_enabled == Some(false) {
             input["command_guard_enabled"] = json!(false);
+        }
+        if strip_ai_co_authors == Some(false) {
+            input["strip_ai_co_authors"] = json!(false);
         }
         if let Some(system_prompt) = &system_prompt {
             input["system_prompt"] = json!(system_prompt);
@@ -850,6 +865,7 @@ impl Manager {
                 config.repository = session.workspace.as_ref().ok_or_else(|| io::Error::other("session workspace missing"))?.path.canonicalize()?;
                 let (kind, reasoning) = (session.harness, session.reasoning.clone());
                 let command_guard_enabled = session.command_guard_enabled();
+                let strip_ai_co_authors = session.strip_ai_co_authors();
                 let system_prompt = session.system_prompt();
                 failure_reason = "The side chat's source conversation could not be copied";
                 fork = children::fork_history(&local, &id, &request)?;
@@ -857,8 +873,8 @@ impl Manager {
                 // Claim before spawning: a crash after this point must not repeat uncertain execution.
                 local.append(&id, "state", json!({"state":"starting"}), None)?;
                 let (handle, events) = match &fork {
-                    Some(fork) => runtime::Handle::spawn_fork(&config, kind, fork, command_guard_enabled, system_prompt)?,
-                    None => runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled, system_prompt)?,
+                    Some(fork) => runtime::Handle::spawn_fork(&config, kind, fork, command_guard_enabled, strip_ai_co_authors, system_prompt)?,
+                    None => runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled, strip_ai_co_authors, system_prompt)?,
                 };
                 let handle = handle.with_reasoning(reasoning);
                 let pid = handle.pid();
@@ -1826,6 +1842,7 @@ impl Manager {
                     kind,
                     Some(saved),
                     local.sessions[&id].command_guard_enabled(),
+                    local.sessions[&id].strip_ai_co_authors(),
                     local.sessions[&id].system_prompt(),
                 )?;
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());

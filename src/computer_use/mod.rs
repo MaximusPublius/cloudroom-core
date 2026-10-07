@@ -156,6 +156,11 @@ fn ensure_desktop() -> Result<String, Error> {
         )?;
         wait_for("The session bus", || listening(&bus_socket))?;
     }
+    // A window manager gives windows focus, so keyboard input reaches them (web/computer-use.sh installs it).
+    let wm = format!("{STATE}/wm.pid");
+    if Path::new("/usr/bin/openbox").exists() && !alive(&wm) {
+        std::fs::write(&wm, detach("openbox", &[], "wm")?.to_string())?;
+    }
     let atspi = format!("{STATE}/atspi.pid");
     if !alive(&atspi) {
         let pid = detach(

@@ -86,6 +86,25 @@ async fn capture_stderr(script: &str, shutdown: bool) -> runtime::ExitDetails {
 }
 
 #[tokio::test]
+async fn harness_commits_drop_ai_co_authors_and_keep_human_ones() {
+    let script = r#"import subprocess, tempfile
+repo = tempfile.mkdtemp()
+git = lambda *args: subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True, text=True).stdout
+git("init", "-q")
+open(repo + "/file.txt", "w").write("content\n")
+git("add", "file.txt")
+git("-c", "user.name=Agent", "-c", "user.email=agent@example.com", "commit", "-q", "--no-verify", "-m", "Add file", "-m",
+    "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: Ada Lovelace <ada@example.com>")
+os.write(2, git("log", "-1", "--format=%B").encode())
+os._exit(0)"#;
+    let details = capture_stderr(script, false).await;
+    assert_eq!(
+        String::from_utf8_lossy(details.stderr()).trim(),
+        "Add file\n\nCo-authored-by: Ada Lovelace <ada@example.com>"
+    );
+}
+
+#[tokio::test]
 async fn stderr_keeps_bounded_final_bytes_and_separates_concurrent_harnesses() {
     let mut tasks = tokio::task::JoinSet::new();
     for n in 0..4 {

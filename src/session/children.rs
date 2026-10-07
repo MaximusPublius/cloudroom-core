@@ -39,6 +39,9 @@ impl Manager {
         if !session.command_guard_enabled() {
             input["command_guard_enabled"] = json!(false);
         }
+        if !session.strip_ai_co_authors() {
+            input["strip_ai_co_authors"] = json!(false);
+        }
         if let Some(system_prompt) = session.system_prompt() {
             input["system_prompt"] = json!(system_prompt);
         }
@@ -307,6 +310,9 @@ impl Manager {
             if !p.command_guard_enabled() {
                 input["command_guard_enabled"] = json!(false);
             }
+            if !p.strip_ai_co_authors() {
+                input["strip_ai_co_authors"] = json!(false);
+            }
             if let Some(system_prompt) = p.system_prompt() {
                 input["system_prompt"] = json!(system_prompt);
             }
@@ -406,6 +412,9 @@ impl Manager {
             let mut input = json!({"harness":s.harness,"fork":fork,"reasoning":s.reasoning});
             if !s.command_guard_enabled() {
                 input["command_guard_enabled"] = json!(false);
+            }
+            if !s.strip_ai_co_authors() {
+                input["strip_ai_co_authors"] = json!(false);
             }
             if let Some(system_prompt) = s.system_prompt() {
                 input["system_prompt"] = json!(system_prompt);
@@ -578,17 +587,18 @@ impl Manager {
     }
 
     /// The caller's children, or one child with its latest reply: live when idle, else its last completed one.
-    pub(crate) async fn children(&self, parent: &str, only: Option<&str>) -> Value {
+    /// Archived children are listed only on request, but `only` still finds one.
+    pub(crate) async fn children(&self, parent: &str, only: Option<&str>, archived: bool) -> Value {
         let (mut items, handle, kept) = {
             let local = self.local.lock().unwrap();
             let items: Vec<_> = local
                 .sessions
                 .values()
                 .filter(|c| may_use(&local, parent, c))
-                .filter(|c| only.is_none_or(|id| c.session_id == id))
+                .filter(|c| only.map_or(archived || !c.archived, |id| c.session_id == id))
                 .map(|c| {
                     let busy = c.current_request.is_some() || c.has_work();
-                    json!({"id":c.session_id,"title":title(c),"harness":c.harness,"model":c.model,"state":c.state,"busy":busy,"error":c.failure})
+                    json!({"id":c.session_id,"title":title(c),"harness":c.harness,"model":c.model,"state":c.state,"busy":busy,"error":c.failure,"archived":c.archived})
                 })
                 .collect();
             let child = only.and_then(|id| local.sessions.get(id));

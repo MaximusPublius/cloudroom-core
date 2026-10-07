@@ -2,7 +2,7 @@
 //! app reconnects. After `101 Switching Protocols` both sides send frames: a kind byte, a big-endian u32
 //! length, then the data. To the app: OUTPUT bytes, EXIT `{"code"}`, HELLO `{"offset","cwd","shell"}` (first,
 //! and again after skipped output), PING. From the app: INPUT bytes, RESIZE (cols, rows as u16), PING.
-use super::linux;
+use super::{Kind, linux};
 use crate::{config::Config, session::Manager};
 use axum::{
     Json, Router,
@@ -130,6 +130,21 @@ fn set_size(pty: &impl AsRawFd, cols: u16, rows: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// `claude`, `codex` and `cursor-agent` start signed in with the logins Core gives its agents, read once when
+/// the shell starts. Only this shell's variables change; the agents' own logins are untouched.
+fn logins(process: &mut tokio::process::Command, config: &Config) {
+    if let Some(profile) = config.harnesses.get(&Kind::Claude) {
+        super::claude::profile_env(process, config, profile);
+    }
+    if let Some(profile) = config.harnesses.get(&Kind::Codex) {
+        process.env("CODEX_HOME", &profile.home);
+    }
+    if config.harnesses.contains_key(&Kind::Cursor) {
+        // A missing or unreadable key still opens the shell; Cursor then uses its own login file.
+        let _ = super::cursor_auth::apply_key(process, config);
+    }
+}
+
 struct Output {
     replay: VecDeque<u8>,
     written: u64,
@@ -179,6 +194,7 @@ impl Terminal {
             .env("COLORTERM", "truecolor")
             .env("SHELL", shell)
             .current_dir(&cwd);
+        logins(&mut process, config);
         let group = match &config.storage {
             Some(policy) => {
                 // The shell owns its terminal, as on any login.

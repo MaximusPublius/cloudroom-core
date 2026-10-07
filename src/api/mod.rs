@@ -574,6 +574,7 @@ struct Start {
     provider: Option<String>,
     workspace_name: Option<String>,
     command_guard_enabled: Option<bool>,
+    strip_ai_co_authors: Option<bool>,
     system_prompt: Option<String>,
     /// Starts a child thread in this parent's folder; it inherits the parent's settings.
     parent_session: Option<String>,
@@ -823,6 +824,7 @@ async fn start(
             || body.workspace_name.is_some()
             || body.provider.is_some()
             || body.command_guard_enabled.is_some()
+            || body.strip_ai_co_authors.is_some()
             || body.system_prompt.is_some()
         {
             return Err(session::Error::Conflict(
@@ -841,6 +843,7 @@ async fn start(
             || body.workspace_name.is_some()
             || body.provider.is_some()
             || body.command_guard_enabled.is_some()
+            || body.strip_ai_co_authors.is_some()
             || body.system_prompt.is_some()
             || title.as_ref().is_some_and(|t| {
                 t.is_empty() || t.chars().count() > 200 || t.chars().any(char::is_control)
@@ -880,6 +883,7 @@ async fn start(
             (
                 body.provider,
                 body.command_guard_enabled,
+                body.strip_ai_co_authors,
                 body.system_prompt,
             ),
         )

@@ -71,6 +71,8 @@ pub struct Manifest {
     pub service_tier: Option<String>,
     pub command_guard_enabled: Option<bool>,
     #[serde(default)]
+    pub strip_ai_co_authors: Option<bool>,
+    #[serde(default)]
     pub system_prompt: Option<String>,
     pub workspace: String,
     pub workspace_name: String,
@@ -799,7 +801,7 @@ impl Manager {
         let receipt = Receipt {
             request_id: id.into(),
             command: "start".into(),
-            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"fork":manifest.fork,"command_guard_enabled":manifest.command_guard_enabled,"system_prompt":manifest.system_prompt}),
+            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"fork":manifest.fork,"command_guard_enabled":manifest.command_guard_enabled,"strip_ai_co_authors":manifest.strip_ai_co_authors,"system_prompt":manifest.system_prompt}),
             state: "completed".into(),
             model: Some(manifest.model.clone()),
             provider: manifest.provider.clone(),

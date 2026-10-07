@@ -4,7 +4,7 @@ use super::Manager;
 use crate::preview::Peer;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -20,7 +20,7 @@ cloudroom thread update --self --reasoning-level LEVEL
 cloudroom thread archive --self
 cloudroom thread stop --self
 cloudroom thread spawn --provider codex|claude-code|pi [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] --prompt TEXT|--prompt-file PATH
-cloudroom thread list
+cloudroom thread list [--include-archived]
 cloudroom thread output CHILD_ID
 cloudroom thread tell CHILD_ID TEXT
 cloudroom thread stop CHILD_ID
@@ -226,12 +226,21 @@ async fn spawn(
     ))
 }
 
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
 async fn list(
     State(m): State<Arc<Manager>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread list")?;
-    Ok(Json(m.children(&parent, None).await))
+    Ok(Json(
+        m.children(&parent, None, query.include_archived).await,
+    ))
 }
 
 async fn output(
@@ -242,7 +251,7 @@ async fn output(
     let parent = caller(&m, peer, "thread output")?;
     m.own_child(&parent, &id).map_err(session_failure)?;
     Ok(Json(
-        m.children(&parent, Some(&id)).await["children"][0].clone(),
+        m.children(&parent, Some(&id), true).await["children"][0].clone(),
     ))
 }
 
@@ -355,8 +364,13 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
             return Ok(0);
         }
         ["spawn", rest @ ..] => return spawn_cli(rest).await,
-        ["list", ..] => {
-            let answer = crate::mac::request(crate::mac::SOCKET, "GET", "/children", None).await?;
+        ["list", rest @ ..] => {
+            let path = if rest.contains(&"--include-archived") {
+                "/children?include_archived=true"
+            } else {
+                "/children"
+            };
+            let answer = crate::mac::request(crate::mac::SOCKET, "GET", path, None).await?;
             println!("{answer}");
             return Ok(0);
         }

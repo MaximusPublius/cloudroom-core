@@ -86,3 +86,44 @@ async fn shell_runs_on_a_resizable_terminal_and_replays_after_reconnect() {
     terminals.close("term_test");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn shell_gets_the_agents_claude_and_codex_logins() {
+    let dir =
+        std::env::temp_dir().join(format!("cloudroom-terminal-logins-{}", std::process::id()));
+    fs::create_dir_all(dir.join("state")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    fs::write(
+        dir.join("state/claude-oauth-token"),
+        "sk-ant-oat-test\nmax\n",
+    )
+    .unwrap();
+    let mut config = config(&dir);
+    for (kind, home) in [
+        (runtime::Kind::Claude, ".claude"),
+        (runtime::Kind::Codex, ".codex"),
+    ] {
+        let profile = cloudroom::config::HarnessConfig {
+            binary: "/bin/true".into(),
+            home: dir.join(home),
+            model: "fixture".into(),
+            provider: None,
+        };
+        config.harnesses.insert(kind, profile);
+    }
+    let terminals = runtime::terminal::Terminals::default();
+    let command = r#"echo "[$CLAUDE_CODE_OAUTH_TOKEN $CLAUDE_CODE_SUBSCRIPTION_TYPE $DISABLE_AUTOUPDATER $CODEX_HOME]""#;
+    let terminal = terminals
+        .open(&config, "term_logins", dir.clone(), 100, 30, Some(command))
+        .unwrap();
+    let (mut app, core) = tokio::io::duplex(1 << 20);
+    tokio::spawn(Arc::clone(&terminal).serve(core, 0));
+    let (output, _) = tokio::time::timeout(Duration::from_secs(10), until_exit(&mut app))
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&output);
+    let expected = format!("[sk-ant-oat-test max 1 {}]", dir.join(".codex").display());
+    assert!(text.contains(&expected), "{text}");
+    terminals.close("term_logins");
+    let _ = fs::remove_dir_all(&dir);
+}

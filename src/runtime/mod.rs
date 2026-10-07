@@ -296,6 +296,29 @@ trait Adapter: Send {
     }
 }
 
+/// A Git 2.54+ config hook that drops AI agent Co-authored-by lines from every commit message.
+fn strip_ai_co_authors_env(command: &mut Command) {
+    const HOOK: &str = r#"cloudroom_strip_ai_co_authors() { grep -viE '^co-authored-by:.*(claude|anthropic|cursor|codex|openai|chatgpt|copilot|gemini|aider\.chat|devin-ai|windsurf|codeium)' "$1" > "$1.cloudroom"; [ $? -le 1 ] && mv "$1.cloudroom" "$1" || rm -f "$1.cloudroom"; }; cloudroom_strip_ai_co_authors"#;
+    command.envs([
+        ("GIT_CONFIG_COUNT", "3"),
+        (
+            "GIT_CONFIG_KEY_0",
+            "hook.cloudroom-strip-ai-co-authors.command",
+        ),
+        ("GIT_CONFIG_VALUE_0", HOOK),
+        (
+            "GIT_CONFIG_KEY_1",
+            "hook.cloudroom-strip-ai-co-authors.event",
+        ),
+        ("GIT_CONFIG_VALUE_1", "prepare-commit-msg"),
+        (
+            "GIT_CONFIG_KEY_2",
+            "hook.cloudroom-strip-ai-co-authors.event",
+        ),
+        ("GIT_CONFIG_VALUE_2", "commit-msg"),
+    ]);
+}
+
 #[derive(Clone)]
 pub struct Handle {
     process: process::Process,
@@ -310,6 +333,7 @@ pub struct Handle {
     baseline: Arc<Mutex<Option<String>>>,
     rpc_timeout: Duration,
     command_guard_enabled: bool,
+    strip_ai_co_authors: bool,
     system_prompt: Option<String>,
     controls: Arc<tokio::sync::Mutex<()>>,
 }
@@ -319,7 +343,7 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
-        Self::spawn_guarded(config, kind, resume, true, None)
+        Self::spawn_guarded(config, kind, resume, true, true, None)
     }
 
     pub fn spawn_guarded(
@@ -327,13 +351,14 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
         command_guard_enabled: bool,
+        strip_ai_co_authors: bool,
         system_prompt: Option<String>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
         Self::spawn_inner(
             config,
             kind,
             resume,
-            command_guard_enabled,
+            (command_guard_enabled, strip_ai_co_authors),
             system_prompt,
             None,
         )
@@ -345,10 +370,18 @@ impl Handle {
         kind: Kind,
         fork: &Fork,
         command_guard_enabled: bool,
+        strip_ai_co_authors: bool,
         system_prompt: Option<String>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
         if kind != Kind::Claude {
-            return Self::spawn_guarded(config, kind, None, command_guard_enabled, system_prompt);
+            return Self::spawn_guarded(
+                config,
+                kind,
+                None,
+                command_guard_enabled,
+                strip_ai_co_authors,
+                system_prompt,
+            );
         }
         let profile = config
             .harnesses
@@ -365,7 +398,7 @@ impl Handle {
             config,
             kind,
             resume,
-            command_guard_enabled,
+            (command_guard_enabled, strip_ai_co_authors),
             system_prompt,
             Some(&at),
         )
@@ -375,7 +408,7 @@ impl Handle {
         config: &Config,
         kind: Kind,
         resume: Option<Resume>,
-        command_guard_enabled: bool,
+        (command_guard_enabled, strip_ai_co_authors): (bool, bool),
         system_prompt: Option<String>,
         fork: Option<&str>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
@@ -403,6 +436,7 @@ impl Handle {
                     resume.as_ref(),
                     fork,
                     command_guard_enabled,
+                    strip_ai_co_authors,
                     system_prompt.as_deref(),
                 )?;
                 let saved = resume.as_ref().filter(|_| fork.is_none());
@@ -481,6 +515,10 @@ impl Handle {
                 )
             }
         };
+        let mut command = command;
+        if strip_ai_co_authors {
+            strip_ai_co_authors_env(&mut command);
+        }
         let (process, events) = process::Process::spawn(config, command, adapter)?;
         Ok((
             Self {
@@ -493,6 +531,7 @@ impl Handle {
                 baseline: Arc::new(Mutex::new(None)),
                 rpc_timeout: config.rpc_timeout,
                 command_guard_enabled,
+                strip_ai_co_authors,
                 system_prompt,
                 controls: Arc::new(tokio::sync::Mutex::new(())),
                 resume,
@@ -667,7 +706,7 @@ impl Handle {
             config,
             self.kind,
             Some(saved),
-            self.command_guard_enabled,
+            (self.command_guard_enabled, self.strip_ai_co_authors),
             self.system_prompt.clone(),
             Some(&parent),
         )

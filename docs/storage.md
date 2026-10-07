@@ -8,7 +8,7 @@ Workspace Management measures actual available disk space. Session Management re
 - **Below 2 GB**, block new work and uploads, then freeze managed agents, sync transfers, and attachment writers. Saved history, health, and recovery reads remain available. `room-cli vm run` still works and is never frozen, so a person can read work back and free space; bulk `vm run/raw` project copies stay blocked.
 - **Above 2.5 GB**, resume paused work, even if the low-space warning remains. Never replay a prompt or reset an in-flight native RPC deadline because of a pause.
 - **Still paused after 30 seconds** (frozen work never frees space): in each session, kill the process group that wrote the most to disk, never the harness's own group (tool commands run in their own groups). Then thaw work and tell the agent what was stopped. Work pauses again only when half of the space left is used; above 2.5 GB the normal thresholds return.
-- Failed measurements, or measurements older than five seconds, block work until disk access can be verified.
+- Failed measurements block work until disk access can be verified. If the guard loop falls more than five seconds behind, each check re-measures the disk itself instead of blocking.
 - Validate `/code` and registered workspace paths against the configured filesystem; unsupported mounts block work. Measure the actual workspace root and history location. Linux filesystem-reserved blocks are already excluded from available space; do not subtract another reserve.
 
 Warnings and pause/resume events are saved in session history and replayed to clients. Harness notification acknowledgement is not proof that the model read it. Account isolation, capability dropping, cgroups, and history ownership remain unchanged.

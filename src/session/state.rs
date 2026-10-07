@@ -517,6 +517,7 @@ impl Local {
                 session.rewind_request = None;
                 session.state = "idle".into();
             }
+            "archive" => session.archived = true,
             "usage_limited" => session.usage_limited = true,
             "storage_warning" => session.storage_warned = true,
             "storage_pause" => session.storage_paused = record.data["paused"] == true,

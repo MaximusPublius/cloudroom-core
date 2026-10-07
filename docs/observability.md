@@ -12,6 +12,7 @@ One internal module; no alerts, external collector, or new dependency. The [dash
 - `computer_use`: one `cloudroom computer-use call` in a Cloud sandbox: session ID, tool, target app (process or launch name), outcome (`ok` or the error code), effect, and elapsed milliseconds. Never screen content, typed text, or window titles.
 - `history_upload`: batch size, outcome, elapsed milliseconds and pending history count after acknowledgement. `history_fault` identifies journal read/acknowledgement failure.
 - `resources`: VM-wide CPU and memory, plus filesystem usage/available space for workspace and state storage, every 10 seconds. CPU/memory use Linux `/proc`; unsupported or failed samples are `null`, never zero. First CPU sample is unknown. Filesystem sampling uses `/bin/df` with a one-second timeout. Session Management also supplies full-registry working/queued/waiting/failed counts on this cycle; older samples have no counts. These are observations, not resource limits.
+- `storage_stale`: the disk guard loop measured more than five seconds late; `gap_ms` is how long. Recorded only during stalls.
 - `diagnostics`: cumulative dropped-record, local-write-failure and database-write-failure counts for this process.
 
 Ordinary local/SQL diagnostics contain only fixed diagnostic fields and correlation IDs. No credentials, prompts, native history, filesystem paths, request bodies or raw URLs. The separate, protected stderr capture below is the only raw-output exception. History and recovery remain with their existing owners.

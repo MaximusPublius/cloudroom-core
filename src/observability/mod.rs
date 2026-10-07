@@ -70,6 +70,10 @@ pub(crate) enum Signal {
     HistoryFault {
         operation: &'static str,
     },
+    /// The disk guard loop measured late; work saw a stale reading for this long.
+    StorageStale {
+        gap_ms: u64,
+    },
     AuthHealth {
         harness: Kind,
         credentials: crate::runtime::claude_auth::Credentials,
