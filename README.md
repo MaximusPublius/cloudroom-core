@@ -1,43 +1,55 @@
 # Cloudroom core
 
-A pre-release Rust service for running coding harnesses and preserving their session history.
-One Cargo package; one service per Linux VM. Harnesses make their own inference calls.
-No Cloudroom account or managed-hosting service is required.
+[Website](https://www.cloudroom.dev) · [Desktop app](https://github.com/davidondrej/cloudroom-gui) · [Changelog](https://www.cloudroom.dev/changelog) · [Security](https://www.cloudroom.dev/security)
 
-![Cloudroom core architecture: session management, agent runtime, workspace management, storage, and app integrations](docs/architecture.png)
+Your agents get their own room in the cloud.
 
-*Architecture design. Some components and integrations shown are planned, not yet implemented.*
+Cloudroom core runs coding agents on your own Linux machine and saves their chat history. It powers the cloud side of the [Cloudroom app](https://github.com/davidondrej/cloudroom-gui), which runs Claude Code, Codex, and Pi on your Mac or in the cloud.
 
-Start with the [Ubuntu 24.04 setup guide](docs/setup.md) to build from source and run your first agent through the API.
+- Works with Codex, Claude Code, Pi, and Cursor.
+- Agents use your own logins to call their models.
+- One Rust service per machine. No Cloudroom account needed.
 
-## macOS GUI beta
+Don't want to host it yourself? Hosted Cloudroom is invite-only for now. [Join the waitlist](https://www.cloudroom.dev/#waitlist).
 
-[Download the Cloudroom GUI](https://github.com/davidondrej/cloudroom-installer/releases/tag/gui-v0.43.1-beta) for Apple Silicon Macs (M1 or newer) running macOS 13+.
-This beta is not notarized by Apple; see the release page for installation instructions.
-Downloads are public, but hosted cloud access remains invite-only. The core does not require the GUI.
+![Cloudroom architecture: one cloud sandbox per agent, each running Cloudroom core and the agent.](docs/architecture.png)
+
+## Get started
+
+- [Install on Ubuntu 24.04](docs/setup.md) with one script, on a VPS, a home server, or a spare laptop. A database on the same machine works.
+- [Reach it from your laptop](docs/setup.md#reach-it-from-your-other-devices) with Tailscale, and [upgrade](docs/setup.md#upgrade) in place.
+- [HTTP API](docs/api.md): every endpoint, event, and error code.
+- [Linux builds](https://github.com/davidondrej/cloudroom-core/releases): tested binaries for each release.
+
+## Security
+
+- Agents run as a separate Linux user, with no admin rights and no `sudo`.
+- Agents can't read the core's token, database password, or history files.
+- Every API request needs a secret token. The API listens only on localhost unless you put it behind HTTPS.
+- History is saved to PostgreSQL: on the same machine, or on another one over verified TLS.
+- Command Guard blocks a few disastrous commands, like wiping a home folder.
+
+Agents run without approval prompts, so give each trusted user their own machine.
+Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
+
+## Desktop app
+
+[Download the Cloudroom app](https://github.com/davidondrej/cloudroom-gui/releases) for Apple Silicon Macs (Linux alpha). [Connect it to your own core](docs/setup.md#connect-the-desktop-app) with a URL and token, no account needed. The core also works without it.
 
 ## Build and test
 
-Requires Rust 1.89+, Git, and the supported harness runtimes.
+Needs Rust 1.89+, Git, and the agent CLIs you want to run.
 
 ```sh
 cargo build --locked --release
 cargo test --locked --all-targets
 ```
 
-Apply the two SQL files in `docs/database/` to a dedicated PostgreSQL database as its owner.
-The service never applies migrations. Keep database and core credentials server-side.
+Apply the two SQL files in `docs/database/` to a dedicated PostgreSQL database. The core never runs migrations itself.
 
-- [Installation and workload protection](docs/storage.md)
-- [Harness configuration and verification](docs/harnesses.md)
-- [Session lifecycle](docs/session-lifecycle.md)
-- [Diagnostics](docs/observability.md)
-- [Dashboard API](docs/dashboard.md)
+More docs: [storage](docs/storage.md) · [harnesses](docs/harnesses.md) · [session lifecycle](docs/session-lifecycle.md) · [diagnostics](docs/observability.md) · [dashboard API](docs/dashboard.md)
 
 ## Contributing
 
-Contributions and pull requests are welcome from day one. Open an issue to discuss larger changes.
-Development happens in a private monorepo; accepted contributions are included in future public snapshots.
-
-This is a development snapshot, not a claim that all planned features are complete.
-Licensed under [Apache 2.0](LICENSE).
+Issues and pull requests are welcome. For big changes, open an issue first.
+This is pre-release software. Licensed under [Apache 2.0](LICENSE).

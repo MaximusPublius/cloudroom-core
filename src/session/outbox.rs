@@ -15,8 +15,20 @@ pub struct Journal {
     _lock: File,
 }
 
+const SNAPSHOT: &str = "snapshot.json";
+
+fn record_name(id: u64) -> String {
+    format!("{id:020}.record")
+}
+
 impl Journal {
     pub fn open(directory: &Path) -> io::Result<Self> {
+        Self::open_from(directory, 0)
+    }
+
+    /// `known` is the last record a replay snapshot covers. Listing every record of a large journal is slow,
+    /// so a present `known` record skips the listing and only the records after it are counted.
+    pub fn open_from(directory: &Path, known: u64) -> io::Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -30,6 +42,36 @@ impl Journal {
             .open(directory.join("lock"))?;
         lock.try_lock()
             .map_err(|_| io::Error::other("state directory already in use"))?;
+        let last = if known > 0 && directory.join(record_name(known)).is_file() {
+            let mut last = known;
+            while directory.join(record_name(last + 1)).is_file() {
+                last += 1;
+            }
+            last
+        } else {
+            Self::count(directory)?
+        };
+        let saved = match fs::read_to_string(directory.join("saved")) {
+            Ok(value) => value
+                .parse()
+                .map_err(|_| io::Error::other("invalid saved cursor"))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        if saved > last {
+            return Err(io::Error::other("saved cursor exceeds journal"));
+        }
+        Ok(Self {
+            directory: directory.into(),
+            next: last + 1,
+            saved,
+            writable: true,
+            _lock: lock,
+        })
+    }
+
+    /// Lists every record and checks they run from 1 without gaps.
+    fn count(directory: &Path) -> io::Result<u64> {
         let mut ids = Vec::new();
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
@@ -39,7 +81,7 @@ impl Journal {
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<u64>().ok())
                     .ok_or_else(|| io::Error::other("invalid journal filename"))?;
-                if path.file_name().and_then(|s| s.to_str()) != Some(&format!("{id:020}.record")) {
+                if path.file_name().and_then(|s| s.to_str()) != Some(&record_name(id)) {
                     return Err(io::Error::other("noncanonical journal filename"));
                 }
                 ids.push(id);
@@ -49,37 +91,45 @@ impl Journal {
         if ids.iter().copied().ne(1..=ids.len() as u64) {
             return Err(io::Error::other("journal has missing or duplicate records"));
         }
-        let saved = match fs::read_to_string(directory.join("saved")) {
-            Ok(value) => value
-                .parse()
-                .map_err(|_| io::Error::other("invalid saved cursor"))?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e),
-        };
-        if saved > ids.len() as u64 {
-            return Err(io::Error::other("saved cursor exceeds journal"));
-        }
-        Ok(Self {
-            directory: directory.into(),
-            next: ids.len() as u64 + 1,
-            saved,
-            writable: true,
-            _lock: lock,
-        })
+        Ok(ids.len() as u64)
     }
 
     pub fn append(&mut self, record: &[u8]) -> io::Result<u64> {
         let id = self.next;
-        self.write_atomic(&format!("{id:020}.record"), record)?;
+        self.write_atomic(&record_name(id), record)?;
         self.next += 1;
         Ok(id)
+    }
+
+    /// The replay snapshot (`Local::save_snapshot`), if one was saved.
+    pub fn read_snapshot(directory: &Path) -> Option<Vec<u8>> {
+        fs::read(directory.join(SNAPSHOT)).ok()
+    }
+
+    /// Replaces the snapshot whole. It is only a shortcut: a lost or stale one costs a longer replay, never
+    /// records, so it skips the journal's write guard.
+    pub fn write_snapshot(&self, bytes: &[u8]) -> io::Result<()> {
+        let temporary = self.directory.join("snapshot.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(temporary, self.directory.join(SNAPSHOT))
     }
 
     pub fn read(&self, id: u64) -> io::Result<Vec<u8>> {
         if id == 0 || id >= self.next {
             return Err(io::Error::other("record outside journal"));
         }
-        fs::read(self.directory.join(format!("{id:020}.record")))
+        fs::read(self.directory.join(record_name(id)))
+    }
+
+    pub fn writable(&self) -> bool {
+        self.writable
     }
 
     pub fn last(&self) -> u64 {
