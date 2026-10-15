@@ -23,6 +23,19 @@ fn save_private(path: &Path, contents: &str) -> io::Result<()> {
     file.sync_all()?;
     fs::rename(temporary, path)
 }
+fn save_private_bytes(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let temporary = path.with_extension("tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)
+}
 fn remove(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
@@ -50,9 +63,15 @@ pub(crate) fn is_api_key(value: &str) -> bool {
 /// the subscription token is dropped. A rejected key leaves the old login intact.
 async fn save_key(config: &Config, key: &str) -> Result<(), &'static str> {
     let path = claude::key_path(config);
+    // Preserve the previous key if the probe fails; never discard working credentials.
+    let previous = fs::read(&path).ok();
     save_private(&path, &format!("{key}\n")).map_err(|_| "Could not save the API key.")?;
     if claude::probe(config, "haiku", None).await.is_err() {
-        let _ = remove(&path);
+        if let Some(previous) = previous {
+            save_private_bytes(&path, &previous).map_err(|_| "Could not restore the previous API key.")?;
+        } else {
+            remove(&path).map_err(|_| "Could not remove the rejected API key.")?;
+        }
         return Err("Anthropic did not accept this API key. Check the key and its credits.");
     }
     remove(&claude::token_path(config)).map_err(|_| "Could not remove the old Claude token.")
