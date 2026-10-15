@@ -500,6 +500,7 @@ READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
 ASK = '''on run argv
 activate
 display dialog (item 1 of argv) with title "Cloudroom" buttons {"Deny", "Allow"} default button (item 2 of argv) cancel button "Deny" with icon caution giving up after 300
+if gave up of result then return "Deny"
 return button returned of result
 end run'''
 # Hex characters per result request: some sandbox proxies drop requests over about 8 MB,
