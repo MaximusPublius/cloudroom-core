@@ -499,7 +499,7 @@ READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
              ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))')
 ASK = '''on run argv
 activate
-display dialog (item 1 of argv) with title "Cloudroom" buttons {"Deny", "Allow for this thread", "Allow"} default button (item 2 of argv) cancel button "Deny" with icon caution giving up after 300
+display dialog (item 1 of argv) with title "Cloudroom" buttons {"Deny", "Allow"} default button (item 2 of argv) cancel button "Deny" with icon caution giving up after 300
 return button returned of result
 end run'''
 # Hex characters per result request: some sandbox proxies drop requests over about 8 MB,
@@ -584,7 +584,7 @@ class MacJobs:
     def approve(self, core, job):
         with self.asking:
             if core.key in self.trusted:
-                return True
+                return False
             # Hidden parts still run: warn above the command, where padding cannot push it out of view, and let Return deny.
             command, stdin, warnings = job['command'], len(job.get('stdin') or '') // 2, ''
             if len(command) > 600:
@@ -600,8 +600,8 @@ class MacJobs:
             with self.lock:
                 self.running.pop(job['id'], None)
             if answer == 'Allow for this thread':
-                self.trusted.add(core.key)
-            return answer in ('Allow', 'Allow for this thread')
+                return False
+            return answer == 'Allow'
 
     def refusal(self, core, job):
         """Why this job may not run as asked, or None. Everything else that is not full access runs read-only."""
