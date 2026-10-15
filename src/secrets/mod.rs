@@ -390,7 +390,13 @@ fn encode(value: &str) -> io::Result<String> {
         Ok(format!("'{value}'"))
     } else if !value.contains('"') && !value.contains("\\n") && !value.contains("\\r") {
         Ok(format!("\"{value}\""))
-    } else if value == value.trim() && !value.contains('#') && !value.contains('\'') && !value.contains('"') && !value.contains('\\') && !value.chars().any(char::is_whitespace) {
+    } else if value == value.trim()
+        && !value.contains('#')
+        && !value.contains('\'')
+        && !value.contains('"')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_whitespace)
+    {
         Ok(value.into())
     } else {
         Err(io::Error::other(
