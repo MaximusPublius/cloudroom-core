@@ -37,9 +37,9 @@ impl Fixture {
             token: String::new(),
             state_dir: root.join("state"),
             repository: root.clone(),
-            database_url: "postgres://127.0.0.1:1/test".into(),
+            api_url: Some("http://127.0.0.1:1".into()),
             store: "test".into(),
-            allow_insecure_database: true,
+            instance: None,
             account_home: root.clone(),
             default_harness: kind,
             harnesses: [(
@@ -52,8 +52,9 @@ impl Fixture {
                 },
             )]
             .into(),
-            max_harnesses: 2,
             storage: None,
+            rpc_timeout: Duration::from_secs(30),
+            diagnostic_upload: Duration::from_secs(1),
         };
         Self { root, config }
     }
@@ -81,7 +82,9 @@ async fn both_harnesses_obey_request_and_shutdown_contract() {
                         assert!(!started);
                         started = true;
                     }
-                    Event::Finished { request, status } => {
+                    Event::Finished {
+                        request, status, ..
+                    } => {
                         assert!(started);
                         assert_eq!((request.as_str(), status.as_str()), ("first", "completed"));
                         return;
@@ -129,12 +132,18 @@ async fn pi_waits_through_retry_and_preserves_tool_snapshots() {
     let started = std::time::Instant::now();
     let mut starts = 0;
     let mut snapshots = Vec::new();
+    let mut updates = Vec::new();
     tokio::time::timeout(Duration::from_secs(4), async {
         while let Some(event) = events.recv().await {
             match event {
                 Event::Started { request, .. } => {
                     assert_eq!(request, "retry");
                     starts += 1;
+                }
+                // Tool-call chunks and per-chunk usage are never recorded.
+                Event::Record { data, .. } if data["type"] == "message_update" => {
+                    assert!(data["usage"].is_null());
+                    updates.push(data["delta"].as_str().unwrap().to_owned());
                 }
                 Event::Record {
                     kind: "tool_snapshot",
@@ -149,7 +158,9 @@ async fn pi_waits_through_retry_and_preserves_tool_snapshots() {
                             .to_owned(),
                     );
                 }
-                Event::Finished { request, status } => {
+                Event::Finished {
+                    request, status, ..
+                } => {
                     assert_eq!(request, "retry");
                     assert_eq!(status, "completed");
                     return;
@@ -164,6 +175,7 @@ async fn pi_waits_through_retry_and_preserves_tool_snapshots() {
     assert!(started.elapsed() >= Duration::from_millis(250));
     assert_eq!(starts, 1);
     assert_eq!(snapshots, ["one", "one two"]);
+    assert_eq!(updates, ["hi"]);
     handle.request_shutdown();
     tokio::time::timeout(Duration::from_secs(6), async {
         while events.recv().await.is_some() {}
@@ -194,6 +206,7 @@ async fn pi_handles_no_run_dialogs_rejection_and_failure() {
                     Event::Finished {
                         request,
                         status: outcome,
+                        ..
                     } => {
                         assert_eq!(request, text);
                         assert_eq!(outcome, status);

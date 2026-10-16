@@ -1,11 +1,11 @@
-"""Real Rust/Codex/PostgreSQL tests. --foundation checks HTTP and diagnostics without inference.
+"""Real Rust/Codex tests with a fake website API (tests/fake_api.py). --foundation checks HTTP and diagnostics
+without inference.
 
-Uses one explicitly isolated PostgreSQL container from the already installed image.
 Copies only the selected account's auth.json to a private disposable Codex home.
 Never changes existing databases, checkouts, services, or harness configuration.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import http.client
 import json
@@ -20,9 +20,6 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "docs/database"
-if not (MIGRATIONS / "0001-session-records.sql").is_file():
-    MIGRATIONS = ROOT.parent / "docs/database"
 
 
 def run(*args, **kwargs):
@@ -202,7 +199,7 @@ def wait_done(service, sid, request, expected="completed"):
     return until(complete, f"{sid}/{request} {expected}")
 
 
-def check_database_pagination(service, container, store):
+def check_saved_pagination(service, api):
     records = [{"sequence": n, "session_id": "cr_paged", "kind": "text_delta", "data": {"delta": str(n)}} for n in range(1, 601)]
     receipt = {"request_id": "paged", "command": "start", "input": {}, "state": "accepted"}
     records[0].update(kind="receipt", data=receipt)
@@ -211,12 +208,7 @@ def check_database_pagination(service, container, store):
     records[449].update(kind="native_identity", data={"id": "late-native-identity"})
     records[-2].update(kind="receipt", data={**receipt, "state": "completed"})
     records[-1].update(kind="receipt", data={**receipt, "request_id": "other"})
-    values = []
-    for record in records:
-        payload = json.dumps(record).replace("'", "''")
-        values.append(f"('{store}', 'cr_paged', {record['sequence']}, '{payload}')")
-    run("docker", "exec", "-i", container, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1",
-        input="INSERT INTO cloudroom_records VALUES " + ",".join(values))
+    api.seed("cr_paged", records)
     status = service.session("cr_paged")
     assert status["last_sequence"] == 600 and status["native_id"] == "late-native-identity"
     assert status["state"] == "saved_history_only" and status["receipts"] == {}
@@ -243,22 +235,22 @@ def main():
         raise SystemExit("BLOCKED: run CARGO_BUILD_JOBS=1 cargo build --locked")
     if not Path("/proc/self/stat").is_file():
         raise SystemExit("BLOCKED: these end-to-end checks require Linux /proc; use tests/core_fixture.py for local HTTP checks")
-    for command in ["docker", "git"]:
-        if not shutil.which(command):
-            raise SystemExit("BLOCKED: missing test tool " + command)
-    run("docker", "image", "inspect", "postgres:16-alpine")
+    if not shutil.which("git"):
+        raise SystemExit("BLOCKED: missing test tool git")
     source_home = Path(os.environ.get("CLOUDROOM_TEST_" + args.harness.upper() + "_HOME", str(Path.home() / (".pi/agent" if args.harness == "pi" else ".codex"))))
     if not (args.foundation or args.fixture) and not (source_home / "auth.json").is_file():
         raise SystemExit("BLOCKED: selected harness account has no auth.json")
-    name = "cloudroom-core-e2e-" + secrets.token_hex(6)
-    created, service = False, None
-    evidence = {"kind": "real " + args.harness + " inference + local disposable PostgreSQL", "checks": []}
+    from fake_api import FakeApi
+    name, token = "cloudroom-core-e2e-" + secrets.token_hex(6), secrets.token_hex(32)
+    api, service = FakeApi(token, name), None
+    evidence = {"kind": "real " + args.harness + " inference + fake website API", "checks": []}
     evidence_file = ROOT / "private/core-e2e-last.json"
     def passed(label):
         evidence["checks"].append(label)
         print("PASS:", label, flush=True)
     try:
-        with fixture_root() as root:
+        with fixture_root() as root, ExitStack() as cleanup:
+            cleanup.callback(lambda: service.stop() if service else None)
             repo = root / "repo"
             repo.mkdir()
             run("git", "init", "--quiet", str(repo))
@@ -271,33 +263,21 @@ def main():
                 (codex_home / "settings.json").write_text('{"defaultThinkingLevel":"minimal"}')
             if not (args.foundation or args.fixture):
                 shutil.copy2(source_home / "auth.json", codex_home / "auth.json")
-            password = secrets.token_hex(20)
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                port = str(reservation.getsockname()[1])
-            run("docker", "run", "-d", "--pull=never", "--name", name,
-                "--label", "cloudroom-test=core-first-slice", "--cpus", "0.5", "--memory", "256m",
-                "--pids-limit", "64", "-e", "POSTGRES_PASSWORD=" + password,
-                "-e", "POSTGRES_DB=cloudroom_core_test", "-p", "127.0.0.1:" + port + ":5432", "postgres:16-alpine")
-            created = True
-            assert run("docker", "port", name, "5432/tcp").rsplit(":", 1)[1] == port
-            def db_ready():
-                return subprocess.run(["docker", "exec", name, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "cloudroom_core_test"],
-                                      capture_output=True, timeout=10).returncode == 0
-            until(db_ready, "disposable PostgreSQL", 30)
-            run("docker", "exec", "-i", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test",
-                "-v", "ON_ERROR_STOP=1", input=(MIGRATIONS / "0001-session-records.sql").read_text())
             env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "CLOUDROOM_UNPROTECTED_TEST_MODE": "1", "CLOUDROOM_LISTEN": "127.0.0.1:0",
-                   "CLOUDROOM_TOKEN": secrets.token_hex(32), "CLOUDROOM_STATE_DIR": str(root / "state"),
-                   "CLOUDROOM_REPOSITORY": str(repo), "CLOUDROOM_DATABASE_URL": f"postgres://postgres:{password}@127.0.0.1:{port}/cloudroom_core_test",
-                   "CLOUDROOM_STORE": name, "CLOUDROOM_ALLOW_INSECURE_DATABASE": "1",
-                   "CLOUDROOM_CODEX_BINARY": str(ROOT / "tests/core_fixture.py") if args.fixture else "/usr/local/bin/codex", "CLOUDROOM_ACCOUNT_HOME": str(home),
-                   "CLOUDROOM_CODEX_HOME": str(codex_home), "CLOUDROOM_MODEL": model, "CLOUDROOM_MAX_HARNESSES": "2",
+                   "CLOUDROOM_TOKEN": token, "CLOUDROOM_STATE_DIR": str(root / "state"),
+                   "CLOUDROOM_REPOSITORY": str(repo), **api.env(),
+                   "CLOUDROOM_CODEX_BINARY": str(ROOT / "tests/core_fixture.py") if (args.foundation or args.fixture) else "/usr/local/bin/codex", "CLOUDROOM_ACCOUNT_HOME": str(home),
+                   "CLOUDROOM_CODEX_HOME": str(codex_home), "CLOUDROOM_MODEL": model,
                    "DATABASE_ADMIN_SECRET": "must-not-reach-harness", "BB_CONTROL_SECRET": "must-not-reach-harness"}
             if args.harness == "pi":
                 env.pop("CLOUDROOM_CODEX_BINARY"); env.pop("CLOUDROOM_CODEX_HOME")
                 env.update(CLOUDROOM_HARNESS="pi", CLOUDROOM_PI_BINARY=os.environ.get("CLOUDROOM_TEST_PI_BINARY", "/usr/local/bin/pi"),
                            CLOUDROOM_PI_HOME=str(codex_home), CLOUDROOM_PI_PROVIDER=os.environ.get("CLOUDROOM_TEST_PI_PROVIDER", "openai-codex"))
+            if args.fixture:
+                pi_home = home / ".pi/agent"
+                pi_home.mkdir(parents=True)
+                env.update(CLOUDROOM_PI_BINARY=str(ROOT / "tests/pi_fixture.py"),
+                           CLOUDROOM_PI_HOME=str(pi_home), CLOUDROOM_PI_PROVIDER="default-provider", CLOUDROOM_PI_MODEL="fixture")
             service = Service(env, root / "service.log").start()
             def local_diagnostics():
                 records = []
@@ -309,8 +289,7 @@ def main():
                             pass  # The writer may still be appending the last line; the next read retries it.
                 return records
             def diagnostics():
-                return json.loads(run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
-                                      "SELECT coalesce(json_agg(record), '[]'::json) FROM cloudroom_diagnostics"))
+                return list(api.diagnostics)
             for token, expected in [(None, 401), ("wrong", 401), (True, 200)]:
                 result = service.request("GET", "/v1/health", expected=expected, token=token)
                 if expected == 200:
@@ -320,23 +299,46 @@ def main():
             passed("HTTP auth, client reconnection, and exclusive state ownership")
             if args.fixture:
                 from core_fixture import session_checks
-                evidence["kind"] = "protocol fixtures + local disposable PostgreSQL; no inference"
-                run("docker", "exec", "-i", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1",
-                    input=(MIGRATIONS / "0002-diagnostics.sql").read_text())
+                evidence["kind"] = "protocol fixtures + fake website API; no inference"
                 session_checks(service, root)
-                passed("acceptance wakes quiet SSE; idle/active close, safe retry, capacity release, peer isolation and shutdown")
-                check_database_pagination(service, name, name)
-                passed("bounded database replay with complete late metadata and latest receipts")
+                assert next(h for h in service.request("GET", "/v1/capabilities")["harnesses"] if h["id"] == "pi")["provider_selection"]
+                pi_sessions = []
+                for provider in [None, "other-provider"]:
+                    request = {"request_id": "pi-" + str(provider), "harness": "pi", "model": "family/test-model", "reasoning": "high"}
+                    if provider:
+                        request["provider"] = provider
+                    sid = service.request("POST", "/v1/sessions", request, 202)["session_id"]
+                    until(lambda: service.session(sid)["state"] == "idle", "selected Pi provider")
+                    assert service.session(sid)["provider"] == (provider or "default-provider")
+                    service.request("POST", "/v1/sessions", request, 202)
+                    service.request("POST", "/v1/sessions", {**request, "provider": "changed-provider"}, 409)
+                    pi_sessions.append((sid, provider or "default-provider", service.session(sid)["native_id"]))
+                for harness, provider in [("codex", "other-provider"), ("pi", ""), ("pi", "bad/provider")]:
+                    assert service.request("POST", "/v1/sessions", {"request_id": "invalid-provider", "harness": harness, "provider": provider}, 409)["code"] == "invalid_provider"
+                service.stop()
+                service.env["CLOUDROOM_PI_PROVIDER"] = "changed-default"
+                service.start()
+                for sid, provider, native in pi_sessions:
+                    until(lambda: service.session(sid)["state"] == "idle", "saved Pi provider after restart")
+                    assert service.session(sid)["provider"] == provider and service.session(sid)["native_id"] == native
+                    frames = [json.loads(r["native"]) for r in service.records(sid) if r.get("native") and r["kind"] != "native_record"]
+                    assert any(f.get("command") == "get_state" and f.get("data", {}).get("model", {}).get("provider") == provider for f in frames)
+                    service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "followup", "text": "hello"}, 202)
+                    until(lambda: service.session(sid)["receipts"]["followup"]["state"] == "completed", "Pi provider follow-up")
+                passed("Pi selects providers per session; retries and restart preserve native provider, model and identity")
+                passed("acceptance wakes quiet SSE; idle/active close, safe retry, parallel sessions, peer isolation and shutdown")
+                check_saved_pagination(service, api)
+                passed("bounded saved-history replay with complete late metadata and latest receipts")
                 return
+            api.down = True
             service.request("GET", "/v1/health?secret=never-log-query")
             service.request("GET", "/never-log-path", expected=404)
             service.request("GET", "/v1/health", expected=401, token="never-log-token")
             denied_id = service.diagnostic_id
             until(lambda: any(r["kind"] == "diagnostics" and r["upload_failures"] > 0 for r in local_diagnostics()),
-                  "local diagnostics while monitoring migration is absent", 30)
-            run("docker", "exec", "-i", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1",
-                input=(MIGRATIONS / "0002-diagnostics.sql").read_text())
-            until(lambda: any(f'{r["run_id"]}-{r["sequence"]}' == denied_id for r in diagnostics()), "diagnostic upload after migration", 30)
+                  "local diagnostics while the API is down", 30)
+            api.down = False
+            until(lambda: any(f'{r["run_id"]}-{r["sequence"]}' == denied_id for r in diagnostics()), "diagnostic upload after the API recovers", 30)
             def resource_sample():
                 return next((r for r in diagnostics() if r["kind"] == "resources" and r["cpu_used_percent"] is not None), None)
             resource = until(resource_sample, "real Linux resource measurements", 30)
@@ -344,22 +346,30 @@ def main():
             assert 0 <= resource["memory_used_bytes"] <= resource["memory_total_bytes"]
             assert resource["workspace_disk"]["total_bytes"] > 0 and resource["state_disk"]["available_bytes"] > 0
             diagnostic_text = json.dumps(diagnostics()) + json.dumps(local_diagnostics())
-            assert not any(secret in diagnostic_text for secret in [env["CLOUDROOM_TOKEN"], password, str(repo), "never-log-query", "never-log-path", "never-log-token"])
+            assert not any(secret in diagnostic_text for secret in [env["CLOUDROOM_TOKEN"], str(repo), "never-log-query", "never-log-path", "never-log-token"])
             assert (root / "state/diagnostics.jsonl").stat().st_mode & 0o777 == 0o600
-            run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1", "-c",
-                "CREATE ROLE diagnostics_browser; GRANT USAGE ON SCHEMA public TO diagnostics_browser; GRANT SELECT ON cloudroom_diagnostics TO diagnostics_browser;")
-            assert run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
-                       "SET ROLE diagnostics_browser; SELECT count(*) FROM cloudroom_diagnostics").splitlines()[-1] == "0"
-            passed("local/SQL diagnostics, missing-migration recovery, request correlation, resource measurements, redaction and browser RLS")
-            run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1", "-c",
-                f"INSERT INTO cloudroom_diagnostics VALUES ('{name}', 'retention', 1, 0, '{{\"kind\":\"retention_fixture\"}}'), ('another-owner', 'retention', 1, 0, '{{\"kind\":\"retention_fixture\"}}')")
+            passed("local/API diagnostics, outage recovery, request correlation, resource measurements and redaction")
+            success_ids = set()
+            for route in ["/v1/health", "/v1/capabilities", "/v1/dashboard"]:
+                for _ in range(20):
+                    service.request("GET", route + "?secret=never-log-query")
+                    success_ids.add(service.diagnostic_id)
+            until(lambda: sum(r.get("requests", 0) for r in diagnostics() if r["kind"] == "api_summary") >= 60,
+                  "minute-level API summaries", 75)
+            stored = diagnostics()
+            assert not any(f'{r["run_id"]}-{r["sequence"]}' in success_ids for r in stored)
+            assert success_ids <= {f'{r["run_id"]}-{r["sequence"]}' for r in local_diagnostics()}
+            assert any(f'{r["run_id"]}-{r["sequence"]}' == denied_id for r in stored)
+            assert "never-log-query" not in json.dumps(stored)
+            summaries = [r for r in stored if r["kind"] == "api_summary"]
+            assert len(summaries) <= 6 and all(r["total_duration_ms"] >= r["max_duration_ms"] for r in summaries)
+            summary_count = sum(r["requests"] for r in summaries)
+            service.request("GET", "/v1/health")
             service.stop()
-            service = Service(env, root / "retention.log").start()
-            until(lambda: run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
-                              f"SELECT count(*) FROM cloudroom_diagnostics WHERE store='{name}' AND run_id='retention'") == "0", "seven-day diagnostic retention", 15)
-            assert run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
-                       "SELECT count(*) FROM cloudroom_diagnostics WHERE store='another-owner' AND run_id='retention'") == "1"
-            passed("retention removes only this owner's old diagnostics")
+            assert sum(r.get("requests", 0) for r in diagnostics() if r["kind"] == "api_summary") > summary_count
+            passed("routine API calls become minute summaries; local correlation, errors, redaction and shutdown flush remain")
+            # Diagnostics retention is the website's job now (docs/database/0066).
+            service = Service(env, root / "restarted-foundation.log").start()
             if args.foundation:
                 evidence["kind"] = "foundation only; no Codex inference"
                 return
@@ -426,7 +436,10 @@ def main():
             assert second_harness not in before_second and second_harness in second_children
             assert Path(f"/proc/{second_harness}/stat").read_text().rsplit(")", 1)[1].split()[1] == str(service.process.pid)
             second_identity = second_children[second_harness]
-            service.request("POST", "/v1/sessions", {"request_id": "capacity"}, 409)
+            third = service.request("POST", "/v1/sessions", {"request_id": "third-session"}, 202)["session_id"]
+            until(lambda: service.session(third)["state"] == "idle", "third live session", 45)
+            service.request("POST", f"/v1/sessions/{third}/close", {"request_id": "close-third"}, 202)
+            until(lambda: service.session(third)["state"] == "closed", "third session closed")
             service.request("POST", f"/v1/sessions/{sid2}/prompts", {"request_id": "independent", "text": "Run exactly python3 stop-job.py other in the foreground. Wait for it to finish. Do not edit the script, spawn agents or do any other work."}, 202)
             until(lambda: (repo / "other.ticks").exists(), "second running tool")
             target_pid = (repo / "interrupt.pid").read_text()
@@ -464,10 +477,13 @@ def main():
             assert body["text"] not in json.dumps(diagnostics())
             passed("real harness crash automatically resumes the same native conversation; follow-up succeeds; diagnostics contain no conversation copies")
             service.request("POST", f"/v1/sessions/{sid2}/close", {"request_id": "close-recovered"}, 202)
-            until(lambda: service.session(sid2)["state"] == "closed", "release recovered session capacity")
+            until(lambda: service.session(sid2)["state"] == "closed", "recovered session closed")
             close_id = service.request("POST", "/v1/sessions", {"request_id": "close-idle"}, 202)["session_id"]
             until(lambda: service.session(close_id)["state"] == "idle", "idle close candidate", 45)
-            service.request("POST", "/v1/sessions", {"request_id": "still-full"}, 409)
+            extra = service.request("POST", "/v1/sessions", {"request_id": "alongside-idle"}, 202)["session_id"]
+            until(lambda: service.session(extra)["state"] == "idle", "idle peers do not block starts", 45)
+            service.request("POST", f"/v1/sessions/{extra}/close", {"request_id": "close-extra"}, 202)
+            until(lambda: service.session(extra)["state"] == "closed", "extra session closed")
             close = {"request_id": "close"}
             service.request("POST", f"/v1/sessions/{close_id}/close", close, 202)
             until(lambda: service.session(close_id)["state"] == "closed" and service.session(close_id)["receipts"]["close"]["state"] == "completed", "idle close completion")
@@ -486,11 +502,11 @@ def main():
             time.sleep(.5)
             assert (repo / "closing.ticks").read_text() == close_tick
             assert service.session(sid)["native_id"] == native_id and service.session(sid)["state"] == "idle"
-            passed("real idle/active session close, stable retries, released capacity and tool exit before cleanup")
-            run("docker", "stop", "-t", "5", name)
+            passed("real idle/active session close, stable retries, parallel sessions and tool exit before cleanup")
+            api.down = True
             outage = {"request_id": "outage", "text": "Run this shell command: python3 -c \"from pathlib import Path; import time; p=Path('counter.txt'); p.open('a').write('outage\\n'); Path('outage-started').write_text('ready'); time.sleep(45); Path('after-crash').write_text('bad')\". Wait for it to finish. Do not spawn agents or do other work."}
             service.request("POST", f"/v1/sessions/{sid}/prompts", outage, 202)
-            until(lambda: (repo / "outage-started").exists(), "agent progress during database outage")
+            until(lambda: (repo / "outage-started").exists(), "agent progress during an API outage")
             assert service.request("GET", "/v1/health")["saving"]["pending_records"] > 0
             until(lambda: any(r["kind"] == "history_upload" and not r["success"] and r["pending_records"] > 0 for r in local_diagnostics()),
                   "local failed-upload diagnostics while agents continue", 15)
@@ -513,12 +529,10 @@ def main():
             # The never-dispatched queued prompt runs after resume, exactly once.
             wait_done(service, sid, "queued-follow")
             assert (repo / "counter.txt").read_text() == before + "resumed\n"
-            run("docker", "start", name)
-            assert run("docker", "port", name, "5432/tcp").rsplit(":", 1)[1] == port
-            until(db_ready, "database restart", 30)
+            api.down = False
             until(lambda: service.request("GET", "/v1/health")["saving"]["pending_records"] == 0, "pending upload recovery", 60)
             until(lambda: any(r["kind"] == "history_upload" and r["success"] and r["pending_records"] == 0 for r in diagnostics()), "diagnostic uploads recover")
-            passed("work continues during DB outage; local diagnostics remain available; crash resumes the same native session; queued work survives and runs once; uncertain command is not repeated")
+            passed("work continues during an API outage; local diagnostics remain available; crash resumes the same native session; queued work survives and runs once; uncertain command is not repeated")
             service.stop()
             (root / "state/saved").write_text("0")
             service = Service(env, root / "reupload.log").start()
@@ -530,9 +544,8 @@ def main():
             until(lambda: service.session(sid)["state"] == "closed" and service.session(sid)["receipts"]["close-before-export"]["state"] == "completed", "finished export source")
             until(lambda: service.request("GET", "/v1/health")["saving"]["pending_records"] == 0, "idempotent reupload", 60)
             saved = service.records(sid)
-            count = int(run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc", "SELECT count(*) FROM cloudroom_records WHERE session_id='cr_first'"))
-            assert count == len(saved)
-            passed("replaying already-committed uploads creates no duplicate database records")
+            assert len(api.records("cr_first")) == len(saved)
+            passed("replaying already-committed uploads creates no duplicate saved records")
             shutdown_id = service.request("POST", "/v1/sessions", {"request_id": "shutdown"}, 202)["session_id"]
             until(lambda: service.session(shutdown_id)["state"] == "idle", "shutdown session", 45)
             service.request("POST", f"/v1/sessions/{shutdown_id}/prompts", {"request_id": "job", "text": "Run exactly python3 stop-job.py shutdown in the foreground and wait. Do not edit files, spawn agents, or do other work."}, 202)
@@ -555,18 +568,16 @@ def main():
             assert service.records(sid) == saved
             assert service.request("POST", "/v1/sessions", {"request_id": "first"}, 202)["session_id"] == sid
             assert not (fresh_repo / "counter.txt").exists()
-            passed("database-only history recovery with fresh state, fresh workspace and no native credentials/history")
-            check_database_pagination(service, name, name)
-            passed("bounded database replay with complete late metadata and latest receipts")
+            passed("saved-history-only recovery with fresh state, fresh workspace and no native credentials/history")
+            check_saved_pagination(service, api)
+            passed("bounded saved-history replay with complete late metadata and latest receipts")
             evidence.update(model=model, native_id=native_id, session_id=sid, record_count=len(saved),
                             history_sha256=hashlib.sha256(json.dumps(saved, sort_keys=True).encode()).hexdigest(),
-                            limitation="PostgreSQL is on the same VM. Actual off-VM durability is not verified.")
+                            limitation="The fake API runs in this test. Real R2 and website durability are not verified here.")
     finally:
         if service:
             service.stop()
-        if created:
-            assert run("docker", "inspect", "--format", '{{index .Config.Labels "cloudroom-test"}}', name) == "core-first-slice"
-            run("docker", "rm", "-f", "-v", name)
+        api.close()
         evidence_file.parent.mkdir(exist_ok=True)
         evidence_file.write_text(json.dumps(evidence, indent=2) + "\n")
 
