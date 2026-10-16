@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('preview', Path(__file__).parents[1] / 'src/preview/client.py')
 preview = importlib.util.module_from_spec(spec)
@@ -76,6 +77,31 @@ class PreviewTests(unittest.TestCase):
             connection.request(method, path, body=body, headers={'Host': self.server.authority, **(headers or {})})
             response = connection.getresponse()
             return response.status, response.getheaders(), response.read()
+
+    def test_ask_first_timeout_cannot_grant_write_permission(self):
+        # The AppleScript interpreter is macOS-only. On Linux, assert that
+        # the script explicitly converts a timed-out default "Allow" into
+        # "Deny", then prove the Python permission gate rejects that answer.
+        self.assertIn('if gave up of result then return "Deny"', preview.ASK)
+        jobs = preview.MacJobs(Path(self.directory.name))
+        core = SimpleNamespace(key='timeout-test-core')
+        job = {'id': 'timeout-job', 'command': 'touch /tmp/cloudroom-timeout-fixture'}
+        with patch.object(preview.subprocess, 'Popen') as launch:
+            launch.return_value.communicate.return_value = ('Deny\\n', '')
+            self.assertFalse(jobs.approve(core, job))
+            argv = launch.call_args.args[0]
+            self.assertEqual(argv[:3], ['/usr/bin/osascript', '-e', preview.ASK])
+            self.assertEqual(argv[-1], 'Allow')  # Default is unsafe WITHOUT the timeout guard.
+        self.assertNotIn(job['id'], jobs.running)
+
+    def test_ask_first_allows_only_explicit_allow_answer(self):
+        jobs = preview.MacJobs(Path(self.directory.name))
+        core = SimpleNamespace(key='explicit-consent-test-core')
+        job = {'id': 'explicit-job', 'command': 'touch /tmp/cloudroom-consent-fixture'}
+        with patch.object(preview.subprocess, 'Popen') as launch:
+            launch.return_value.communicate.return_value = ('Allow\\n', '')
+            self.assertTrue(jobs.approve(core, job))
+        self.assertNotIn(job['id'], jobs.running)
 
     def test_browser_path_streaming_upload_and_readiness(self):
         self.assertTrue(preview.Tunnel.healthy(self.tunnel))  # HEAD 405 still proves transport works.
