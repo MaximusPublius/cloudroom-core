@@ -87,7 +87,7 @@ class PreviewTests(unittest.TestCase):
         core = SimpleNamespace(key='timeout-test-core')
         job = {'id': 'timeout-job', 'command': 'touch /tmp/cloudroom-timeout-fixture'}
         with patch.object(preview.subprocess, 'Popen') as launch:
-            launch.return_value.communicate.return_value = ('Deny\\n', '')
+            launch.return_value.communicate.return_value = ('Deny\n', '')
             self.assertFalse(jobs.approve(core, job))
             argv = launch.call_args.args[0]
             self.assertEqual(argv[:3], ['/usr/bin/osascript', '-e', preview.ASK])
@@ -99,7 +99,7 @@ class PreviewTests(unittest.TestCase):
         core = SimpleNamespace(key='explicit-consent-test-core')
         job = {'id': 'explicit-job', 'command': 'touch /tmp/cloudroom-consent-fixture'}
         with patch.object(preview.subprocess, 'Popen') as launch:
-            launch.return_value.communicate.return_value = ('Allow\\n', '')
+            launch.return_value.communicate.return_value = ('Allow\n', '')
             self.assertTrue(jobs.approve(core, job))
         self.assertNotIn(job['id'], jobs.running)
 
