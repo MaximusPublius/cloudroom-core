@@ -68,7 +68,8 @@ async fn save_key(config: &Config, key: &str) -> Result<(), &'static str> {
     save_private(&path, &format!("{key}\n")).map_err(|_| "Could not save the API key.")?;
     if claude::probe(config, "haiku", None).await.is_err() {
         if let Some(previous) = previous {
-            save_private_bytes(&path, &previous).map_err(|_| "Could not restore the previous API key.")?;
+            save_private_bytes(&path, &previous)
+                .map_err(|_| "Could not restore the previous API key.")?;
         } else {
             remove(&path).map_err(|_| "Could not remove the rejected API key.")?;
         }
