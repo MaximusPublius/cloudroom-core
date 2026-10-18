@@ -45,6 +45,19 @@ function sendJson(res: ServerResponse, value: unknown, status = 200) {
   res.end(JSON.stringify(value));
 }
 
+test("accepts the Pi key endpoint's synchronous HTTP 200 response", async (t) => {
+  const service = await fixture((req, res, body) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/v1/accounts/pi/key");
+    assert.deepEqual(body, { provider: "synthetic", key: "synthetic-key" });
+    sendJson(res, { providers: ["synthetic"] });
+  });
+  t.after(() => service.close());
+  assert.deepEqual(await service.client.piApiKey("synthetic", "synthetic-key"), {
+    providers: ["synthetic"],
+  });
+});
+
 test("routes Cursor account operations and rejects off-domain login links", async (t) => {
   let url = "https://cursor.com/loginDeepControl?challenge=fixture";
   const bodies: Record<string, unknown>[] = [];

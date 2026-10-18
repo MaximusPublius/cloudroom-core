@@ -418,6 +418,7 @@ export class CloudroomClient {
     body?: Json,
     signal?: AbortSignal,
     upload?: Upload,
+    acceptedStatus = 202,
     timeoutMs = this.#timeoutMs,
   ): Promise<Record<string, unknown>> {
     const timeout = AbortSignal.timeout(timeoutMs);
@@ -427,7 +428,7 @@ export class CloudroomClient {
       signal ? AbortSignal.any([signal, timeout]) : timeout,
       upload,
     );
-    if ((body !== undefined || upload) && response.status !== 202) {
+    if ((body !== undefined || upload) && response.status !== acceptedStatus) {
       await response.body?.cancel();
       throw new CloudroomError(
         "Cloudroom did not acknowledge command acceptance",
@@ -520,7 +521,7 @@ export class CloudroomClient {
   }
 
   async claudeAuth(action?: "login" | "cancel" | "complete" | "token" | "key", id?: string, code?: string, state?: string, signal?: AbortSignal): Promise<CodexAuthStatus> {
-    const value = await this.#json(`/v1/accounts/claude${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "complete" ? { code, state } : {}), ...(action === "token" ? { token: code, ...(state ? { plan: state } : {}) } : {}), ...(action === "key" ? { api_key: code } : {}) } : undefined, signal, undefined, action === "key" ? 60_000 : undefined);
+    const value = await this.#json(`/v1/accounts/claude${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "complete" ? { code, state } : {}), ...(action === "token" ? { token: code, ...(state ? { plan: state } : {}) } : {}), ...(action === "key" ? { api_key: code } : {}) } : undefined, signal, undefined, 202, action === "key" ? 60_000 : undefined);
     if (!["missing", "waiting", "connected", "unavailable", "error", "expired"].includes(String(value.state))) throw new CloudroomError("Invalid Claude account status");
     const nullable = (key: string) => value[key] === null ? null : text(value[key]);
     const result = { state: value.state as CodexAuthStatus["state"], email: nullable("email"), plan: nullable("plan"), message: nullable("message"), login_id: nullable("login_id"), verification_url: nullable("verification_url"), user_code: nullable("user_code") };
@@ -533,7 +534,7 @@ export class CloudroomClient {
 
   /** Saves one Pi provider key on the VM. Returns provider names only, never secrets. */
   async piApiKey(provider: string, key: string, signal?: AbortSignal): Promise<{ providers: string[] }> {
-    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal);
+    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal, undefined, 200);
     if (!Array.isArray(value.providers) || !value.providers.every(name => typeof name === "string")) throw new CloudroomError("Invalid Pi account status");
     return { providers: value.providers };
   }
