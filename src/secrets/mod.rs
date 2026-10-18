@@ -386,7 +386,11 @@ fn check_file(content: &str, names: &[String]) -> io::Result<()> {
 }
 
 fn encode(value: &str) -> io::Result<String> {
-    if !value.contains('\'') {
+    if value.contains(['\n', '\r']) {
+        Err(io::Error::other(
+            "A secret value cannot contain line separators",
+        ))
+    } else if !value.contains('\'') {
         Ok(format!("'{value}'"))
     } else if !value.contains('"')
         && !value.contains('\\')
@@ -489,6 +493,30 @@ mod encoding_tests {
             assert!(encode(value).is_err());
             let values = BTreeMap::from([("KEY".into(), value.into())]);
             assert!(reconcile("KEY='old'\n", &["KEY".into()], &values).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_line_separators_for_added_and_updated_assignments() {
+        for value in ["first\nsecond", "first\rsecond", "it's\nmultiline"] {
+            assert!(encode(value).is_err());
+            let values = BTreeMap::from([("KEY".into(), value.into())]);
+            assert!(reconcile("", &["KEY".into()], &values).is_err());
+            assert!(reconcile("KEY='old'\n", &["KEY".into()], &values).is_err());
+        }
+    }
+
+    #[test]
+    fn encoded_assignments_are_safe_to_reconcile_again() {
+        for value in ["plain", "it's safe", "abc\\", "$HOME", "double\"quote"] {
+            let values = BTreeMap::from([("KEY".into(), value.into())]);
+            for content in ["", "KEY='old'\n"] {
+                let (first, _, _, _) = reconcile(content, &["KEY".into()], &values).unwrap();
+                let (second, added, updated, unchanged) =
+                    reconcile(&first, &["KEY".into()], &values).unwrap();
+                assert_eq!(second, first);
+                assert_eq!((added, updated, unchanged), (0, 0, 1));
+            }
         }
     }
 
