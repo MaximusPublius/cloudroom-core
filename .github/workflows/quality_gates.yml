@@ -79,6 +79,13 @@ jobs:
           cargo build --locked
           cargo build --locked --release
 
+      - name: Disposable disk-safety and attachment checks
+        run: |
+          docker pull postgres:16-alpine
+          sudo useradd --system --user-group --no-create-home cr-service-test
+          sudo useradd --system --user-group --no-create-home cr-disk-test
+          sudo python3 tests/storage_e2e.py --disposable --mixed
+
       - name: Client and fixture tests
         run: |
           python3 tests/preview_client.py
@@ -88,3 +95,11 @@ jobs:
           python3 tests/pi_http.py
           python3 tests/workspaces.py
           python3 tests/sync_e2e.py
+
+      - name: Disposable SSH preview checks
+        run: sudo python3 tests/previews_ssh.py --disposable
+
+      - name: Disposable PostgreSQL checks
+        run: |
+          python3 tests/core_e2e.py --foundation
+          python3 tests/core_e2e.py --fixture
