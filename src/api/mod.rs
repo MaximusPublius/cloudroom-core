@@ -626,7 +626,7 @@ async fn attach(
         .workspaces
         .attach(
             &workspace,
-            workspace::AttachmentSpec {
+            crate::workspace::AttachmentSpec {
                 session_id: &id,
                 request_id: &query.request_id,
                 name: &query.name,
