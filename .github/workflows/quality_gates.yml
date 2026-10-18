@@ -54,7 +54,13 @@ jobs:
         run: |
           test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
           test -z "$(git ls-files | awk '/^\.\.\// || /^\// { print }')"
-          test -z "$(git ls-files -s | awk '$1 == 120000 { print $4 }')"
+          while read -r link; do
+            target="$(realpath -m "$link")"
+            case "$target" in
+              "$GITHUB_WORKSPACE"/*) ;;
+              *) printf 'symlink escapes repository: %s -> %s\n' "$link" "$target" >&2; exit 1 ;;
+            esac
+          done < <(git ls-files -s | awk '$1 == 120000 { print $4 }')
 
       - name: Dependency policy and audit
         run: |
