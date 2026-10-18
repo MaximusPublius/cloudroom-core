@@ -190,9 +190,10 @@ fn validate(manifest: &Manifest) -> Result<()> {
 
 /// A closed session gave its conversation back (Teleport to Local).
 fn native_in_use(local: &super::Local, native_id: &str) -> bool {
-    local.sessions.values().any(|s| {
-        s.native_id.as_deref() == Some(native_id) && s.state != "closed"
-    })
+    local
+        .sessions
+        .values()
+        .any(|s| s.native_id.as_deref() == Some(native_id) && s.state != "closed")
 }
 
 impl Manager {
