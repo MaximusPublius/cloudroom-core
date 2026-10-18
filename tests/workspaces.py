@@ -184,6 +184,10 @@ class WorkspaceTests(unittest.TestCase):
             slow.endheaders()
             slow.send(b'A'*1024**2)
             time.sleep(.2)
+            blocked_collision = self.service.request('POST',f'/v1/sessions/cr_{kind}/prompts',
+                {'request_id':'slow','text':'must not claim the upload request'},409)
+            self.assertEqual(blocked_collision['code'],'request_conflict')
+            self.assertEqual(blocked_collision['error'],'request_id is reserved by an attachment upload')
             blocked_close = self.service.request('POST',f'/v1/sessions/cr_{kind}/close',
                 {'request_id':'close-during-upload'},409)
             self.assertEqual(blocked_close['error'],'wait for the pending attachment upload')

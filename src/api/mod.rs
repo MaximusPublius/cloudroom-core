@@ -155,6 +155,7 @@ impl IntoResponse for session::Error {
                 "attachment_too_large"
             }
             "request_id already has different content"
+            | "request_id is reserved by an attachment upload"
             | "session already exists"
             | "saved session has no matching receipt" => "request_conflict",
             "agent setup is incomplete" | "harness is not configured" => "harness_not_configured",

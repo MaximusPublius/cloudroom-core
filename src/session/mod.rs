@@ -110,7 +110,7 @@ pub struct Session {
     #[serde(skip)]
     close_request: Option<String>,
     // Fresh uploads reserve the session before consuming their request bodies.
-    // This prevents a lifecycle command from making the eventual file orphaned.
+    // This prevents another command from claiming the request while bytes are in flight.
     #[serde(skip)]
     attachment_writes: BTreeMap<String, (String, String, usize)>,
     // Last harness pid, so a later instance can reconcile ownership before resuming.
@@ -1291,6 +1291,11 @@ impl Manager {
             }
             if self.is_stopping() {
                 return Err(Error::Conflict("service is stopping"));
+            }
+            if command != "attach" && session.attachment_writes.contains_key(&request) {
+                return Err(Error::Conflict(
+                    "request_id is reserved by an attachment upload",
+                ));
             }
             if matches!(command, "close" | "rewind" | "interrupt" | "stop")
                 && !session.attachment_writes.is_empty()
