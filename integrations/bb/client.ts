@@ -424,6 +424,7 @@ export class CloudroomClient {
     signal?: AbortSignal,
     upload?: Upload,
     timeoutMs = this.#timeoutMs,
+    expectedPostStatus = 202,
   ): Promise<Record<string, unknown>> {
     const timeout = AbortSignal.timeout(timeoutMs);
     const response = await this.#request(
@@ -432,7 +433,7 @@ export class CloudroomClient {
       signal ? AbortSignal.any([signal, timeout]) : timeout,
       upload,
     );
-    if ((body !== undefined || upload) && response.status !== 202) {
+    if ((body !== undefined || upload) && response.status !== expectedPostStatus) {
       await response.body?.cancel();
       throw new CloudroomError(
         "Cloudroom did not acknowledge command acceptance",
@@ -480,6 +481,7 @@ export class CloudroomClient {
     command: string,
     body: { request_id: string } & Record<string, Json>,
     sessionId?: string,
+    receiptRequestId = body.request_id,
   ): Promise<Acceptance> {
     requestId(body.request_id);
     const value = await this.#json(path, body);
@@ -490,7 +492,7 @@ export class CloudroomClient {
     };
     if (
       (sessionId !== undefined && accepted.session_id !== sessionId) ||
-      accepted.receipt.request_id !== body.request_id ||
+      accepted.receipt.request_id !== receiptRequestId ||
       accepted.receipt.command !== command
     ) {
       throw new CloudroomError(
@@ -538,7 +540,7 @@ export class CloudroomClient {
 
   /** Saves one Pi provider key on the VM. Returns provider names only, never secrets. */
   async piApiKey(provider: string, key: string, signal?: AbortSignal): Promise<{ providers: string[] }> {
-    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal);
+    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal, undefined, this.#timeoutMs, 200);
     if (!Array.isArray(value.providers) || !value.providers.every(name => typeof name === "string")) throw new CloudroomError("Invalid Pi account status");
     return { providers: value.providers };
   }
@@ -579,7 +581,11 @@ export class CloudroomClient {
   start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; prompt?: string; title?: string; fork?: { session: string; before?: string; last_turn_id?: string } } = {}) {
     if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx" && harness !== "opencode" && harness !== "hermes" && harness !== "devin")
       throw new CloudroomError("Unsupported Cloudroom harness");
-    return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
+    return this.#command(
+      "/v1/sessions", "start", { request_id: id, harness, ...options },
+      options.parent_session === undefined ? undefined : `cr_child_${id}`,
+      options.parent_session === undefined ? id : `child_${id}`,
+    );
   }
 
   prompt(

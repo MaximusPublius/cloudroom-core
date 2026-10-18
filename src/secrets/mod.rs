@@ -386,9 +386,17 @@ fn check_file(content: &str, names: &[String]) -> io::Result<()> {
 }
 
 fn encode(value: &str) -> io::Result<String> {
-    if !value.contains('\'') {
+    if value.contains(['\n', '\r']) {
+        Err(io::Error::other(
+            "A secret value cannot contain line separators",
+        ))
+    } else if !value.contains('\'') {
         Ok(format!("'{value}'"))
-    } else if !value.contains('"') && !value.contains("\\n") && !value.contains("\\r") {
+    } else if !value.contains('"')
+        && !value.contains('\\')
+        && !value.contains('$')
+        && !value.contains('`')
+    {
         Ok(format!("\"{value}\""))
     } else if value == value.trim()
         && !value.contains('#')
@@ -466,4 +474,57 @@ fn reconcile(
         joined.push_str(ending);
     }
     Ok((joined, added, updated, unchanged))
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_ambiguous_double_quoted_values_before_reconciliation() {
+        for value in [
+            "abc'\\",
+            "abc'\\t",
+            "abc'\\n",
+            "abc'$HOME",
+            "abc'`id`",
+            "both'\"quotes",
+        ] {
+            assert!(encode(value).is_err());
+            let values = BTreeMap::from([("KEY".into(), value.into())]);
+            assert!(reconcile("KEY='old'\n", &["KEY".into()], &values).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_line_separators_for_added_and_updated_assignments() {
+        for value in ["first\nsecond", "first\rsecond", "it's\nmultiline"] {
+            assert!(encode(value).is_err());
+            let values = BTreeMap::from([("KEY".into(), value.into())]);
+            assert!(reconcile("", &["KEY".into()], &values).is_err());
+            assert!(reconcile("KEY='old'\n", &["KEY".into()], &values).is_err());
+        }
+    }
+
+    #[test]
+    fn encoded_assignments_are_safe_to_reconcile_again() {
+        for value in ["plain", "it's safe", "abc\\", "$HOME", "double\"quote"] {
+            let values = BTreeMap::from([("KEY".into(), value.into())]);
+            for content in ["", "KEY='old'\n"] {
+                let (first, _, _, _) = reconcile(content, &["KEY".into()], &values).unwrap();
+                let (second, added, updated, unchanged) =
+                    reconcile(&first, &["KEY".into()], &values).unwrap();
+                assert_eq!(second, first);
+                assert_eq!((added, updated, unchanged), (0, 0, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_literal_single_quoted_values_and_safe_apostrophes() {
+        for value in ["abc\\", "abc\\t", "$HOME", "`id`", "double\"quote"] {
+            assert_eq!(encode(value).unwrap(), format!("'{value}'"));
+        }
+        assert_eq!(encode("it's safe").unwrap(), "\"it's safe\"");
+    }
 }
