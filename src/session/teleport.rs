@@ -133,6 +133,13 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 fn validate(manifest: &Manifest) -> Result<()> {
     if !valid_id(&manifest.request_id)
         || !valid_id(&manifest.native_id)
@@ -166,10 +173,9 @@ fn validate(manifest: &Manifest) -> Result<()> {
                 "native" | "context" | "project" | "attachment"
             )
             || entry.size > 4 * 1024 * 1024 * 1024
-            || (!(entry.sha256.is_empty()
-                && matches!(entry.kind.as_str(), "project" | "attachment"))
-                && (entry.sha256.len() != 64
-                    || !entry.sha256.bytes().all(|c| c.is_ascii_hexdigit())))
+            || !(valid_sha256(&entry.sha256)
+                || entry.sha256.is_empty()
+                    && matches!(entry.kind.as_str(), "project" | "attachment"))
             || entry
                 .origin
                 .as_ref()
@@ -487,8 +493,7 @@ impl Manager {
             .get(index)
             .ok_or(Error::NotFound)?
             .clone();
-        if sha256.len() != 64
-            || !sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        if !valid_sha256(&sha256)
             || (!entry.sha256.is_empty() && entry.sha256 != sha256)
             || transfer
                 .digests
@@ -831,5 +836,35 @@ impl Manager {
         }
         self.teleport_files_ready(&transfer)?;
         self.transfer_view(&transfer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_uppercase_manifest_checksums() {
+        assert!(valid_sha256(&"a".repeat(64)));
+        assert!(!valid_sha256(&"A".repeat(64)));
+        let manifest: Manifest = serde_json::from_value(json!({
+            "request_id":"transfer",
+            "harness":"codex",
+            "native_id":"native",
+            "model":"model",
+            "provider":null,
+            "reasoning":null,
+            "service_tier":null,
+            "command_guard_enabled":null,
+            "workspace":"workspace",
+            "workspace_name":"workspace",
+            "files":[{"path":"history.jsonl","size":1,"sha256":"A".repeat(64),"kind":"native","executable":false,"symlink":false,"origin":null}],
+            "handoff":"continue",
+            "queued":[]
+        })).unwrap();
+        assert!(matches!(
+            validate(&manifest),
+            Err(Error::Conflict("invalid teleport file"))
+        ));
     }
 }

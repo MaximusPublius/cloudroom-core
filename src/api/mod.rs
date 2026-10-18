@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{convert::Infallible, sync::Arc, time::Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -1020,8 +1021,17 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
+    let bytes = axum::body::to_bytes(body, 26 * 1024 * 1024)
+        .await
+        .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
     if let Some(receipt) = manager.receipt(&id, &query.request_id) {
-        if receipt.command != "attach" {
+        if receipt.command != "attach"
+            || receipt.input["name"] != query.name
+            || receipt.input["kind"] != query.kind
+            || receipt.input["size"] != bytes.len()
+            || receipt.input["sha256"] != sha256
+        {
             return Err(session::Error::Conflict(
                 "request_id already has different content",
             ));
@@ -1052,7 +1062,7 @@ async fn attach(
             &query.request_id,
             &query.name,
             &query.kind,
-            body,
+            Body::from(bytes),
             &manager.storage,
         )
         .await
@@ -1073,6 +1083,8 @@ async fn attach(
                 _ => "attachment upload failed",
             })
         })?;
+    let mut written = written;
+    written["sha256"] = json!(sha256);
     let receipt = manager.command(&id, query.request_id, "attach", written)?;
     Ok(accepted(&manager, &id, receipt))
 }

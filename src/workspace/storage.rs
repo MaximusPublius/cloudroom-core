@@ -490,10 +490,10 @@ pub fn clean_npm_cache(root: &Path, groups: &Path) -> io::Result<usize> {
                         a_name(&b)?,
                         leaf.file_name().to_string_lossy()
                     );
-                    if !digest
+                    if digest
                         .split_whitespace()
                         .next()
-                        .is_some_and(|d| d == expected)
+                        .is_none_or(|d| d != expected)
                     {
                         continue;
                     }

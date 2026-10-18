@@ -118,6 +118,10 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(uploaded['size'],len(payload))
             self.assertEqual(dest.stat().st_mode & 0o777,0o600)
             self.assertEqual(upload(kind,'note','note.txt',payload)['receipt']['input'],uploaded)
+            self.assertEqual(upload(kind,'note','other.txt',payload,expected=409)['code'],'request_conflict')
+            self.assertEqual(upload(kind,'note','note.txt',payload,'image',409)['code'],'request_conflict')
+            self.assertEqual(upload(kind,'note','note.txt',payload+b'changed',expected=409)['code'],'request_conflict')
+            self.assertEqual(dest.read_bytes(),payload)
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')

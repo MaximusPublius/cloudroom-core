@@ -40,7 +40,7 @@ export type Receipt = {
   input: Json;
   model?: string;
   provider?: string;
-  error?: string;
+  error?: string | null;
 };
 export type Acceptance = { session_id: string; receipt: Receipt; saving: Json };
 export type SessionRecord = {
@@ -216,6 +216,7 @@ function receipt(value: unknown): Receipt {
     input: json(item.input),
     ...(item.model === undefined ? {} : { model: text(item.model) }),
     ...(item.provider === undefined ? {} : { provider: text(item.provider) }),
+    ...(item.error === undefined ? {} : { error: item.error === null ? null : text(item.error) }),
   };
 }
 
@@ -400,6 +401,7 @@ export class CloudroomClient {
     signal?: AbortSignal,
     upload?: Upload,
     timeoutMs = this.#timeoutMs,
+    successStatus?: number,
   ): Promise<Record<string, unknown>> {
     const timeout = AbortSignal.timeout(timeoutMs);
     const response = await this.#request(
@@ -408,7 +410,7 @@ export class CloudroomClient {
       signal ? AbortSignal.any([signal, timeout]) : timeout,
       upload,
     );
-    if ((body !== undefined || upload) && response.status !== 202) {
+    if (response.status !== (successStatus ?? 202) && (successStatus !== undefined || body !== undefined || upload)) {
       await response.body?.cancel();
       throw new CloudroomError(
         "Cloudroom did not acknowledge command acceptance",
@@ -514,7 +516,7 @@ export class CloudroomClient {
 
   /** Saves one Pi provider key on the VM. Returns provider names only, never secrets. */
   async piApiKey(provider: string, key: string, signal?: AbortSignal): Promise<{ providers: string[] }> {
-    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal);
+    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal, undefined, this.#timeoutMs, 200);
     if (!Array.isArray(value.providers) || !value.providers.every(name => typeof name === "string")) throw new CloudroomError("Invalid Pi account status");
     return { providers: value.providers };
   }

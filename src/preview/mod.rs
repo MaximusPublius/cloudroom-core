@@ -395,10 +395,10 @@ impl Previews {
     pub fn report(&self, input: Report) -> Result<Value> {
         let saved = self.saved.lock().unwrap();
         if !saved.devices.contains_key(&input.device)
-            || !saved
+            || saved
                 .previews
                 .get(&input.port)
-                .is_some_and(|p| p.generation == input.generation)
+                .is_none_or(|p| p.generation != input.generation)
         {
             return Err(conflict(
                 "Preview or device changed; refresh before reporting",

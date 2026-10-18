@@ -137,6 +137,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tokio-stream",
