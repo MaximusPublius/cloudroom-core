@@ -282,13 +282,16 @@ impl Workspaces {
     pub async fn attach(
         &self,
         workspace: &Workspace,
-        session_id: &str,
-        request_id: &str,
-        name: &str,
-        kind: &str,
+        spec: AttachmentSpec<'_>,
         body: Body,
         guard: &storage::Guard,
     ) -> io::Result<serde_json::Value> {
+        let AttachmentSpec {
+            session_id,
+            request_id,
+            name,
+            kind,
+        } = spec;
         if guard.blocks() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -359,6 +362,13 @@ impl Workspaces {
         Ok(serde_json::json!({"id":request_id,"name":name,"kind":kind,
             "path":workspace.path.join(relative),"size":result["size"]}))
     }
+}
+
+pub struct AttachmentSpec<'a> {
+    pub session_id: &'a str,
+    pub request_id: &'a str,
+    pub name: &'a str,
+    pub kind: &'a str,
 }
 
 fn file_result(output: std::process::Output) -> io::Result<serde_json::Value> {

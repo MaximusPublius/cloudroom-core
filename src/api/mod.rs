@@ -596,18 +596,17 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
-    if let Some(receipt) = manager.receipt(&id, &query.request_id) {
-        if receipt.command != "attach"
+    if let Some(receipt) = manager.receipt(&id, &query.request_id)
+        && (receipt.command != "attach"
             || receipt.input["name"].as_str() != Some(query.name.as_str())
-            || receipt.input["kind"].as_str() != Some(query.kind.as_str())
-        {
-            return Err(session::Error::Conflict(
-                "request_id already has different content",
-            ));
-        }
-        // Continue through storage so an exact retry verifies the submitted bytes
-        // against the already-saved attachment before returning the old receipt.
+            || receipt.input["kind"].as_str() != Some(query.kind.as_str()))
+    {
+        return Err(session::Error::Conflict(
+            "request_id already has different content",
+        ));
     }
+    // Continue through storage so an exact retry verifies the submitted bytes
+    // against the already-saved attachment before returning the old receipt.
     let session = manager.session(&id).await?;
     let workspace = session
         .workspace
@@ -627,10 +626,12 @@ async fn attach(
         .workspaces
         .attach(
             &workspace,
-            &id,
-            &query.request_id,
-            &query.name,
-            &query.kind,
+            workspace::AttachmentSpec {
+                session_id: &id,
+                request_id: &query.request_id,
+                name: &query.name,
+                kind: &query.kind,
+            },
             body,
             &manager.storage,
         )

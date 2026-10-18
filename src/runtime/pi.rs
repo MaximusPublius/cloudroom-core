@@ -541,8 +541,9 @@ impl Adapter for Protocol {
             let id = data["sessionId"]
                 .as_str()
                 .ok_or_else(|| io::Error::other("missing Pi identity"))?;
-            if self.expected.as_deref().is_some_and(|old| old != id) && !self.forking
-                || !self.forking && data["sessionFile"].as_str() != self.capture.path.to_str()
+            if (self.expected.as_deref().is_some_and(|old| old != id)
+                || data["sessionFile"].as_str() != self.capture.path.to_str())
+                && !self.forking
             {
                 return Err(io::Error::other("Pi identity changed"));
             }
