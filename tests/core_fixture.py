@@ -822,6 +822,14 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(self.status()["rewind_request"])
         self.assertEqual(self.status()["receipts"]["rewind"]["state"],"unknown_after_restart")
 
+    def test_live_unknown_rewind_receipt_clears_pending_guard(self):
+        rewind = {"request_id":"rewind","command":"rewind","input":{"before":"turn"},"state":"accepted"}
+        terminal = {**rewind,"state":"unknown"}
+        self.seed([("receipt",rewind),("state",{"state":"rewinding"}),("receipt",terminal)])
+        self.start()
+        self.assertIsNone(self.status()["rewind_request"])
+        self.assertEqual(self.status()["receipts"]["rewind"]["state"],"unknown")
+
     def test_reused_pid_never_kills_unrelated_process(self):
         sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", self.env["CLOUDROOM_CODEX_BINARY"]],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

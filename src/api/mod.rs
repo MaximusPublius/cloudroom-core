@@ -624,7 +624,8 @@ async fn attach(
             "storage unsafe; uploads are blocked",
         ));
     }
-    manager.check_attachment_write(&id, &query.request_id)?;
+    let reserved =
+        manager.begin_attachment_write(&id, &query.request_id, &query.name, &query.kind)?;
     let written = manager
         .workspaces
         .attach(
@@ -640,6 +641,9 @@ async fn attach(
         )
         .await
         .map_err(|error| {
+            if reserved {
+                manager.cancel_attachment_write(&id, &query.request_id);
+            }
             eprintln!(
                 "attachment upload failed: session={id} request={} kind={:?} errno={:?}",
                 query.request_id,
@@ -657,7 +661,7 @@ async fn attach(
                 _ => "attachment upload failed",
             })
         })?;
-    let receipt = manager.command(&id, query.request_id, "attach", written)?;
+    let receipt = manager.finish_attachment_write(&id, query.request_id, written, reserved)?;
     Ok(accepted(&manager, &id, receipt))
 }
 async fn interrupt(

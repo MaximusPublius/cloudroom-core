@@ -109,6 +109,10 @@ pub struct Session {
     recovery_attempted: bool,
     #[serde(skip)]
     close_request: Option<String>,
+    // Fresh uploads reserve the session before consuming their request bodies.
+    // This prevents a lifecycle command from making the eventual file orphaned.
+    #[serde(skip)]
+    attachment_writes: BTreeMap<String, (String, String, usize)>,
     // Last harness pid, so a later instance can reconcile ownership before resuming.
     #[serde(skip)]
     harness_pid: Option<u32>,
@@ -343,7 +347,11 @@ impl Local {
                         session.state = "rewinding".into();
                     } else if matches!(
                         receipt.state.as_str(),
-                        "completed" | "interrupted" | "failed" | "unknown_after_restart"
+                        "completed"
+                            | "interrupted"
+                            | "failed"
+                            | "unknown"
+                            | "unknown_after_restart"
                     ) && session.rewind_request.as_deref() == Some(&receipt.request_id)
                     {
                         session.rewind_request = None;
@@ -1176,17 +1184,29 @@ impl Manager {
             .cloned()
     }
 
-    /// Reject fresh attachment writes before any bytes reach the workspace.
-    /// Exact retries remain eligible so storage can compare their submitted bytes.
-    pub fn check_attachment_write(&self, id: &str, request: &str) -> Result<()> {
-        let local = self.local.lock().unwrap();
-        let session = local.sessions.get(id).ok_or(Error::NotFound)?;
-        if session.receipts.contains_key(request) {
-            return Ok(());
+    /// Reserve a fresh attachment write before any bytes reach the workspace.
+    /// Exact completed retries need no reservation because they cannot orphan a new file.
+    pub fn begin_attachment_write(
+        &self,
+        id: &str,
+        request: &str,
+        name: &str,
+        kind: &str,
+    ) -> Result<bool> {
+        let mut local = self.local.lock().unwrap();
+        if local
+            .sessions
+            .get(id)
+            .ok_or(Error::NotFound)?
+            .receipts
+            .contains_key(request)
+        {
+            return Ok(false);
         }
         if !local.journal.writable() {
             return Err(Error::Storage);
         }
+        let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
         if self.is_stopping() {
             return Err(Error::Conflict("service is stopping"));
         }
@@ -1201,7 +1221,46 @@ impl Manager {
                 "process unavailable; history does not restore execution",
             ));
         }
-        Ok(())
+        match session.attachment_writes.entry(request.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((name.to_owned(), kind.to_owned(), 1));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (reserved_name, reserved_kind, count) = entry.get_mut();
+                if reserved_name != name || reserved_kind != kind {
+                    return Err(Error::Conflict("request_id already has different content"));
+                }
+                *count += 1;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn cancel_attachment_write(&self, id: &str, request: &str) {
+        let mut local = self.local.lock().unwrap();
+        let Some(session) = local.sessions.get_mut(id) else {
+            return;
+        };
+        if let Some((_, _, count)) = session.attachment_writes.get_mut(request) {
+            *count -= 1;
+            if *count == 0 {
+                session.attachment_writes.remove(request);
+            }
+        }
+    }
+
+    pub fn finish_attachment_write(
+        self: &Arc<Self>,
+        id: &str,
+        request: String,
+        input: Value,
+        reserved: bool,
+    ) -> Result<Receipt> {
+        let result = self.command(id, request.clone(), "attach", input);
+        if reserved {
+            self.cancel_attachment_write(id, &request);
+        }
+        result
     }
 
     pub fn command(
@@ -1232,6 +1291,11 @@ impl Manager {
             }
             if self.is_stopping() {
                 return Err(Error::Conflict("service is stopping"));
+            }
+            if matches!(command, "close" | "rewind" | "interrupt" | "stop")
+                && !session.attachment_writes.is_empty()
+            {
+                return Err(Error::Conflict("wait for the pending attachment upload"));
             }
             if session.rewind_request.is_some() {
                 return Err(Error::Conflict("wait for the pending rewind"));

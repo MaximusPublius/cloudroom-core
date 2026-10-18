@@ -176,6 +176,23 @@ class WorkspaceTests(unittest.TestCase):
                 {'request_id':'read','text':'read attachment','attachments':[uploaded]},202)
             until(lambda:self.service.session('cr_'+kind)['receipts']['read']['state']=='completed','attachment prompt',10)
 
+            slow = http.client.HTTPConnection(self.service.address, timeout=10)
+            slow.putrequest('POST',f'/v1/sessions/cr_{kind}/attachments?request_id=slow&name=slow.bin&kind=file')
+            slow.putheader('Authorization','Bearer '+self.env['CLOUDROOM_TOKEN'])
+            slow.putheader('Content-Type','application/octet-stream')
+            slow.putheader('Content-Length',str(2*1024**2))
+            slow.endheaders()
+            slow.send(b'A'*1024**2)
+            time.sleep(.2)
+            blocked_close = self.service.request('POST',f'/v1/sessions/cr_{kind}/close',
+                {'request_id':'close-during-upload'},409)
+            self.assertEqual(blocked_close['error'],'wait for the pending attachment upload')
+            slow.send(b'B'*1024**2)
+            slow_response = slow.getresponse()
+            slow_upload = json.loads(slow_response.read()); slow.close()
+            self.assertEqual(slow_response.status,202,slow_upload)
+            self.assertEqual(Path(slow_upload['receipt']['input']['path']).read_bytes(),b'A'*1024**2+b'B'*1024**2)
+
             self.service.request('POST',f'/v1/sessions/cr_{kind}/close', {'request_id':'close-before-upload'},202)
             until(lambda:self.service.session('cr_'+kind)['state']=='closed','closed attachment target',10)
             rejected = upload(kind,'after-close','orphan.txt',b'must not persist',expected=409)
