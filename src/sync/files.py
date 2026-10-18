@@ -175,6 +175,15 @@ class Tree:
                     info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                     if not stat.S_ISREG(info.st_mode):
                         raise ValueError('attachment must be a regular file')
+                    if info.st_size != entry['size']:
+                        raise AttachmentConflict('attachment retry changed content')
+                    with os.fdopen(os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as candidate, \
+                            os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as winner:
+                        while chunk := candidate.read(CHUNK):
+                            if winner.read(len(chunk)) != chunk:
+                                raise AttachmentConflict('attachment retry changed content')
+                        if winner.read(1):
+                            raise AttachmentConflict('attachment retry changed content')
                     return {'size': info.st_size}
                 os.fsync(fd)
                 return {'size': entry['size']}

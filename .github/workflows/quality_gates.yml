@@ -1,0 +1,67 @@
+name: Quality Gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gates:
+    name: Typecheck, test, build, lint, format, audit, and policy checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.89
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.89.0
+
+      - name: Typecheck
+        run: cargo check --locked --all-targets
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked --all-targets
+
+      - name: Prepare disposable PostgreSQL fixture
+        run: docker pull postgres:16-alpine
+
+      - name: Workspace and recovery tests
+        run: |
+          python3 tests/core_fixture.py
+          python3 tests/workspaces.py
+          python3 tests/sync_e2e.py
+
+      - name: Production build
+        run: cargo build --locked --release
+
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --locked --version 0.21.2
+          cargo audit
+
+      - name: Repository boundaries and dependency policy
+        run: |
+          test "$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["packages"]))')" = 1
+          test "$(find . -mindepth 2 -name Cargo.toml -not -path './target/*' -print -quit)" = ""
+          cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

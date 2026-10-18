@@ -337,9 +337,20 @@ impl Local {
                         );
                     session.compact_request = (!terminal).then(|| receipt.request_id.clone());
                 }
-                if receipt.command == "rewind" && receipt.state == "accepted" {
-                    session.rewind_request = Some(receipt.request_id.clone());
-                    session.state = "rewinding".into();
+                if receipt.command == "rewind" {
+                    if receipt.state == "accepted" {
+                        session.rewind_request = Some(receipt.request_id.clone());
+                        session.state = "rewinding".into();
+                    } else if matches!(
+                        receipt.state.as_str(),
+                        "completed" | "interrupted" | "failed" | "unknown_after_restart"
+                    ) && session.rewind_request.as_deref() == Some(&receipt.request_id)
+                    {
+                        session.rewind_request = None;
+                        if session.state == "rewinding" {
+                            session.state = "idle".into();
+                        }
+                    }
                 }
                 prompt::apply(&mut session.prompts, &receipt);
                 session.receipts.insert(receipt.request_id.clone(), receipt);

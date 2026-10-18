@@ -107,7 +107,10 @@ class WorkspaceTests(unittest.TestCase):
                 {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
             response = connection.getresponse()
             data = json.loads(response.read()); connection.close()
-            self.assertEqual(response.status,expected,data)
+            if expected is not None:
+                self.assertEqual(response.status,expected,data)
+            else:
+                data['_status'] = response.status
             return data
         for kind,path in paths.items():
             until(lambda:self.service.session('cr_'+kind)['state']=='idle','attachment target',10)
@@ -142,6 +145,14 @@ class WorkspaceTests(unittest.TestCase):
                 self.assertEqual(changed['error'],'request_id already has different content')
             self.assertFalse((scope/'note'/'different.txt').exists())
             self.assertEqual(dest.read_bytes(),payload)
+            race_key = 'same-id-race'
+            race_payloads = [b'A' * 131072, b'B' * 131072]
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                raced = list(pool.map(lambda body: upload(kind,race_key,'race.bin',body,expected=None), race_payloads))
+            accepted = [item for item in raced if item['_status'] == 202]
+            conflicts = [item for item in raced if item['_status'] == 409 and item.get('code') == 'request_conflict']
+            self.assertEqual((len(accepted),len(conflicts)),(1,1),raced)
+            self.assertEqual(Path(accepted[0]['receipt']['input']['path']).read_bytes() in race_payloads,True)
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
