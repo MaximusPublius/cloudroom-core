@@ -629,3 +629,45 @@ test("reads core status without exposing private fields as client configuration"
   assert.equal(state.receipts.p2.state, "accepted");
   assert.deepEqual(state.queue, ["p2"]);
 });
+
+test("Pi key saves accept the handler's HTTP 200 without weakening command acceptance", async (t) => {
+  const service = await fixture((req, res, body) => {
+    if (req.url === "/v1/accounts/pi/key") {
+      assert.deepEqual(body, { provider: "fixture", key: "SYNTHETIC-KEY" });
+      return sendJson(res, { providers: ["fixture"] });
+    }
+    sendJson(res, { session_id: "s1", receipt: { request_id: body.request_id, command: "start", state: "accepted", input: {} }, saving: {} });
+  });
+  t.after(() => service.close());
+  assert.deepEqual(await service.client.piApiKey("fixture", "SYNTHETIC-KEY"), { providers: ["fixture"] });
+  await assert.rejects(service.client.start("normal_1"), /did not acknowledge/);
+});
+
+test("child starts accept only the server's derived child identity on same-ID retries", async (t) => {
+  let wrongReceipt = false;
+  let wrongSession = false;
+  const seen: unknown[] = [];
+  const service = await fixture((_req, res, body) => {
+    seen.push(body);
+    sendJson(res, {
+      session_id: wrongSession ? "cr_child_other" : `cr_child_${body.request_id}`,
+      receipt: { request_id: wrongReceipt ? body.request_id : `child_${body.request_id}`, command: "start", state: "accepted", input: {} },
+      saving: {},
+    }, 202);
+  });
+  t.after(() => service.close());
+  const options = { parent_session: "parent", prompt: "synthetic task" };
+  for (let i = 0; i < 2; i++) {
+    const accepted = await service.client.start("child_1", "codex", options);
+    assert.equal(accepted.session_id, "cr_child_child_1");
+    assert.equal(accepted.receipt.request_id, "child_child_1");
+  }
+  assert.deepEqual(seen[0], seen[1]);
+  wrongReceipt = true;
+  await assert.rejects(service.client.start("child_1", "codex", options), /does not match/);
+  wrongReceipt = false;
+  wrongSession = true;
+  await assert.rejects(service.client.start("child_1", "codex", options), /does not match/);
+  wrongSession = false;
+  await assert.rejects(service.client.start("child_1"), /does not match/);
+});

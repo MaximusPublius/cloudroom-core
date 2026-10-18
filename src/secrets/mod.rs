@@ -388,7 +388,11 @@ fn check_file(content: &str, names: &[String]) -> io::Result<()> {
 fn encode(value: &str) -> io::Result<String> {
     if !value.contains('\'') {
         Ok(format!("'{value}'"))
-    } else if !value.contains('"') && !value.contains("\\n") && !value.contains("\\r") {
+    } else if !value.contains('"')
+        && !value.contains('\\')
+        && !value.contains('$')
+        && !value.contains('`')
+    {
         Ok(format!("\"{value}\""))
     } else if value == value.trim()
         && !value.contains('#')
@@ -466,4 +470,33 @@ fn reconcile(
         joined.push_str(ending);
     }
     Ok((joined, added, updated, unchanged))
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_ambiguous_double_quoted_values_before_reconciliation() {
+        for value in [
+            "abc'\\",
+            "abc'\\t",
+            "abc'\\n",
+            "abc'$HOME",
+            "abc'`id`",
+            "both'\"quotes",
+        ] {
+            assert!(encode(value).is_err());
+            let values = BTreeMap::from([("KEY".into(), value.into())]);
+            assert!(reconcile("KEY='old'\n", &["KEY".into()], &values).is_err());
+        }
+    }
+
+    #[test]
+    fn preserves_literal_single_quoted_values_and_safe_apostrophes() {
+        for value in ["abc\\", "abc\\t", "$HOME", "`id`", "double\"quote"] {
+            assert_eq!(encode(value).unwrap(), format!("'{value}'"));
+        }
+        assert_eq!(encode("it's safe").unwrap(), "\"it's safe\"");
+    }
 }
