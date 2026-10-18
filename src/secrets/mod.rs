@@ -390,8 +390,6 @@ fn encode(value: &str) -> io::Result<String> {
         Ok(format!("'{value}'"))
     } else if !value.contains('"') && !value.contains("\\n") && !value.contains("\\r") {
         Ok(format!("\"{value}\""))
-    } else if value == value.trim() && !value.contains('#') {
-        Ok(value.into())
     } else {
         Err(io::Error::other(
             "A secret value cannot be represented safely in a single dotenv assignment",
@@ -460,4 +458,18 @@ fn reconcile(
         joined.push_str(ending);
     }
     Ok((joined, added, updated, unchanged))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_quotes_are_rejected_instead_of_written_unquoted() {
+        let error = encode("pa'ss\"word").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "A secret value cannot be represented safely in a single dotenv assignment"
+        );
+    }
 }

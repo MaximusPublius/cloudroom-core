@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('preview', Path(__file__).parents[1] / 'src/preview/client.py')
 preview = importlib.util.module_from_spec(spec)
@@ -109,6 +110,24 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(self.request()[2], b'ok')
             self.assertLess(time.monotonic() - started, 2)
             self.assertEqual(slow.result()[0], 405)
+
+    def test_mac_thread_approval_is_scoped_to_authenticated_session(self):
+        jobs = preview.MacJobs(Path(self.directory.name))
+        core = SimpleNamespace(key='core')
+        answers = [b'Allow for this thread\n', b'Deny\n']
+
+        def process(*_args, **_kwargs):
+            answer = answers.pop(0).decode()
+            return SimpleNamespace(communicate=lambda: (answer, ''))
+
+        with mock.patch.object(preview.subprocess, 'Popen', side_effect=process) as popen:
+            first = {'id': 'one', 'session': 'thread-a', 'command': 'touch one'}
+            same = {'id': 'two', 'session': 'thread-a', 'command': 'touch two'}
+            other = {'id': 'three', 'session': 'thread-b', 'command': 'touch three'}
+            self.assertTrue(jobs.approve(core, first))
+            self.assertTrue(jobs.approve(core, same))
+            self.assertFalse(jobs.approve(core, other))
+            self.assertEqual(popen.call_count, 2)
 
 
 if __name__ == '__main__':

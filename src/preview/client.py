@@ -513,7 +513,7 @@ class MacJobs:
     """Mac access (ADR 0113, levels in ADR 0186): run commands from the user's cloud agents as this user, only while enabled."""
     def __init__(self, folder):
         self.folder, self.running, self.lock = folder, {}, threading.Lock()
-        # Ask first: one dialog at a time; "Allow for this thread" trusts that sandbox's core until the helper restarts.
+        # Ask first: one dialog at a time; thread grants are scoped to Core's authenticated session identity.
         self.asking, self.trusted = threading.Lock(), set()
 
     def enabled(self):
@@ -522,7 +522,8 @@ class MacJobs:
 
     def approve(self, core, job):
         with self.asking:
-            if core.key in self.trusted:
+            trust = (core.key, job['session'])
+            if trust in self.trusted:
                 return True
             text = f"A cloud agent wants to change your Mac.\n\nFolder: {job.get('cwd') or '~'}\n\n{job['command'][:600]}"
             process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -533,7 +534,7 @@ class MacJobs:
             with self.lock:
                 self.running.pop(job['id'], None)
             if answer == 'Allow for this thread':
-                self.trusted.add(core.key)
+                self.trusted.add(trust)
             return answer in ('Allow', 'Allow for this thread')
 
     def refusal(self, core, job):

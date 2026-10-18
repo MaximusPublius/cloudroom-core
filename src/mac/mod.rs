@@ -317,6 +317,10 @@ async fn local_run(
     Json(run): Json<Run>,
 ) -> Result<Json<Value>> {
     local_auth(&m, peer)?;
+    let session = peer
+        .1
+        .and_then(|pid| m.harness_session(&crate::secrets::ancestors(pid)))
+        .ok_or(conflict("Run cloudroom mac from a Cloudroom cloud thread"))?;
     validate(&run)?;
     let mac = &m.mac;
     let mut changed = mac.changed.subscribe();
@@ -353,9 +357,9 @@ async fn local_run(
             },
         );
     }
-    let data =
-        json!({"id":id,"command":run.command,"stdin":run.stdin,"cwd":run.cwd,"write":run.write})
-            .to_string();
+    let data = json!({"id":id,"session":session,"command":run.command,"stdin":run.stdin,
+        "cwd":run.cwd,"write":run.write})
+    .to_string();
     if events
         .send(Ok(Event::default().event("job").data(data)))
         .await
