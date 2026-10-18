@@ -11,7 +11,7 @@ export type CodexAuthStatus = {
   email: string | null; plan: string | null; message: string | null;
   login_id: string | null; verification_url: string | null; user_code: string | null;
 };
-export type TeleportFile = { path: string; size: number; sha256: string; kind: "native" | "context" | "project" | "attachment"; executable: boolean; symlink?: boolean; origin?: string };
+export type TeleportFile = { path: string; size: number; sha256: string; kind: "native" | "lineage" | "context" | "project" | "attachment"; executable: boolean; symlink?: boolean; origin?: string };
 export type TeleportManifest = {
   request_id: string; harness: Harness; native_id: string; model: string; provider: string | null; reasoning: string | null;
   workspace: string; workspace_name: string; files: TeleportFile[]; handoff: string;
@@ -577,7 +577,7 @@ export class CloudroomClient {
     }
   }
 
-  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; prompt?: string; title?: string; fork?: { session: string; before?: string; last_turn_id?: string } } = {}) {
+  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; parent_thread?: string; prompt?: string; title?: string; fork?: { session: string; before?: string; last_turn_id?: string } } = {}) {
     if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx" && harness !== "opencode" && harness !== "hermes" && harness !== "devin")
       throw new CloudroomError("Unsupported Cloudroom harness");
     return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });

@@ -16,6 +16,7 @@ from pathlib import Path
 import plistlib
 import pwd
 import select
+import shlex
 import signal
 import socket
 import ssl
@@ -452,7 +453,7 @@ class Tunnel:
         if self.process.poll() is not None or not self.socket_path.exists():
             return False
         try:
-            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=2)) as connection:
+            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=10)) as connection:
                 connection.request('HEAD', '/', headers={'Host': self.server.authority})
                 response = connection.getresponse()
                 return response.getheader('X-Cloudroom-Preview') == self.generation
@@ -499,9 +500,18 @@ READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
              ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))')
 ASK = '''on run argv
 activate
-display dialog (item 1 of argv) with title "Cloudroom" buttons {"Deny", "Allow for this thread", "Allow"} default button (item 2 of argv) cancel button "Deny" with icon caution giving up after 300
+display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this thread", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
 return button returned of result
 end run'''
+
+
+def visible(text, chars, lines):
+    """The part of `text` the Ask first popup shows, and how many characters it leaves out."""
+    text = text.rstrip()
+    shown = ''.join(text[:chars].splitlines(keepends=True)[:lines]).rstrip()
+    return shown, len(text) - len(shown)
+
+
 # Hex characters per result request: some sandbox proxies drop requests over about 8 MB,
 # and each part must upload within MAC_POST_SECONDS on a slow home connection.
 MAC_PART = 1024 * 1024
@@ -587,14 +597,25 @@ class MacJobs:
         with self.asking:
             if core.key in self.trusted:
                 return True
-            # Hidden parts still run: warn above the command, where padding cannot push it out of view, and let Return deny.
-            command, stdin, warnings = job['command'], len(job.get('stdin') or '') // 2, ''
-            if len(command) > 600:
-                warnings += f"Warning: {len(command) - 600:,} more characters of this command are not shown, and will also run.\n\n"
-            if stdin:
-                warnings += f"Warning: the command also reads {stdin:,} bytes of input that are not shown.\n\n"
-            text = f"A cloud agent wants to change your Mac.\n\n{warnings}Folder: {job.get('cwd') or '~'}\n\n{command[:600]}"
-            process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text, 'Deny' if warnings else 'Allow'], stdout=subprocess.PIPE,
+            # Show what will run, including a script sent as input. Hidden parts still run: warn above them, where
+            # padding cannot push the warning out of view. Return always denies.
+            command, hidden = visible(job['command'], 600, 10)
+            warnings = f"Warning: {hidden:,} more characters of this command are not shown, and will also run.\n\n" if hidden else ''
+            text = f"Folder: {job.get('cwd') or '~'}\nCommand: {command}"
+            if job.get('stdin'):
+                try:
+                    data = bytes.fromhex(job['stdin']).decode()
+                    if '\0' in data:
+                        raise ValueError('binary input')
+                    script, hidden = visible(data, 1000, 20)
+                    count = len(data.rstrip().splitlines())
+                    text += f"\n\nInput ({count:,} line{'s' if count != 1 else ''}{', all shown' if not hidden else ''}):\n\n{script}"
+                    if hidden:
+                        warnings += f"Warning: {hidden:,} more characters of its input are not shown, and will also run.\n\n"
+                except ValueError:  # Not text, such as the archive a push unpacks.
+                    warnings += f"Warning: the command also reads {len(job['stdin']) // 2:,} bytes of input that cannot be shown.\n\n"
+            text = f"A cloud agent wants to change your Mac.\n\n{warnings}{text}"
+            process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text], stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, text=True, start_new_session=True)
             with self.lock:
                 self.running[job['id']] = process
@@ -684,7 +705,11 @@ class MacJobs:
         # Core may have taken a confirmation whose reply was lost, so it still gets this result instead of waiting forever.
         refused = self.refusal(core, job) if confirmed else 'The Mac could not confirm this command with the cloud, so it did not run. Try again.'
         sandboxed = not refused and not job.get('write') and mac_level(self.enabled() or {}) != 'full'
-        shell = [pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh', '-lc', job['command']]
+        login = pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh'
+        # Cloudroom's own tools (browser-harness) come first, as in Local threads, after the user's profile sets PATH.
+        tools = shlex.quote(str(Path(core.config['connectionFile']).parent / 'bin'))
+        path = f'set -gx PATH {tools} $PATH; ' if login.endswith('/fish') else f'PATH={tools}:"$PATH"; '
+        shell = [login, '-lc', path + job['command']]
         try:
             if refused:
                 raise PermissionError(refused)
