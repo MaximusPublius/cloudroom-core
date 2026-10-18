@@ -76,6 +76,7 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo check --locked --all-targets
           cargo test --locked --all-targets
+          cargo build --locked
           cargo build --locked --release
 
       - name: Client and fixture tests
