@@ -159,7 +159,9 @@ impl IntoResponse for session::Error {
             | "saved session has no matching receipt" => "request_conflict",
             "agent setup is incomplete" | "harness is not configured" => "harness_not_configured",
             "invalid workspace" | "workspace mapping unavailable" => "invalid_workspace",
-            "storage unsafe; new execution is blocked" => "storage_blocked",
+            "storage unsafe; new execution is blocked" | "storage unsafe; uploads are blocked" => {
+                "storage_blocked"
+            }
             "service is stopping" => "service_stopping",
             "model catalog unavailable" => "model_catalog_unavailable",
             _ => "request_rejected",
@@ -622,6 +624,7 @@ async fn attach(
             "storage unsafe; uploads are blocked",
         ));
     }
+    manager.check_attachment_write(&id, &query.request_id)?;
     let written = manager
         .workspaces
         .attach(

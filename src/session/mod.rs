@@ -926,24 +926,27 @@ impl Manager {
         if !self.config.harnesses.contains_key(&kind) {
             return Err(Error::Conflict("harness is not configured"));
         }
-        if let Some(reasoning) = &reasoning {
-            let supported = match kind {
-                runtime::Kind::Codex => {
-                    let models = self.codex_models().await?;
-                    let selected = model
-                        .as_ref()
-                        .unwrap_or(&self.config.harnesses[&kind].model);
-                    let entry = models
-                        .iter()
-                        .find(|entry| &entry.model == selected)
-                        .ok_or(Error::Conflict("invalid model"))?;
-                    entry.reasoning_levels.contains(reasoning)
-                }
-                runtime::Kind::Pi => runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str()),
-            };
-            if !supported {
+        if kind == runtime::Kind::Codex && (model.is_some() || reasoning.is_some()) {
+            let models = self.codex_models().await?;
+            let selected = model
+                .as_ref()
+                .unwrap_or(&self.config.harnesses[&kind].model);
+            let entry = models
+                .iter()
+                .find(|entry| &entry.model == selected)
+                .ok_or(Error::Conflict("invalid model"))?;
+            if reasoning
+                .as_ref()
+                .is_some_and(|reasoning| !entry.reasoning_levels.contains(reasoning))
+            {
                 return Err(Error::Conflict("invalid reasoning effort"));
             }
+        } else if kind == runtime::Kind::Pi
+            && reasoning.as_ref().is_some_and(|reasoning| {
+                !runtime::PI_REASONING_LEVELS.contains(&reasoning.as_str())
+            })
+        {
+            return Err(Error::Conflict("invalid reasoning effort"));
         }
         let workspace = match workspace {
             Some(id) => self
@@ -1171,6 +1174,34 @@ impl Manager {
             .get(id)
             .and_then(|session| session.receipts.get(request))
             .cloned()
+    }
+
+    /// Reject fresh attachment writes before any bytes reach the workspace.
+    /// Exact retries remain eligible so storage can compare their submitted bytes.
+    pub fn check_attachment_write(&self, id: &str, request: &str) -> Result<()> {
+        let local = self.local.lock().unwrap();
+        let session = local.sessions.get(id).ok_or(Error::NotFound)?;
+        if session.receipts.contains_key(request) {
+            return Ok(());
+        }
+        if !local.journal.writable() {
+            return Err(Error::Storage);
+        }
+        if self.is_stopping() {
+            return Err(Error::Conflict("service is stopping"));
+        }
+        if session.rewind_request.is_some() {
+            return Err(Error::Conflict("wait for the pending rewind"));
+        }
+        if session.close_request.is_some() || session.interrupt_pending() {
+            return Err(Error::Conflict("wait for the pending close or interrupt"));
+        }
+        if matches!(session.state.as_str(), "closed" | "process_lost" | "failed") {
+            return Err(Error::Conflict(
+                "process unavailable; history does not restore execution",
+            ));
+        }
+        Ok(())
     }
 
     pub fn command(

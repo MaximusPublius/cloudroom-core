@@ -410,6 +410,16 @@ class ReplayTests(unittest.TestCase):
         error = self.service.request('POST', '/v1/sessions', {'request_id': 'not-configured'}, 409)
         self.assertIn('setup is incomplete', error['error'])
 
+    def test_explicit_codex_model_is_validated_without_reasoning(self):
+        from workspaces import WorkspaceTests
+        WorkspaceTests.database(self)
+        self.start()
+        error = self.service.request('POST', '/v1/sessions', {
+            'request_id': 'invalid-model', 'model': 'missing-from-catalog'}, 409)
+        self.assertEqual(error, {'error': 'invalid model', 'code': 'invalid_model'})
+        missing = self.service.request('GET', '/v1/sessions/cr_invalid-model', expected=404)
+        self.assertEqual(missing['error'], 'session not found')
+
     def test_dashboard_is_authenticated_bounded_and_contains_only_summaries(self):
         for n in range(1001):
             record = {"sequence": n + 1, "session_id": f"session-{n}", "kind": "state",

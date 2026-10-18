@@ -8,7 +8,7 @@ impl Directory {
             "cloudroom-diagnostics-{:x}",
             RandomState::new().hash_one(SystemTime::now())
         ));
-        fs::create_dir(&path).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         Self(path)
     }
 }

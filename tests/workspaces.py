@@ -176,6 +176,12 @@ class WorkspaceTests(unittest.TestCase):
                 {'request_id':'read','text':'read attachment','attachments':[uploaded]},202)
             until(lambda:self.service.session('cr_'+kind)['receipts']['read']['state']=='completed','attachment prompt',10)
 
+            self.service.request('POST',f'/v1/sessions/cr_{kind}/close', {'request_id':'close-before-upload'},202)
+            until(lambda:self.service.session('cr_'+kind)['state']=='closed','closed attachment target',10)
+            rejected = upload(kind,'after-close','orphan.txt',b'must not persist',expected=409)
+            self.assertEqual(rejected['code'],'request_rejected')
+            self.assertFalse((scope/'after-close'/'orphan.txt').exists())
+
     def assert_single_dispatch(self, kind, path, native):
         if kind == 'codex':
             self.assertEqual((path/(native+'.requests')).read_text().splitlines(),['first'])
