@@ -2,66 +2,104 @@ name: Quality Gates
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: quality-gates-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality-gates:
     name: Typecheck, test, build, lint, format, audit, and policy checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
-      - name: Checkout complete history
-        uses: actions/checkout@v4
+      - name: Checkout exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install Rust 1.89
+      - name: Verify exact revision
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+
+      - name: Secret scan of tracked source
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: false
+
+      - name: Setup Node 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Repository boundary policy
         run: |
-          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.89.0
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          test -z "$(git ls-files | awk '/^\.\.\// || /^\// { print }')"
+          while read -r link; do
+            target="$(realpath -m "$link")"
+            case "$target" in
+              "$GITHUB_WORKSPACE"/*) ;;
+              *) printf 'symlink escapes repository: %s -> %s\n' "$link" "$target" >&2; exit 1 ;;
+            esac
+          done < <(git ls-files -s | awk '$1 == 120000 { print $4 }')
 
-      - name: Typecheck
-        run: cargo check --locked --all-targets
-
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Tests
-        run: cargo test --locked --all-targets
-
-      - name: Prepare disposable PostgreSQL fixture
-        run: docker pull postgres:16-alpine
-
-      - name: Workspace and recovery tests
+      - name: Dependency policy and audit
         run: |
+          cargo metadata --locked --format-version 1 --no-deps > /dev/null
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: Rust format, lint, typecheck, test, and production build
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo check --locked --all-targets
+          cargo test --locked --all-targets
+          cargo build --locked
+          cargo build --locked --release
+
+      - name: Disposable disk-safety and attachment checks
+        run: |
+          docker pull postgres:16-alpine
+          sudo useradd --system --user-group --no-create-home cr-service-test
+          sudo useradd --system --user-group --no-create-home cr-disk-test
+          sudo python3 tests/storage_e2e.py --disposable --mixed
+
+      - name: Client and fixture tests
+        run: |
+          python3 tests/preview_client.py
+          node --test integrations/bb/client.test.ts
+          python3 tests/install.py
           python3 tests/core_fixture.py
+          python3 tests/pi_http.py
           python3 tests/workspaces.py
           python3 tests/sync_e2e.py
 
-      - name: Production build
-        run: cargo build --locked --release
+      - name: Disposable SSH preview checks
+        run: sudo python3 tests/previews_ssh.py --disposable
 
-      - name: Dependency audit
+      - name: Disposable PostgreSQL checks
         run: |
-          cargo install cargo-audit --locked --version 0.22.2
-          cargo audit
-
-      - name: Repository boundaries and dependency policy
-        run: |
-          test "$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["packages"]))')" = 1
-          test "$(find . -mindepth 2 -name Cargo.toml -not -path './target/*' -print -quit)" = ""
-          cargo metadata --locked --format-version 1 > /dev/null
-
-      - name: Secret scan
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          python3 tests/core_e2e.py --foundation
+          python3 tests/core_e2e.py --fixture

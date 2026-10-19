@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::process::Command;
 
@@ -17,6 +17,9 @@ pub struct Policy {
     pub agent_gid: u32,
     pub cache_dir: PathBuf,
     pub cgroup_root: PathBuf,
+    /// Sandbox deployments give agents sudo: the sandbox itself is the security boundary.
+    #[serde(default)]
+    pub agent_sudo: bool,
     #[serde(default = "warning")]
     pub warning_bytes: u64,
     #[serde(default = "pause")]
@@ -154,6 +157,9 @@ pub struct Snapshot {
     pub level: Level,
     pub workspace_available_bytes: Option<u64>,
     pub history_available_bytes: Option<u64>,
+    pub workspace_total_bytes: Option<u64>,
+    pub history_total_bytes: Option<u64>,
+    pub sampled_at: Option<u64>,
     pub reason: &'static str,
 }
 impl Snapshot {
@@ -167,6 +173,9 @@ impl Snapshot {
             },
             workspace_available_bytes: None,
             history_available_bytes: None,
+            workspace_total_bytes: None,
+            history_total_bytes: None,
+            sampled_at: None,
             reason: if enabled {
                 "measurement_unavailable"
             } else {
@@ -223,7 +232,7 @@ impl Guard {
             .as_ref()
             .map(|policy| {
                 let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
-                group.attach(command, policy.agent_uid, policy.agent_gid)?;
+                group.attach(command, policy)?;
                 Ok::<_, io::Error>(group)
             })
             .transpose()?;
@@ -272,6 +281,14 @@ impl Guard {
                 level,
                 workspace_available_bytes: Some(workspace.available_bytes),
                 history_available_bytes: Some(history.available_bytes),
+                workspace_total_bytes: Some(workspace.total_bytes),
+                history_total_bytes: Some(history.total_bytes),
+                sampled_at: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                ),
                 reason: "disk_capacity",
             })
         }
@@ -291,7 +308,7 @@ impl Guard {
             .arg(&p.cache_dir)
             .arg(&p.cgroup_root)
             .kill_on_drop(true);
-        linux::as_agent(&mut command, p.agent_uid, p.agent_gid, None)?;
+        linux::as_agent(&mut command, p.agent_uid, p.agent_gid, None, true)?;
         let result = tokio::time::timeout(Duration::from_secs(5), command.output())
             .await
             .map_err(|_| io::Error::other("cache cleanup timed out"))??;
@@ -545,6 +562,7 @@ mod tests {
                         workspace_available_bytes: Some(available),
                         history_available_bytes: Some(available),
                         reason: "disk_capacity",
+                        ..Snapshot::unavailable(true)
                     },
                     Instant::now(),
                 )),

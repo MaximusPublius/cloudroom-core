@@ -19,6 +19,8 @@ pub struct Config {
     pub database_url: String,
     pub store: String,
     pub allow_insecure_database: bool,
+    /// Optional host label, such as a sandbox name, that prefixes this process's diagnostic run IDs.
+    pub instance: Option<String>,
     pub account_home: PathBuf,
     pub default_harness: Kind,
     pub harnesses: BTreeMap<Kind, HarnessConfig>,
@@ -63,6 +65,9 @@ impl Config {
         let default_harness = match env::var("CLOUDROOM_HARNESS").as_deref().unwrap_or("codex") {
             "codex" => Kind::Codex,
             "pi" => Kind::Pi,
+            "cursor" => Kind::Cursor,
+            "claude-code" => Kind::Claude,
+            "fx" => Kind::Fx,
             _ => return Err(io::Error::other("unsupported CLOUDROOM_HARNESS")),
         };
         let account_home: PathBuf = required("CLOUDROOM_ACCOUNT_HOME")?.into();
@@ -91,6 +96,57 @@ impl Config {
                 );
             }
         }
+        let claude = [
+            account_home.join(".local/bin/claude"),
+            PathBuf::from("/usr/local/bin/claude"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = claude.filter(|_| account_home.join(".claude").is_dir()) {
+            harnesses.insert(
+                Kind::Claude,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".claude"),
+                    model: "sonnet".into(),
+                    provider: None,
+                },
+            );
+        }
+        let cursor = [
+            account_home.join(".local/bin/cursor-agent"),
+            PathBuf::from("/usr/local/bin/cursor-agent"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = cursor.filter(|_| account_home.join(".cursor").is_dir()) {
+            harnesses.insert(
+                Kind::Cursor,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".cursor"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
+        }
+        let fx = [
+            account_home.join(".local/bin/fx"),
+            PathBuf::from("/usr/local/bin/fx"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = fx.filter(|_| account_home.join(".fx").is_dir()) {
+            harnesses.insert(
+                Kind::Fx,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".fx"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
+        }
         Ok(Self {
             storage,
             default_harness,
@@ -105,6 +161,23 @@ impl Config {
             store: required("CLOUDROOM_STORE")?,
             allow_insecure_database: env::var("CLOUDROOM_ALLOW_INSECURE_DATABASE").as_deref()
                 == Ok("1"),
+            instance: match env::var("CLOUDROOM_INSTANCE") {
+                Ok(value)
+                    if !value.is_empty()
+                        && value.len() <= 63
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+                {
+                    Some(value)
+                }
+                Ok(value) if !value.is_empty() => {
+                    return Err(io::Error::other(
+                        "CLOUDROOM_INSTANCE must be lowercase letters, digits and dashes",
+                    ));
+                }
+                _ => None,
+            },
             account_home,
         })
     }

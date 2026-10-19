@@ -6,6 +6,19 @@ Use a **fresh VM for one trusted user**, with sudo access, systemd, cgroup v2, a
 
 Agents run without approval prompts and share their account's files. Do not give that account sudo or access to a Docker socket.
 
+## Quick install
+
+On an x86_64 VM, one script does most of the manual setup below, using the newest CI-tested release instead of a source build:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/davidondrej/cloudroom-core/main/install/install.sh -o install.sh
+sudo bash install.sh
+```
+
+It asks for your PostgreSQL URL without showing it, checks the download's checksum, creates both accounts, writes `/etc/cloudroom/core.env` with a new token, and starts the service. It never prints the token or runs SQL. When it finishes, it prints the two remaining steps: apply the database schema and sign in to a harness. Use `--version X.Y.Z` to pick a release. It refuses to run over an existing installation.
+
+To build from source instead, follow the manual steps below.
+
 ## 1. Install tools and build
 
 Run these commands in an SSH terminal on the VM, as your administrator account:
@@ -47,6 +60,14 @@ sudo -u cloudroom-agent -H /usr/local/bin/codex login --device-auth
 ```
 
 Complete the login in your browser. If device login is unavailable for your account, use [Codex's supported login methods](https://developers.openai.com/codex/auth/) under the same `cloudroom-agent` account. Do not put inference credentials in the service environment.
+
+### Retire standalone shell agents on a managed VM
+
+Keep Codex/Pi setup under the agent account. SSH remains for administration; tasks go through the core API. After shell-owned agents exit, run `sudo python3 install/agent-home.py --shell-user YOUR_SSH_USER` to preview, then repeat with `--apply`.
+
+This preserves the old setup in a root-private archive, copies only missing supported settings, and blocks the administrator's normal Codex/Pi commands and default auth writes. Core logins, processes and histories stay untouched. Conflicts and symlinked settings remain archived for review; do not restore stale tokens automatically. `--check` detects competing shell setup without deleting it. This is an operational guard, not a sandbox against a VM administrator.
+
+New managed templates run `--apply` before service startup: Boat may restore shell settings even with `noEnv`. Recreated files under a previously retired home are archived separately, never used as runtime credentials. Unmarked conflicting setup fails closed. Review provider credential injection separately; do not blindly change a shared environment or erase unrelated credentials.
 
 ## 3. Prepare PostgreSQL
 
@@ -162,9 +183,13 @@ sudo -u cloudroom-agent -H /usr/local/bin/codex login status
 
 A failed readiness check usually means the database, TLS certificate, migrations, or disk protection needs attention. A failed agent start may mean login or model configuration. There is no fixed limit on open harness sessions; actual concurrency depends on available VM resources. Keep logs private when asking for help.
 
+## Sandboxes without systemd
+
+Cloud sandboxes have no systemd ([scope](../../docs/scopes/sandboxes.md)). The web app writes `/etc/cloudroom/core.env` on every wake, then starts `install/sandbox-start.sh` as root, detached. It parses (never sources) `image.env` and `core.env`, creates the agents' cgroup, runs Core as `cloudroom` with only the capabilities it needs, and restarts it after a crash. A second start is a no-op. The log is `/var/log/cloudroom/core.log`. With `"agent_sudo": true` in `storage.json`, agents keep sudo inside their own sandbox. Before a stop, `POST /v1/drain {"hold":true}` refuses new work and reports whether anything still runs; `{"hold":false}` reopens it.
+
 ## Cloud folders
 
-Send `"workspace":"PROJECT_ID"` and optional `"workspace_name":"project-name"` with `POST /v1/sessions`. The core creates an empty directory under `/code` and starts the harness. Repeated workspace IDs reuse their recorded directory; name collisions never overwrite another folder. No Git repository, local source folder, archive upload, or sync worker is required. The agent can clone a repository or install dependencies after starting.
+Send `"workspace":"PROJECT_ID"` and optional `"workspace_name":"project-name"` with `POST /v1/sessions`. The core creates an empty directory under `/code` and starts the harness. Repeated workspace IDs reuse their recorded directory; name collisions never overwrite another folder. No Git repository, local source folder, archive upload, or sync worker is required. The agent can clone a repository or install dependencies after starting. Send `"workspace":"root"` to start in `/code` itself, outside any project folder.
 
 `GET /v1/workspaces/PROJECT_ID` returns the mapping; `GET /v1/sessions/SESSION_ID/workspace` returns the actual directory and Git metadata, which may be null. `/code` belongs to the unprivileged agent; the installer prepares it. Existing folders, nested mappings, session IDs, and history remain intact. No new environment variable or SQL migration is required.
 

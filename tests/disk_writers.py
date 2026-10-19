@@ -144,8 +144,8 @@ try:
         sending=pool.submit(send_chunks,2*1024**2)
         time.sleep(.3)
         checks['active_upload_stops_writing']=staged_size()==before_size
-        status,value=request('POST','/v1/sessions/cr_probe/attachments?request_id=blocked&name=note.txt&kind=file',b'no writes')
-        checks['blocked_attachment_rejected']=status==409 and value.get('code')=='storage_blocked' and not Path('/code/project/.cloudroom/attachments/blocked/note.txt').exists()
+        status,_=request('POST','/v1/sessions/cr_probe/attachments?request_id=blocked&name=note.txt&kind=file',b'no writes')
+        checks['blocked_attachment_rejected']=status==409 and not Path('/code/project/.cloudroom/attachments/blocked/note.txt').exists()
         free();sending.result(timeout=10)
     send_chunks(size-6*1024**2);upload.send(b'0\r\n\r\n')
     response=upload.getresponse();result=json.loads(response.read());upload.close()

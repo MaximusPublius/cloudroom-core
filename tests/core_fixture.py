@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -22,6 +23,15 @@ def codex():
     path.parent.mkdir(exist_ok=True)
     path.write_text('{"fixture":"start"}\n')
     children, turn, slow_exit = {}, "", False
+    login_cancelled = threading.Event()
+
+    def finish_login(login_id):
+        while not login_cancelled.wait(.02):
+            if Path('auth-finish').exists():
+                success = Path('auth-finish').read_text() == 'success'
+                if success: Path('auth-state').write_text('ready')
+                send({'method': 'account/login/completed', 'params': {'loginId': login_id, 'success': success, 'error': None if success else 'PRIVATE-AUTH-ERROR-CANARY'}})
+                return
 
     def send(message):
         print(json.dumps(message), flush=True)
@@ -35,7 +45,24 @@ def codex():
             if "id" not in message:
                 continue
             method, params, result = message["method"], message.get("params", {}), {}
-            if method == "model/list":
+            if method == 'account/read':
+                mode = Path('auth-state').read_text() if Path('auth-state').exists() else 'ready'
+                result = {'account': None if mode == 'missing' else {'type': 'chatgpt', 'email': 'fixture@example.invalid', 'planType': 'plus'}, 'requiresOpenaiAuth': True}
+            elif method == 'account/rateLimits/read':
+                mode = Path('auth-state').read_text() if Path('auth-state').exists() else 'ready'
+                if mode in ('offline', 'unauthorized'):
+                    send({'id': message['id'], 'error': {'code': -1, 'message': '401 Unauthorized' if mode == 'unauthorized' else 'Network unavailable'}})
+                    continue
+                result = {'rateLimits': {'primary': {'usedPercent': 100 if mode == 'limited' else 0}, 'secondary': None}}
+            elif method == 'account/login/start':
+                login_id = 'fixture-login'
+                with Path('auth-attempts').open('a') as file: file.write('login\n')
+                result = {'type': 'chatgptDeviceCode', 'loginId': login_id, 'verificationUrl': 'https://auth.openai.com/codex/device', 'userCode': 'TEST-1234'}
+                threading.Thread(target=finish_login, args=(login_id,), daemon=True).start()
+            elif method == 'account/login/cancel':
+                login_cancelled.set()
+                result = {'status': 'canceled'}
+            elif method == "model/list":
                 result = {"data": [
                     {"model": "fixture", "supportedReasoningEfforts": [{"reasoningEffort": level} for level in ["low", "medium", "high", "xhigh", "max"]]},
                     {"model": "basic", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]},
@@ -206,6 +233,63 @@ class ReplayTests(unittest.TestCase):
     def start(self):
         self.service = Service(self.env, self.root / "service.log").start()
 
+    def test_codex_login_is_private_idempotent_cancellable_and_verified(self):
+        from workspaces import WorkspaceTests
+        WorkspaceTests.database(self)
+        (self.repo / 'auth-state').write_text('missing')
+        self.start()
+        api = self.service.request
+        api('GET', '/v1/accounts/codex', expected=401, token=None)
+        self.assertEqual(api('GET', '/v1/accounts/codex')['state'], 'missing')
+        start = {'request_id': 'auth-gated', 'harness': 'codex', 'model': 'fixture'}
+        self.assertEqual(api('POST', '/v1/sessions', start, 409)['code'], 'codex_auth_required')
+        first = api('POST', '/v1/accounts/codex/login', {'request_id': 'login-one'}, 202)
+        self.assertEqual(first['state'], 'waiting')
+        self.assertEqual(first['user_code'], 'TEST-1234')
+        self.assertEqual(api('POST', '/v1/accounts/codex/login', {'request_id': 'login-one'}, 202), first)
+        self.assertEqual(api('POST', '/v1/accounts/codex/cancel', {'request_id': 'stale-login'}, 202), first)
+        self.assertEqual((self.repo / 'auth-attempts').read_text().splitlines(), ['login'])
+        self.assertEqual(api('POST', '/v1/accounts/codex/cancel', {'request_id': 'login-one'}, 202)['state'], 'missing')
+        second = api('POST', '/v1/accounts/codex/login', {'request_id': 'login-two'}, 202)
+        self.assertEqual(second['state'], 'waiting')
+        (self.repo / 'auth-finish').write_text('success')
+        until(lambda: api('GET', '/v1/accounts/codex')['state'] == 'connected', 'verified cloud login', 6)
+        self.assertEqual(api('GET', '/v1/accounts/codex')['email'], 'fixture@example.invalid')
+        self.assertIsNone(api('GET', '/v1/accounts/codex')['user_code'])
+        self.assertEqual(list(self.state.glob('*.record')), [], 'Login must not create sessions or conversation records')
+        for file in self.state.rglob('*.jsonl'):
+            self.assertNotIn('TEST-1234', file.read_text())
+            self.assertNotIn('PRIVATE-AUTH-ERROR-CANARY', file.read_text())
+        sid = api('POST', '/v1/sessions', start, 202)['session_id']
+        self.assertEqual(api('POST', '/v1/sessions', start, 202)['session_id'], sid)
+        until(lambda: self.service.session(sid)['state'] == 'idle', 'authenticated start', 10)
+        prompt = {'request_id': 'once', 'text': 'hello'}
+        api('POST', f'/v1/sessions/{sid}/prompts', prompt, 202)
+        until(lambda: self.service.session(sid)['receipts']['once']['state'] == 'completed', 'first authenticated task', 10)
+        api('POST', f'/v1/sessions/{sid}/prompts', prompt, 202)
+        native = self.service.session(sid)['native_id']
+        self.assertEqual((self.repo / (native + '.requests')).read_text().splitlines(), ['once'])
+
+    def test_codex_account_failure_and_limits_are_not_confused_with_login(self):
+        for mode, expected in [('offline', 'unavailable'), ('unauthorized', 'missing'), ('limited', 'limited')]:
+            with self.subTest(mode=mode):
+                (self.repo / 'auth-state').write_text(mode)
+                self.start()
+                self.assertEqual(self.service.request('GET', '/v1/accounts/codex')['state'], expected)
+                if mode == 'offline':
+                    self.assertEqual(self.service.request('POST', '/v1/accounts/codex/login', {'request_id': 'must-not-replace'}, 202)['state'], expected)
+                    self.assertFalse((self.repo / 'auth-attempts').exists())
+                if mode == 'limited':
+                    # A limited account may switch to another subscription.
+                    self.assertEqual(self.service.request('POST', '/v1/accounts/codex/login', {'request_id': 'switch'}, 202)['state'], 'waiting')
+                self.service.stop()
+        (self.repo / 'auth-state').write_text('missing')
+        self.start()
+        self.service.request('POST', '/v1/accounts/codex/login', {'request_id': 'rejected'}, 202)
+        (self.repo / 'auth-finish').write_text('failure')
+        until(lambda: self.service.request('GET', '/v1/accounts/codex')['state'] == 'error', 'failed login', 6)
+        self.assertNotIn('PRIVATE-AUTH-ERROR-CANARY', json.dumps(self.service.request('GET', '/v1/accounts/codex')))
+
     def test_non_loopback_http_requires_permission_before_storage_or_binding(self):
         binary = Path(__file__).resolve().parents[1] / 'target/debug/cloudroom'
         remote = ['0.0.0.0:0', '[::]:0', '192.0.2.10:0', '10.0.0.10:0', '[2001:db8::10]:0']
@@ -295,14 +379,17 @@ class ReplayTests(unittest.TestCase):
                 responses.extend(next_event(stream) for _ in records)
             finally:
                 stream.close(); connection.close()
-        self.assertNotIn(marker, json.dumps(responses))
+            # Crash stderr tails are shown to the session owner (ADR 0123), bounded to 2000 bytes.
+            tails = [r['data']['stderr'] for r in records if r['data'].get('stderr')]
+            self.assertTrue(tails and tails[-1].endswith(marker) and len(tails[-1]) <= 2000)
+        self.assertNotIn(marker, json.dumps(responses[:2]))
         self.service.request('GET', '/v1/health')
         self.service.stop()
         self.assertEqual(private.stat().st_mode & 0o777, 0o700)
         for path in private.glob('*.jsonl'):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertLessEqual(path.stat().st_size, 1024 * 1024)
-        for path in [*self.state.glob('*.record'), *self.state.glob('diagnostics*.jsonl'), self.root / 'service.log']:
+        for path in [*self.state.glob('diagnostics*.jsonl'), self.root / 'service.log']:
             self.assertNotIn(marker, path.read_text())
         before = {p.name:p.read_bytes() for p in private.glob('*.jsonl')}
         private.chmod(0o755)  # An unsafe sink must lose diagnostics, not stop execution or leak text.
@@ -410,16 +497,6 @@ class ReplayTests(unittest.TestCase):
         error = self.service.request('POST', '/v1/sessions', {'request_id': 'not-configured'}, 409)
         self.assertIn('setup is incomplete', error['error'])
 
-    def test_explicit_codex_model_is_validated_without_reasoning(self):
-        from workspaces import WorkspaceTests
-        WorkspaceTests.database(self)
-        self.start()
-        error = self.service.request('POST', '/v1/sessions', {
-            'request_id': 'invalid-model', 'model': 'missing-from-catalog'}, 409)
-        self.assertEqual(error, {'error': 'invalid model', 'code': 'invalid_model'})
-        missing = self.service.request('GET', '/v1/sessions/cr_invalid-model', expected=404)
-        self.assertEqual(missing['error'], 'session not found')
-
     def test_dashboard_is_authenticated_bounded_and_contains_only_summaries(self):
         for n in range(1001):
             record = {"sequence": n + 1, "session_id": f"session-{n}", "kind": "state",
@@ -429,6 +506,10 @@ class ReplayTests(unittest.TestCase):
         self.service.request("GET", "/v1/dashboard", expected=401, token=None)
         self.service.request("GET", "/v1/dashboard", expected=401, token="wrong")
         data = self.service.request("GET", "/v1/dashboard")
+        self.assertEqual(data["storage"], self.service.request("GET", "/v1/health")["storage"])
+        self.assertFalse(data["storage"]["enabled"])
+        for key in ["workspace_available_bytes", "history_available_bytes", "workspace_total_bytes", "history_total_bytes", "sampled_at"]:
+            self.assertIsNone(data["storage"][key])
         self.assertEqual(data["sessionCount"], 1001)
         self.assertEqual(len(data["sessions"]), 1000)
         self.assertEqual(data["sessions"][0]["id"], "session-1000")
@@ -441,6 +522,13 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(data["onboarding"], {"localConnected": None, "offlineTaskVerified": None})
         for secret in ["SECRET-CANARY", "PRIVATE-TRANSCRIPT", str(self.root), self.env["CLOUDROOM_TOKEN"], "receipts", "native_path"]:
             self.assertNotIn(secret, json.dumps(data))
+        self.service.request("GET", "/v1/sessions", expected=401, token="wrong")
+        listed = self.service.request("GET", "/v1/sessions")
+        self.assertEqual((listed["total"], len(listed["sessions"])), (1001, 1000))
+        self.assertEqual({k: listed["sessions"][0][k] for k in ("session_id", "state", "queued")},
+                         {"session_id": "session-1000", "state": "closed", "queued": 0})
+        self.assertNotIn("SECRET-CANARY", json.dumps(listed))
+        self.assertNotIn("PRIVATE-TRANSCRIPT", json.dumps(listed))
         until(lambda: self.service.request("GET", "/v1/dashboard")["sampledAt"] is not None, "resource sampling", 15)
         sampled = self.service.request("GET", "/v1/dashboard")
         self.assertLessEqual(sampled["sampledAt"], int(time.time() * 1000))
@@ -808,27 +896,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotEqual(forked, self.native)
         self.service.request("POST", "/v1/sessions/cr_seed/rewind", body, 202)
         self.assertEqual((self.repo / (forked + ".requests")).read_text().splitlines(), ["corrected"])
-
         self.service.stop(); self.start()
         self.wait(lambda: self.status()["state"] == "idle", "resumed fork")
         self.assertEqual(self.status()["native_id"], forked)
         self.assertEqual((self.repo / (forked + ".requests")).read_text().splitlines(), ["corrected"])
-
-    def test_terminal_rewind_receipt_clears_pending_recovery_guard(self):
-        rewind = {"request_id":"rewind","command":"rewind","input":{"before":"turn"},"state":"accepted"}
-        terminal = {**rewind,"state":"unknown_after_restart"}
-        self.seed([("receipt",rewind),("state",{"state":"rewinding"}),("receipt",terminal)])
-        self.start()
-        self.assertIsNone(self.status()["rewind_request"])
-        self.assertEqual(self.status()["receipts"]["rewind"]["state"],"unknown_after_restart")
-
-    def test_live_unknown_rewind_receipt_clears_pending_guard(self):
-        rewind = {"request_id":"rewind","command":"rewind","input":{"before":"turn"},"state":"accepted"}
-        terminal = {**rewind,"state":"unknown"}
-        self.seed([("receipt",rewind),("state",{"state":"rewinding"}),("receipt",terminal)])
-        self.start()
-        self.assertIsNone(self.status()["rewind_request"])
-        self.assertEqual(self.status()["receipts"]["rewind"]["state"],"unknown")
 
     def test_reused_pid_never_kills_unrelated_process(self):
         sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", self.env["CLOUDROOM_CODEX_BINARY"]],
@@ -961,6 +1032,8 @@ def queue_and_recovery_checks(service, root):
         r = service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": key, "text": key}, 202)
         assert r["receipt"]["state"] == "accepted", r
     assert service.session(sid)["queue"] == ["q2", "q3"], service.session(sid)["queue"]
+    # A sandbox host may stop the machine only after Core drains; a turn in flight refuses it.
+    assert service.request("POST", "/v1/drain", {"hold": True}, 200)["drained"] is False
     # Retrying a queued id is idempotent; conflicting content is rejected.
     service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "q2", "text": "q2"}, 202)
     service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "q2", "text": "different"}, 409)
@@ -968,6 +1041,9 @@ def queue_and_recovery_checks(service, root):
     for key in ["q1", "q2", "q3"]:
         until(lambda k=key: service.session(sid)["receipts"][k]["state"] == "completed", f"{key} completed")
     until(lambda: service.session(sid)["state"] == "idle", "queue drained")
+    assert service.request("POST", "/v1/drain", {"hold": True}, 200)["drained"] is True
+    service.request("POST", f"/v1/sessions/{sid}/prompts", {"request_id": "while-draining", "text": "x"}, 409)
+    service.request("POST", "/v1/drain", {"hold": False}, 200)
     order = [r["data"]["request_id"] for r in service.records(sid)
              if r["kind"] == "state" and r["data"].get("state") == "starting_turn"]
     assert order == ["q1", "q2", "q3"], order

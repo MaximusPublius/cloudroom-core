@@ -13,6 +13,107 @@ use tokio::process::Command;
 
 pub(super) type Identity = Option<(u32, u32)>;
 
+pub(super) fn checkpoint(
+    previous: &serde_json::Value,
+    data: &serde_json::Value,
+    native: Option<&str>,
+) -> io::Result<serde_json::Value> {
+    let offset = data["offset"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("missing native offset"))?;
+    if offset != previous["offset"].as_u64().unwrap_or(0) {
+        return Err(io::Error::other("native record offset mismatch"));
+    }
+    let length = native
+        .ok_or_else(|| io::Error::other("missing native record"))?
+        .len() as u64;
+    Ok(
+        serde_json::json!({"offset":offset.checked_add(length).ok_or_else(||io::Error::other("native offset overflow"))?}),
+    )
+}
+
+pub(super) fn images(
+    handle: &super::Handle,
+    input: &serde_json::Value,
+    mut remaining: usize,
+) -> io::Result<Vec<serde_json::Value>> {
+    use serde_json::json;
+    let mut images = Vec::new();
+    let mut push = |path: &str| -> io::Result<()> {
+        let limit = 10 * 1024 * 1024;
+        let file = open(&handle.repository, Path::new(path), handle.file_identity)?;
+        if file.metadata()?.len() > limit {
+            return Err(io::Error::other("image exceeds the attachment size limit"));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(io::Error::other("image exceeds the attachment size limit"));
+        }
+        let mime = match Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("heic") => "image/heic",
+            _ => "application/octet-stream",
+        };
+        let image = json!({"type":"image","data":base64_encode(&bytes),"mimeType":mime});
+        remaining = remaining
+            .checked_sub(serde_json::to_vec(&image)?.len() + 1)
+            .ok_or_else(|| io::Error::other("images exceed the native request size limit"))?;
+        images.push(image);
+        Ok(())
+    };
+    if let Some(content) = input["content"].as_array() {
+        for part in content {
+            if matches!(part["type"].as_str(), Some("image" | "localImage"))
+                && let Some(path) = part["path"].as_str().or_else(|| part["url"].as_str())
+            {
+                push(path)?;
+            }
+        }
+    }
+    if let Some(attachments) = input["attachments"].as_array() {
+        for attachment in attachments {
+            if attachment["kind"] == "image"
+                && let Some(path) = attachment["path"].as_str()
+            {
+                push(path)?;
+            }
+        }
+    }
+    Ok(images)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = ((chunk[0] as u32) << 16)
+            | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(TABLE[(n >> 18) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 pub(super) fn open(root: &Path, path: &Path, identity: Identity) -> io::Result<File> {
     open_entry(root, path, identity, false)
 }
@@ -54,7 +155,7 @@ fn open_entry(root: &Path, path: &Path, identity: Identity, directory: bool) -> 
         .stdout(Stdio::from(OwnedFd::from(child_socket)))
         .stderr(Stdio::null());
     if let Some((uid, gid)) = identity {
-        super::linux::as_agent(&mut command, uid, gid, None)?;
+        super::linux::as_agent(&mut command, uid, gid, None, true)?;
     }
     let mut child = command.as_std_mut().spawn()?;
     drop(command);
@@ -144,10 +245,17 @@ fn receive(socket: &mut UnixStream) -> io::Result<File> {
         0
     };
     // These C layouts match msghdr/iovec/cmsghdr on the supported Linux/macOS targets.
-    let count = unsafe { recvmsg(socket.as_raw_fd(), &mut message, flags) };
-    if count < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // A child exiting (SIGCHLD) can interrupt the wait; retry instead of failing the session.
+    let count = loop {
+        let count = unsafe { recvmsg(socket.as_raw_fd(), &mut message, flags) };
+        if count >= 0 {
+            break count;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
     if rights.level == SOCKET_LEVEL && rights.kind == 1 && rights.fd >= 0 {
         // The private socket has exactly one trusted sender and one SCM_RIGHTS fd.
         let file = unsafe { File::from_raw_fd(rights.fd) };

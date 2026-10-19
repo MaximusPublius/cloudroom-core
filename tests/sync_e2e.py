@@ -71,7 +71,8 @@ class SyncTests(unittest.TestCase):
         atomic_json(connection_file, self.connection)
         self.config.update(connectionFile=str(connection_file), binding=[self.connection['url'], None])
         atomic_json(self.client_state / 'config.json', self.config)
-        with patch('client.launch') as launch:
+        # An empty home keeps the developer's own MCP configuration out of this migration check.
+        with patch('client.launch') as launch, patch('client.Path.home', return_value=self.root.resolve()):
             configure(self.client_state, connection_file)
             self.assertEqual(launch.call_args_list[0].kwargs, {'stop': True})
             self.assertEqual(launch.call_count, 2)
@@ -162,7 +163,7 @@ class SyncTests(unittest.TestCase):
             self.remote.upload('skills-shared','escape/file',None,{'tag':'x','kind':'file','executable':False,'size':1},io.BytesIO(b'x'))
         self.assertFalse((outside / 'file').exists())
 
-    def test_settings_preserve_local_fields_and_codex_login_moves_both_ways(self):
+    def test_settings_sync_without_copying_codex_logins_and_old_workers_are_denied(self):
         self.prepare()
         local = self.root / 'settings'; local.mkdir()
         cloud_home = Path(self.env['CLOUDROOM_ACCOUNT_HOME'])
@@ -184,8 +185,12 @@ class SyncTests(unittest.TestCase):
         remote_auth = cloud_home / '.codex/auth.json'
         remote_auth.write_text('{"account":"synthetic-cloud"}')
         self.sync()
-        self.assertEqual((local / 'auth.json').read_text(), remote_auth.read_text())
-        self.assertEqual((local / 'auth.json').stat().st_mode & 0o777, 0o600)
+        self.assertEqual((local / 'auth.json').read_text(), '{"account":"synthetic-mac"}')
+        self.assertEqual(remote_auth.read_text(), '{"account":"synthetic-cloud"}')
+        self.service.request('GET', '/v1/sync/auth-codex?device=' + self.config['device'], expected=410)
+        with self.assertRaises(OSError):
+            self.remote.upload('auth-codex', 'auth.json', None, {'tag':'x','kind':'file','executable':False,'size':1}, io.BytesIO(b'x'))
+        self.assertEqual(remote_auth.read_text(), '{"account":"synthetic-cloud"}')
 
     def test_pending_recovery_requires_manual_cleanup_and_preserves_late_writers(self):
         self.prepare()

@@ -8,7 +8,7 @@ impl Directory {
             "cloudroom-diagnostics-{:x}",
             RandomState::new().hash_one(SystemTime::now())
         ));
-        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
@@ -55,6 +55,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
         database_url: "postgres://127.0.0.1:1/test".into(),
         store: "test".into(),
         allow_insecure_database: true,
+        instance: None,
         account_home: directory.0.clone(),
         default_harness: crate::runtime::Kind::Codex,
         harnesses: [(
@@ -72,7 +73,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy(&config.database_url)
         .unwrap();
-    let diagnostics = Observability::start(&config, pool);
+    let diagnostics = Observability::start(&config, pool, metrics::AgentCounts::default);
     // No await: the producer must neither block nor allocate an unbounded queue.
     for _ in 0..CAPACITY * 2 {
         diagnostics.record(Signal::HistoryFault { operation: "test" });
@@ -114,6 +115,7 @@ async fn database_outage_keeps_local_diagnostics_and_overload_is_visible() {
             "harness process exited",
             false,
             ExitDetails {
+                cause: None,
                 code: Some(42),
                 signal: None,
                 stderr_bytes: marker.len() as u64,

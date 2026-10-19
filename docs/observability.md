@@ -1,14 +1,16 @@
 # Diagnostics
 
-One internal module; no alerts, dashboard, external collector, or new dependency. Apply [0002-diagnostics.sql](database/0002-diagnostics.sql) explicitly. It reuses the existing database connection and TLS policy. Missing migrations or database outages do not prevent local logging or agent execution.
+One internal module; no alerts, external collector, or new dependency. The [dashboard history API](dashboard.md#metric-history) exposes only aggregated resource readings and session counts. Apply [0002-diagnostics.sql](database/0002-diagnostics.sql) explicitly. It reuses the existing database connection and TLS policy. Missing migrations or database outages do not prevent local logging or agent execution.
 
 ## Recorded data
 
-- `api`: route template, GET/POST/other, HTTP status and response-header latency. SSE timing covers stream setup, not its lifetime. `X-Cloudroom-Diagnostic-Id` matches `run_id-sequence`.
+- `api`: route template, GET/POST/other, HTTP status and response-header latency. SSE timing covers stream setup, not its lifetime. `X-Cloudroom-Diagnostic-Id` matches the individual local record's `run_id-sequence`. PostgreSQL keeps individual errors, requests taking at least one second, and commands.
+- `api_summary`: successful GETs and `/v1/sync` POSTs below one second become one PostgreSQL row per method/route/status each minute. It contains request count, total/max latency, and first/last timestamps. Individual requests remain in bounded local logs. Shutdown flushes partial summaries; abrupt process loss can lose buffered counts.
 - `agent_start`: Cloudroom session ID, initialization success and elapsed milliseconds; not inference response time.
 - `agent_exit`: session ID (`null` for model discovery), harness, fixed reason, expected/technical classification, exit code or signal, stderr byte count, EOF confirmation and truncation flag. Session exit records include the matching `diagnostic_id` (`run_id-sequence`). Normal turn completion is not a crash.
+- `auth_health`: Claude credential-presence checks and the last observed inference authentication outcome; see [login monitoring](#claude-login-monitoring).
 - `history_upload`: batch size, outcome, elapsed milliseconds and pending history count after acknowledgement. `history_fault` identifies journal read/acknowledgement failure.
-- `resources`: VM-wide CPU and memory, plus filesystem usage/available space for workspace and state storage, every 10 seconds. CPU/memory use Linux `/proc`; unsupported or failed samples are `null`, never zero. First CPU sample is unknown. Filesystem sampling uses `/bin/df` with a one-second timeout. These are observations, not resource limits.
+- `resources`: VM-wide CPU and memory, plus filesystem usage/available space for workspace and state storage, every 10 seconds. CPU/memory use Linux `/proc`; unsupported or failed samples are `null`, never zero. First CPU sample is unknown. Filesystem sampling uses `/bin/df` with a one-second timeout. Session Management also supplies full-registry working/queued/waiting/failed counts on this cycle; older samples have no counts. These are observations, not resource limits.
 - `diagnostics`: cumulative dropped-record, local-write-failure and database-write-failure counts for this process.
 
 Ordinary local/SQL diagnostics contain only fixed diagnostic fields and correlation IDs. No credentials, prompts, native history, filesystem paths, request bodies or raw URLs. The separate, protected stderr capture below is the only raw-output exception. History and recovery remain with their existing owners.
@@ -17,11 +19,23 @@ Ordinary local/SQL diagnostics contain only fixed diagnostic fields and correlat
 
 - `$CLOUDROOM_STATE_DIR/diagnostics.jsonl` and `diagnostics.previous.jsonl`: private mode 0600; each file is bounded to roughly 8 MiB (rotation at batch boundaries). Writes run off the request path, without per-record fsync.
 - One-second batches; a 1,024-record ingress queue and a 1,024-record pending database buffer. Overflow is counted. Database calls have a two-second deadline; local writes use the blocking pool. Only one diagnostic database operation runs at once, sharing the existing pool.
+- Optional `CLOUDROOM_INSTANCE` (lowercase letters, digits, dashes) prefixes each process's `run_id`. Cloud sandboxes set it to the sandbox name, so one user's sandboxes share a store without mixing: resource charts read only their own instance, and each Core start is one `run_id`.
 - Retries use stable `(store, run_id, sequence)` keys. Pending uploads survive brief outages in memory, not process loss. Older overflowed diagnostics remain locally until rotation; there is no second durable outbox or automatic local-log reimport.
-- PostgreSQL retains seven days per store, pruned hourly while the core runs. Stopped cores do not run cleanup. Local logs use size-based retention instead. Shutdown attempts a final flush for up to five seconds.
+- PostgreSQL retains resource samples (including agent counts) for 30 days per store, and other diagnostics for seven days. Hourly cleanup deletes at most 1,000 expired rows per batch, continuing each second while a backlog remains; failures retry after one minute. Stopped cores do not run cleanup. Local logs use size-based retention instead. Shutdown attempts a final flush for up to five seconds.
 - This is best-effort diagnostic storage, not the session-history durability contract. Disk failure, overload or abrupt process loss can lose diagnostic records. Check local logs during database failures; database failure counters appear in the next diagnostic summary.
 
 Use owner-isolated database credentials as required by [0001](database/0001-session-records.sql). A `store` label is not an authorization boundary. RLS denies browser-role access by default; never expose database credentials or these SQL queries through an unrestricted web endpoint.
+
+## Claude login monitoring
+
+Runtime runs one monitor when Claude is configured: at startup and every five minutes. It reuses `claude auth status --json` under the agent identity, with bounded output and a ten-second timeout. Concurrent session starts share an in-flight check. Shutdown cancels the probe; monitoring never restarts agents or initiates inference.
+
+- `credentials`: `unknown`, `present`, `missing`, or `check_failed`. **Presence does not prove validity.** Claude 2.1.280 reports synthetic expired credentials as logged in and leaves them unchanged.
+- `last_request`: `unknown`, `accepted`, or `rejected`, with `last_request_at_ms`. Only a completed inference result with output tokens marks acceptance; the native `authentication_failed` code marks rejection. Initialization, replayed errors, rate limits and unrelated failures do not. A presence check cannot erase a rejection.
+- Records contain only these states, the harness, a fixed reason, and ordinary diagnostic identifiers/timestamps. Record the initial observation, state/reason changes, and otherwise a daily summary. Reuse the existing bounded queues, database connection and seven-day retention; no migration. Database failure never blocks checks or execution.
+- Native Claude owns renewal. This monitor does **not** renew idle logins, read/copy token files, or prove who removed credentials. No supported standalone refresh command was verified; remote invalidation of credentials that remain present is detected when Claude reports it during work. See the native [CLI reference](https://code.claude.com/docs/en/cli-reference) and [login-expiry behavior](https://code.claude.com/docs/en/errors#login-expired).
+
+Inspect the existing `cloudroom_diagnostics` table with the owner-scoped query in [Inspect](#inspect), adding `AND record->>'kind' = 'auth_health'`. Check both credential presence and the timestamp of the last request; neither is an unconditional healthy-login flag.
 
 ## Protected harness stderr
 
@@ -55,9 +69,11 @@ FROM cloudroom_diagnostics WHERE store = :'store'
 ORDER BY timestamp_ms DESC LIMIT 100;
 
 SELECT record->>'route' AS route, record->>'status' AS status,
-       count(*), avg((record->>'duration_ms')::numeric) AS average_ms
+       sum(coalesce((record->>'requests')::bigint, 1)) AS requests,
+       sum(coalesce((record->>'total_duration_ms')::numeric, (record->>'duration_ms')::numeric))
+         / sum(coalesce((record->>'requests')::bigint, 1)) AS average_ms
 FROM cloudroom_diagnostics
-WHERE store = :'store' AND record->>'kind' = 'api'
+WHERE store = :'store' AND record->>'kind' IN ('api', 'api_summary')
   AND timestamp_ms > (extract(epoch FROM now() - interval '1 hour') * 1000)::bigint
 GROUP BY 1, 2;
 ```

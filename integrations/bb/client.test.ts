@@ -14,6 +14,7 @@ async function fixture(
     res: ServerResponse,
     body: Record<string, unknown>,
   ) => void | Promise<void>,
+  timeoutMs = 5000,
 ) {
   const requests: string[] = [];
   const server = createServer(async (req, res) => {
@@ -29,7 +30,7 @@ async function fixture(
   assert(address && typeof address !== "string");
   const url = `http://127.0.0.1:${address.port}`;
   return {
-    client: new CloudroomClient({ url, token: "test-token", timeoutMs: 150 }),
+    client: new CloudroomClient({ url, token: "test-token", timeoutMs }),
     url,
     requests,
     async close() {
@@ -44,7 +45,49 @@ function sendJson(res: ServerResponse, value: unknown, status = 200) {
   res.end(JSON.stringify(value));
 }
 
-test("reports allowlisted rejections, keeps temporary conflicts retryable, and never exposes response bodies", async (t) => {
+test("routes Cursor account operations and rejects off-domain login links", async (t) => {
+  let url = "https://cursor.com/loginDeepControl?challenge=fixture";
+  const bodies: Record<string, unknown>[] = [];
+  const service = await fixture((req, res, body) => {
+    bodies.push(body);
+    sendJson(res, { state: "waiting", email: null, plan: null, message: null, login_id: "login", verification_url: url, user_code: null }, req.method === "POST" ? 202 : 200);
+  });
+  t.after(() => service.close());
+  assert.equal((await service.client.cursorAuth()).verification_url, url);
+  await service.client.cursorAuth("login", "login");
+  await service.client.cursorAuth("cancel", "login");
+  await service.client.cursorAuth("key", "key", "synthetic-key");
+  assert.deepEqual(bodies, [{}, { request_id: "login" }, { request_id: "login" }, { request_id: "key", api_key: "synthetic-key" }]);
+  assert.deepEqual(service.requests, ["GET /v1/accounts/cursor", "POST /v1/accounts/cursor/login", "POST /v1/accounts/cursor/cancel", "POST /v1/accounts/cursor/key"]);
+  for (url of ["https://cursor.com.evil.invalid/loginDeepControl?challenge=fixture", "https://user:pass@cursor.com/loginDeepControl", "https://cursor.com/other", "http://cursor.com/loginDeepControl"]) {
+    await assert.rejects(service.client.cursorAuth(), /Unexpected Cursor sign-in URL/);
+  }
+});
+
+test("accepts synchronous Pi key writes and preserves receipt errors", async (t) => {
+  const service = await fixture((req, res) => {
+    if (req.url === "/v1/accounts/pi/key") return sendJson(res, { providers: ["openai"] });
+    sendJson(res, {
+      session: {
+        ...snapshot(1).session,
+        receipts: {
+          failed: {
+            request_id: "failed",
+            command: "prompt",
+            state: "failed",
+            input: { text: "hello" },
+            error: "provider unavailable",
+          },
+        },
+      },
+    });
+  });
+  t.after(() => service.close());
+  assert.deepEqual(await service.client.piApiKey("openai", "synthetic-key"), { providers: ["openai"] });
+  assert.equal((await service.client.session("s1")).receipts.failed.error, "provider unavailable");
+});
+
+test("reports allowlisted rejections, keeps temporary conflicts retryable, and shows unknown core errors", async (t) => {
   let body: unknown;
   const service = await fixture((_req, res) => sendJson(res, body, 409));
   t.after(() => service.close());
@@ -68,7 +111,9 @@ test("reports allowlisted rejections, keeps temporary conflicts retryable, and n
       assert.equal(error.status, 409);
       assert.equal(error.code, code);
       assert.equal(error.retryable, retryable);
-      assert(!error.message.includes("SECRET-CANARY"));
+      // Allowlisted codes keep their friendly text; unknown rejections show the core's own error (ADR 0123).
+      const shown = code === null && typeof (value as { error?: unknown }).error === "string";
+      assert.equal(error.message.includes("SECRET-CANARY"), shown);
       return true;
     });
   }
@@ -193,7 +238,7 @@ test("rejects each authentication layer independently and replays through the ga
   const url = `http://127.0.0.1:${address.port}`;
   for (const [token, gate, status] of [["test-token", undefined, 403], ["test-token", "wrong-gate", 403], ["wrong-core", gateToken, 401]] as const) {
     const client = new CloudroomClient({ url, token, gateToken: gate });
-    const rejected = (error: unknown) => error instanceof CloudroomError && error.status === status && error.message === "Cloudroom authentication failed";
+    const rejected = (error: unknown) => error instanceof CloudroomError && error.status === status && error.message === `Cloudroom authentication failed (HTTP ${status})`;
     await assert.rejects(client.ready(), rejected);
     await assert.rejects(client.start("rejected"), rejected);
     await assert.rejects(async () => {
@@ -573,7 +618,7 @@ test("rejects invalid stream cursors and mismatched event bodies", async (t) => 
 });
 
 test("times out a stalled command without resubmitting", async (t) => {
-  const service = await fixture(() => {});
+  const service = await fixture(() => {}, 150);
   t.after(() => service.close());
   await assert.rejects(service.client.start("once"), /cancelled or timed out/);
   assert.equal(service.requests.length, 1);

@@ -72,6 +72,7 @@ struct Call {
     params: Value,
     request: Option<String>,
     target: Option<String>,
+    dispatch_only: bool,
     reply: Option<oneshot::Sender<io::Result<Value>>>,
 }
 
@@ -103,7 +104,7 @@ impl Process {
             .as_ref()
             .map(|policy| {
                 let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
-                group.attach(&mut command, policy.agent_uid, policy.agent_gid)?;
+                group.attach(&mut command, policy)?;
                 command.env("npm_config_cache", policy.cache_dir.join("npm"));
                 Ok::<_, io::Error>(group)
             })
@@ -141,6 +142,7 @@ impl Process {
             let mut deadline = None;
             let mut output_closed = false;
             let mut close_pending = false;
+            let mut cause = None;
             let reason = loop {
                 let mut bounded = (&mut output).take((MAX_LINE + 1 - line.len()) as u64);
                 tokio::select! {
@@ -164,15 +166,22 @@ impl Process {
                             let _ = call.reply.map(|r|r.send(Err(io::Error::new(io::ErrorKind::InvalidInput,"target is no longer active"))));
                             continue;
                         }
+                        if let Err(error) = adapter.validate(&call.method, &call.params) {
+                            let _ = call.reply.map(|reply| reply.send(Err(error)));
+                            continue;
+                        }
                         if let Some(request) = &call.request {
                             if state.request.is_some() && !state.finished { let _ = call.reply.map(|r| r.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "harness is busy")))); continue; }
-                            state = Progress { native: state.native.clone(), request: Some(request.clone()), ..Progress::default() };
+                            state = Progress { native: state.native.clone(), model: state.model.clone(), request: Some(request.clone()), ..Progress::default() };
                             progress.send_replace(state.clone());
                         }
                         next += 1;
                         let frame = adapter.encode(next, &call.method, call.params, call.request.as_deref());
-                        if let Some(reply) = call.reply { pending.insert(next, reply); }
                         if write(input.as_mut().unwrap(), &frame).await.is_err() { break "harness stdin closed"; }
+                        if let Some(reply) = call.reply {
+                            if call.dispatch_only { let _ = reply.send(Ok(Value::Null)); }
+                            else { pending.insert(next, reply); }
+                        }
                     }
                     result = bounded.read_until(b'\n', &mut line), if !output_closed => {
                         if matches!(result, Ok(0)) && deadline.is_some() { output_closed = true; continue; }
@@ -180,7 +189,7 @@ impl Process {
                         if line.len() > MAX_LINE || !line.ends_with(b"\n") { break "invalid or oversized harness frame"; }
                         let raw = match String::from_utf8(std::mem::take(&mut line)) { Ok(s) => s, Err(_) => break "invalid harness UTF-8" };
                         let value: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => break "malformed harness JSON" };
-                        let records = match adapter.receive(&value, raw, &mut state) { Ok(r) => r, Err(_) => break "invalid native state" };
+                        let records = match adapter.receive(&value, raw, &mut state) { Ok(r) => r, Err(e) => { cause = Some(e.to_string()); break "invalid native state" } };
                         progress.send_replace(state.clone());
                         let mut disconnected = false;
                         for record in records { if events.send(record).await.is_err() { disconnected = true; break; } }
@@ -194,7 +203,7 @@ impl Process {
                         if let Some((id, result)) = adapter.response(&value) && let Some(reply) = pending.remove(&id) { let _ = reply.send(result); }
                     }
                     _ = tick.tick() => {
-                        let records = match adapter.capture() { Ok(r) => r, Err(_) => break "native history capture failed" };
+                        let records = match adapter.capture() { Ok(r) => r, Err(e) => { cause = Some(e.to_string()); break "native history capture failed" } };
                         let mut disconnected = false;
                         for record in records { if events.send(record).await.is_err() { disconnected = true; break; } }
                         if disconnected { break "recording owner disconnected"; }
@@ -204,7 +213,7 @@ impl Process {
             drop(input);
             let exited = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
             let mut status = exited.ok().and_then(Result::ok);
-            let graceful = status.is_some_and(|status| status.success());
+            let graceful = status.is_some_and(|status| adapter.clean_exit(status.code()));
             if status.is_none() {
                 let _ = child.kill().await;
                 status = child.wait().await.ok();
@@ -226,16 +235,21 @@ impl Process {
                                 break;
                             }
                         }
-                        if empty && !adapter.capture_pending() {
-                            break;
+                        if empty {
+                            if !adapter.capture_pending() {
+                                break;
+                            }
+                            tick.tick().await;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         reason = "native history capture failed at exit";
+                        cause = Some(error.to_string());
                         break;
                     }
                 }
             }
+            details.cause = cause;
             if !cleaned_up {
                 reason = "workload exit unconfirmed; refusing replacement";
             }
@@ -265,14 +279,25 @@ impl Process {
     pub fn pid(&self) -> u32 {
         self.pid
     }
+    /// Processes in this harness's workload, including background jobs. None without containment.
+    pub fn process_count(&self) -> Option<usize> {
+        self.group.as_ref()?.process_count()
+    }
     pub async fn call(
         &self,
         method: &str,
         params: Value,
         request: Option<&str>,
     ) -> io::Result<Value> {
-        self.call_inner(method, params, request, None, Duration::from_secs(30))
-            .await
+        self.call_inner(
+            method,
+            params,
+            request,
+            None,
+            Duration::from_secs(30),
+            false,
+        )
+        .await
     }
     pub async fn call_timeout(
         &self,
@@ -281,12 +306,37 @@ impl Process {
         request: Option<&str>,
         timeout: Duration,
     ) -> io::Result<Value> {
-        self.call_inner(method, params, request, None, timeout)
+        self.call_inner(method, params, request, None, timeout, false)
             .await
     }
     pub async fn control(&self, method: &str, params: Value, target: &str) -> io::Result<Value> {
-        self.call_inner(method, params, None, Some(target), Duration::from_secs(30))
-            .await
+        self.call_inner(
+            method,
+            params,
+            None,
+            Some(target),
+            Duration::from_secs(30),
+            false,
+        )
+        .await
+    }
+    pub async fn dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        request: Option<&str>,
+        target: Option<&str>,
+    ) -> io::Result<()> {
+        self.call_inner(
+            method,
+            params,
+            request,
+            target,
+            Duration::from_secs(30),
+            true,
+        )
+        .await?;
+        Ok(())
     }
     async fn call_inner(
         &self,
@@ -295,6 +345,7 @@ impl Process {
         request: Option<&str>,
         target: Option<&str>,
         timeout: Duration,
+        dispatch_only: bool,
     ) -> io::Result<Value> {
         if *self.stop.borrow() {
             return Err(io::Error::other("harness is closing"));
@@ -307,6 +358,7 @@ impl Process {
                 params,
                 request: request.map(str::to_owned),
                 target: target.map(str::to_owned),
+                dispatch_only,
                 reply: Some(reply),
             }),
         )
@@ -334,6 +386,7 @@ impl Process {
                 params: Value::Null,
                 request: None,
                 target: None,
+                dispatch_only: false,
                 reply: None,
             })
             .await

@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, Version, header},
     middleware::{self, Next},
@@ -16,14 +16,32 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{convert::Infallible, sync::Arc, time::Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub fn router(manager: Arc<Manager>, token: String) -> Router {
     Router::new()
+        .merge(crate::preview::routes())
+        .merge(crate::mac::routes())
+        .merge(crate::secrets::routes())
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/accounts/cursor", get(cursor_auth))
+        .route("/v1/accounts/cursor/{action}", post(cursor_account))
+        .route("/v1/accounts/claude", get(claude_auth))
+        .route("/v1/accounts/claude/version", post(claude_version))
+        .route("/v1/accounts/claude/{action}", post(claude_account))
+        .route("/v1/accounts/pi", get(pi_auth))
+        .route("/v1/accounts/pi/import", post(pi_import))
+        .route("/v1/accounts/pi/setup", post(pi_setup))
+        .route("/v1/accounts/pi/key", post(pi_key))
+        .route("/v1/accounts/codex", get(codex_auth))
+        .route("/v1/accounts/codex/login", post(codex_login))
+        .route("/v1/accounts/codex/import", post(codex_import))
+        .route("/v1/accounts/codex/switched", post(codex_switched))
+        .route("/v1/accounts/codex/cancel", post(codex_cancel))
         .route("/v1/workspaces/{id}", get(workspace))
         .route("/v1/settings", get(crate::sync::settings))
         .route("/v1/sync", post(crate::sync::check_in))
@@ -35,13 +53,28 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/dashboard", get(dashboard))
-        .route("/v1/sessions", post(start))
+        .route("/v1/drain", post(drain))
+        .route("/v1/metrics", get(metrics))
+        .route(
+            "/v1/teleports",
+            post(teleport_prepare).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/v1/teleports/check", post(teleport_check))
+        .route("/v1/teleports/{id}", get(teleport_status))
+        .route("/v1/teleports/{id}/activate", post(teleport_activate))
+        .route("/v1/teleports/{id}/cancel", post(teleport_cancel))
+        .route(
+            "/v1/teleports/{id}/files/{index}",
+            post(teleport_upload).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route("/v1/sessions", post(start).get(list_sessions))
         .route("/v1/sessions/{id}", get(status))
         .route("/v1/sessions/{id}/workspace", get(session_workspace))
         .route("/v1/sessions/{id}/recovery", get(recovery))
         .route("/v1/sessions/{id}/prompts", post(prompt))
         .route("/v1/sessions/{id}/edit", post(edit))
         .route("/v1/sessions/{id}/cancel", post(cancel))
+        .route("/v1/sessions/{id}/reorder", post(reorder))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/compact", post(compact))
         .route("/v1/sessions/{id}/rewind", post(rewind))
@@ -51,6 +84,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         )
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop))
+        .route("/v1/sessions/{id}/sleep", post(sleep))
         .route("/v1/sessions/{id}/resume", post(resume))
         .route("/v1/sessions/{id}/close", post(close))
         .route("/v1/sessions/{id}/events", get(events))
@@ -65,6 +99,303 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
             observe,
         ))
         .with_state(manager)
+}
+
+async fn cursor_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
+    Json(manager.cursor_auth_status().await)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorAccountRequest {
+    request_id: String,
+    api_key: Option<String>,
+}
+async fn cursor_account(
+    State(manager): State<Arc<Manager>>,
+    Path(action): Path<String>,
+    Json(input): Json<CursorAccountRequest>,
+) -> Result<(StatusCode, Json<crate::runtime::auth::Status>)> {
+    crate::workspace::valid_id(&input.request_id)
+        .map_err(|_| session::Error::Conflict("invalid request ID"))?;
+    if !matches!(action.as_str(), "login" | "cancel" | "key")
+        || (action == "key") != input.api_key.is_some()
+    {
+        return Err(session::Error::Conflict("invalid Cursor account operation"));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .cursor_account(&action, input.request_id, input.api_key)
+                .await?,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeAccountRequest {
+    request_id: String,
+    code: Option<String>,
+    state: Option<String>,
+    token: Option<String>,
+    plan: Option<String>,
+    api_key: Option<String>,
+}
+async fn claude_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
+    Json(manager.claude_auth_status().await)
+}
+async fn claude_account(
+    State(manager): State<Arc<Manager>>,
+    Path(action): Path<String>,
+    Json(input): Json<ClaudeAccountRequest>,
+) -> Result<(StatusCode, Json<crate::runtime::auth::Status>)> {
+    crate::workspace::valid_id(&input.request_id)
+        .map_err(|_| session::Error::Conflict("invalid request ID"))?;
+    let valid = |value: &Option<String>, max: usize| {
+        value.as_ref().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= max
+                && s.bytes().all(|c| c.is_ascii_graphic())
+                && !s.starts_with("sk-ant-")
+        })
+    };
+    let secret = |value: &Option<String>, prefix: &str| {
+        value.as_ref().is_some_and(|s| {
+            s.starts_with(prefix)
+                && s.len() <= 1024
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        })
+    };
+    let token = secret(&input.token, "sk-ant-oat");
+    let key = secret(&input.api_key, "sk-ant-api");
+    if !matches!(
+        action.as_str(),
+        "login" | "cancel" | "complete" | "token" | "key"
+    ) || (action == "complete" && (!valid(&input.code, 2048) || !valid(&input.state, 512)))
+        || (action != "complete" && (input.code.is_some() || input.state.is_some()))
+        || (action == "token") != token
+        || (action != "token" && input.token.is_some())
+        || (action == "key") != key
+        || (action != "key" && input.api_key.is_some())
+        || (action != "token" && input.plan.is_some())
+        || input.plan.as_ref().is_some_and(|s| {
+            s.is_empty() || s.len() > 32 || !s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+        })
+    {
+        return Err(session::Error::Conflict("invalid Claude sign-in request"));
+    }
+    let (code, state) = match action.as_str() {
+        "token" => (input.token, input.plan),
+        "key" => (input.api_key, None),
+        _ => (input.code, input.state),
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .claude_account(&action, input.request_id, code, state)
+                .await?,
+        ),
+    ))
+}
+
+fn pi_error(error: std::io::Error) -> session::Error {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        session::Error::Conflict("invalid Pi login")
+    } else {
+        error.into()
+    }
+}
+async fn pi_auth(State(manager): State<Arc<Manager>>) -> Result<Json<Value>> {
+    let result = crate::runtime::pi_auth::providers(&manager.config, &manager.storage).await;
+    Ok(Json(result.map_err(pi_error)?))
+}
+async fn pi_import(
+    State(manager): State<Arc<Manager>>,
+    Json(credentials): Json<Value>,
+) -> Result<Json<Value>> {
+    if manager.is_stopping() {
+        return Err(session::Error::Conflict("service is stopping"));
+    }
+    let result =
+        crate::runtime::pi_auth::import(&manager.config, &manager.storage, credentials).await;
+    Ok(Json(result.map_err(pi_error)?))
+}
+/// Copies the Mac's custom Pi providers and installs its packages in the background.
+async fn pi_setup(
+    State(manager): State<Arc<Manager>>,
+    Json(setup): Json<Value>,
+) -> Result<Json<Value>> {
+    if manager.is_stopping() {
+        return Err(session::Error::Conflict("service is stopping"));
+    }
+    let (result, missing) =
+        crate::runtime::pi_auth::setup(&manager.config, &manager.storage, setup)
+            .await
+            .map_err(pi_error)?;
+    if !missing.is_empty() {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            crate::runtime::pi_auth::install(&manager.config, &manager.storage, missing).await
+        });
+    }
+    Ok(Json(result))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PiKey {
+    provider: String,
+    key: String,
+}
+async fn pi_key(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<PiKey>,
+) -> Result<Json<Value>> {
+    if manager.is_stopping() {
+        return Err(session::Error::Conflict("service is stopping"));
+    }
+    let result = crate::runtime::pi_auth::set_key(
+        &manager.config,
+        &manager.storage,
+        input.provider,
+        input.key,
+    )
+    .await;
+    Ok(Json(result.map_err(pi_error)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Drain {
+    hold: bool,
+}
+/// Sandbox hosts call this before stopping the machine (see session::sleep).
+async fn drain(State(manager): State<Arc<Manager>>, Json(input): Json<Drain>) -> Json<Value> {
+    Json(manager.drain(input.hold))
+}
+
+async fn codex_auth(State(manager): State<Arc<Manager>>) -> Json<crate::runtime::auth::Status> {
+    Json(manager.codex_auth_status().await)
+}
+async fn codex_login(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<RequestId>,
+) -> Result<(StatusCode, Json<crate::runtime::auth::Status>)> {
+    crate::workspace::valid_id(&input.request_id)
+        .map_err(|_| session::Error::Conflict("invalid request ID"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.codex_login(input.request_id).await?),
+    ))
+}
+async fn codex_import(
+    State(manager): State<Arc<Manager>>,
+    Json(credentials): Json<Value>,
+) -> Result<Json<crate::runtime::auth::Status>> {
+    Ok(Json(manager.import_codex_login(credentials).await?))
+}
+async fn codex_switched(State(manager): State<Arc<Manager>>) -> Json<Value> {
+    let (status, continued) = manager.codex_switched().await;
+    Json(json!({"account":status,"continued":continued}))
+}
+async fn codex_cancel(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<RequestId>,
+) -> (StatusCode, Json<crate::runtime::auth::Status>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(manager.cancel_codex_login(&input.request_id).await),
+    )
+}
+
+async fn teleport_prepare(
+    State(manager): State<Arc<Manager>>,
+    Json(manifest): Json<session::teleport::Manifest>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.teleport_prepare(manifest).await?),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeVersion {
+    version: String,
+}
+async fn claude_version(
+    State(manager): State<Arc<Manager>>,
+    Json(input): Json<ClaudeVersion>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.match_claude_version(input.version).await?),
+    ))
+}
+async fn teleport_check(
+    State(manager): State<Arc<Manager>>,
+    Json(check): Json<session::teleport::Check>,
+) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(manager.teleport_check(check).await),
+    )
+}
+async fn teleport_status(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    Ok(Json(manager.teleport_status(&id).await?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeleportActivation {
+    retry_request_id: Option<String>,
+}
+async fn teleport_activate(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<TeleportActivation>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .teleport_activate(&id, body.retry_request_id)
+                .await?,
+        ),
+    ))
+}
+async fn teleport_cancel(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(manager.teleport_cancel(&id).await?),
+    ))
+}
+#[derive(Deserialize)]
+struct TeleportOffset {
+    offset: u64,
+    sha256: String,
+    size: Option<u64>,
+}
+async fn teleport_upload(
+    State(manager): State<Arc<Manager>>,
+    Path((id, index)): Path<(String, usize)>,
+    Query(query): Query<TeleportOffset>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            manager
+                .teleport_upload(&id, index, query.offset, query.sha256, query.size, body)
+                .await?,
+        ),
+    ))
 }
 
 async fn observe(
@@ -87,8 +418,9 @@ async fn observe(
         .unwrap_or("unmatched")
         .to_owned();
     let mut response = next.run(request).await;
-    // The hosting gateway retains idle upstream sockets. Keep SSE streams, not completed requests.
+    // The hosting gateway retains idle upstream sockets. Keep SSE streams and upgraded tunnels, not completed requests.
     if matches!(version, Version::HTTP_10 | Version::HTTP_11)
+        && response.status() != StatusCode::SWITCHING_PROTOCOLS
         && !response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -117,7 +449,7 @@ async fn authenticate(State(token): State<Arc<String>>, request: Request, next: 
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|supplied| supplied == token.as_str());
+        .is_some_and(|supplied| same_token(supplied, token.as_str()));
     let mut response = if authorized {
         next.run(request).await
     } else {
@@ -134,37 +466,75 @@ async fn authenticate(State(token): State<Arc<String>>, request: Request, next: 
     response
 }
 
+/// Compares every byte, so response timing does not reveal how much of the token matched.
+fn same_token(supplied: &str, expected: &str) -> bool {
+    let (supplied, expected) = (supplied.as_bytes(), expected.as_bytes());
+    let difference = supplied
+        .iter()
+        .zip(expected)
+        .fold(0, |difference, (a, b)| difference | (a ^ b));
+    supplied.len() == expected.len() && std::hint::black_box(difference) == 0
+}
+
 impl IntoResponse for session::Error {
     fn into_response(self) -> Response {
         let (status, error) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "session not found"),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
-            Self::Storage => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "storage unavailable; retry with the same request_id",
-            ),
+            Self::Storage(detail) => {
+                eprintln!("storage unavailable: {detail}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": format!("storage unavailable ({detail}); retry with the same request_id"),
+                        "code": "storage_unavailable",
+                    })),
+                )
+                    .into_response();
+            }
         };
         let code = match error {
             "invalid model" => "invalid_model",
             "invalid provider" | "provider selection requires Pi" => "invalid_provider",
             "invalid reasoning effort" => "invalid_reasoning_effort",
             "invalid service tier" => "invalid_service_tier",
+            "invalid teleport manifest"
+            | "invalid teleport file"
+            | "invalid transfer ID"
+            | "invalid upload offset"
+            | "overlapping upload"
+            | "upload content changed"
+            | "upload checksum changed"
+            | "teleport file validation failed"
+            | "session text is still uploading"
+            | "saved transfer requires recovery"
+            | "native conversation already belongs to a cloud session" => "teleport_rejected",
+            "transfer cancelled" => "teleport_cancelled",
+            "cloud execution already owns this transfer; use Stop" => "teleport_running",
             "Cloud folder permission denied" => "attachment_permission_denied",
             "attachment upload failed" => "invalid_attachment",
             "image exceeds the 10 MiB limit" | "file exceeds the 25 MiB limit" => {
                 "attachment_too_large"
             }
             "request_id already has different content"
-            | "request_id is reserved by an attachment upload"
             | "session already exists"
             | "saved session has no matching receipt" => "request_conflict",
             "agent setup is incomplete" | "harness is not configured" => "harness_not_configured",
             "invalid workspace" | "workspace mapping unavailable" => "invalid_workspace",
-            "storage unsafe; new execution is blocked" | "storage unsafe; uploads are blocked" => {
-                "storage_blocked"
-            }
+            "storage unsafe; new execution is blocked" => "storage_blocked",
             "service is stopping" => "service_stopping",
+            "service is draining" => "service_draining",
             "model catalog unavailable" => "model_catalog_unavailable",
+            "connect Codex before starting cloud work" => "codex_auth_required",
+            "connect Claude Code before starting cloud work" => "claude_auth_required",
+            "Claude account could not be verified" => "claude_auth_unavailable",
+            "Claude live steering is not supported" => "unsupported_command",
+            "Codex usage limit reached" => "codex_usage_limit",
+            "Codex account could not be verified" => "codex_auth_unavailable",
+            "connect Cursor before starting cloud work" => "cursor_auth_required",
+            "Cursor account could not be verified" => "cursor_auth_unavailable",
+            "close Cursor sessions before changing the cloud login" => "cursor_auth_busy",
+            "finish active Codex work before signing in" => "codex_auth_busy",
             _ => "request_rejected",
         };
         (status, Json(json!({"error":error,"code":code}))).into_response()
@@ -188,6 +558,7 @@ struct Start {
     workspace: Option<String>,
     provider: Option<String>,
     workspace_name: Option<String>,
+    command_guard_enabled: Option<bool>,
 }
 
 async fn workspace(
@@ -200,9 +571,9 @@ async fn workspace(
             StatusCode::NOT_FOUND,
             Json(json!({"error":"workspace not found"})),
         ),
-        Err(_) => (
+        Err(error) => (
             StatusCode::CONFLICT,
-            Json(json!({"error":"workspace unavailable"})),
+            Json(json!({"error":format!("workspace unavailable: {error}")})),
         ),
     }
 }
@@ -244,6 +615,12 @@ struct Edit {
 struct Target {
     request_id: String,
     target_request_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reorder {
+    request_id: String,
+    order: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,6 +682,28 @@ async fn dashboard(State(manager): State<Arc<Manager>>) -> Json<Value> {
     Json(manager.dashboard())
 }
 
+async fn list_sessions(State(manager): State<Arc<Manager>>) -> Json<Value> {
+    Json(manager.list_sessions())
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsQuery {
+    #[serde(default)]
+    range: crate::observability::metrics::Range,
+}
+async fn metrics(
+    State(manager): State<Arc<Manager>>,
+    Query(query): Query<MetricsQuery>,
+) -> Response {
+    match manager.observability.metrics.read(query.range).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "error":"Metric history is unavailable. Check diagnostic storage; agents may still be working."
+        }))).into_response(),
+    }
+}
+
 async fn ready(State(manager): State<Arc<Manager>>) -> impl IntoResponse {
     let ready = manager.ready().await;
     (
@@ -338,6 +737,16 @@ async fn resume(
 ) -> Result<impl IntoResponse> {
     key(&body.request_id)?;
     let receipt = manager.command(&id, body.request_id, "resume", json!({}))?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
+async fn sleep(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<RequestId>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    let receipt = manager.command(&id, body.request_id, "sleep", json!({}))?;
     Ok(accepted(&manager, &id, receipt))
 }
 
@@ -377,7 +786,7 @@ async fn start(
             body.model,
             body.reasoning,
             (body.workspace, body.workspace_name),
-            body.provider,
+            (body.provider, body.command_guard_enabled),
         )
         .await?;
     Ok(accepted(&manager, &id, receipt))
@@ -527,6 +936,19 @@ async fn cancel(
     Ok(accepted(&manager, &id, receipt))
 }
 
+async fn reorder(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Reorder>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    for target in &body.order {
+        key(target)?;
+    }
+    let receipt = manager.command(&id, body.request_id, "reorder", json!({"order":body.order}))?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
 async fn steer(
     State(manager): State<Arc<Manager>>,
     Path(id): Path<String>,
@@ -599,17 +1021,23 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
-    if let Some(receipt) = manager.receipt(&id, &query.request_id)
-        && (receipt.command != "attach"
-            || receipt.input["name"].as_str() != Some(query.name.as_str())
-            || receipt.input["kind"].as_str() != Some(query.kind.as_str()))
-    {
-        return Err(session::Error::Conflict(
-            "request_id already has different content",
-        ));
+    let bytes = axum::body::to_bytes(body, 26 * 1024 * 1024)
+        .await
+        .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(receipt) = manager.receipt(&id, &query.request_id) {
+        if receipt.command != "attach"
+            || receipt.input["name"] != query.name
+            || receipt.input["kind"] != query.kind
+            || receipt.input["size"] != bytes.len()
+            || receipt.input["sha256"] != sha256
+        {
+            return Err(session::Error::Conflict(
+                "request_id already has different content",
+            ));
+        }
+        return Ok(accepted(&manager, &id, receipt));
     }
-    // Continue through storage so an exact retry verifies the submitted bytes
-    // against the already-saved attachment before returning the old receipt.
     let session = manager.session(&id).await?;
     let workspace = session
         .workspace
@@ -618,42 +1046,35 @@ async fn attach(
         return Err(session::Error::Conflict("workspace mapping unavailable"));
     }
     if !manager.recording_available() {
-        return Err(session::Error::Storage);
+        return Err(session::Error::Storage(
+            "session journal is not writable".into(),
+        ));
     }
     if manager.is_stopping() || manager.storage.blocks() {
         return Err(session::Error::Conflict(
             "storage unsafe; uploads are blocked",
         ));
     }
-    let reserved =
-        manager.begin_attachment_write(&id, &query.request_id, &query.name, &query.kind)?;
     let written = manager
         .workspaces
         .attach(
             &workspace,
-            crate::workspace::AttachmentSpec {
-                session_id: &id,
-                request_id: &query.request_id,
-                name: &query.name,
-                kind: &query.kind,
-            },
-            body,
+            &query.request_id,
+            &query.name,
+            &query.kind,
+            Body::from(bytes),
             &manager.storage,
         )
         .await
         .map_err(|error| {
-            if reserved {
-                manager.cancel_attachment_write(&id, &query.request_id);
-            }
             eprintln!(
-                "attachment upload failed: session={id} request={} kind={:?} errno={:?}",
+                "attachment upload failed: session={id} request={} kind={:?} errno={:?}: {error}",
                 query.request_id,
                 error.kind(),
                 error.raw_os_error()
             );
             session::Error::Conflict(match error.kind() {
                 std::io::ErrorKind::WouldBlock => "storage unsafe; uploads are blocked",
-                std::io::ErrorKind::AlreadyExists => "request_id already has different content",
                 std::io::ErrorKind::PermissionDenied => "Cloud folder permission denied",
                 std::io::ErrorKind::FileTooLarge if query.kind == "image" => {
                     "image exceeds the 10 MiB limit"
@@ -662,7 +1083,9 @@ async fn attach(
                 _ => "attachment upload failed",
             })
         })?;
-    let receipt = manager.finish_attachment_write(&id, query.request_id, written, reserved)?;
+    let mut written = written;
+    written["sha256"] = json!(sha256);
+    let receipt = manager.command(&id, query.request_id, "attach", written)?;
     Ok(accepted(&manager, &id, receipt))
 }
 async fn interrupt(

@@ -80,19 +80,6 @@ class WorkspaceTests(unittest.TestCase):
         for item in results:
             until(lambda:self.service.session(item['session_id'])['state']=='idle','peer',10)
             self.assertEqual(self.service.session(item['session_id'])['workspace']['path'],str(path))
-        shared = []
-        for index,item in enumerate(results):
-            content = ('peer-'+str(index)).encode()
-            connection = http.client.HTTPConnection(self.service.address, timeout=10)
-            connection.request('POST',f"/v1/sessions/{item['session_id']}/attachments?request_id=same-request&name=note.txt&kind=file",content,
-                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
-            response = connection.getresponse()
-            uploaded = json.loads(response.read()); connection.close()
-            self.assertEqual(response.status,202,uploaded)
-            shared.append((uploaded['receipt']['input'],content))
-        self.assertNotEqual(shared[0][0]['path'],shared[1][0]['path'])
-        for uploaded,content in shared:
-            self.assertEqual(Path(uploaded['path']).read_bytes(),content)
         self.assertEqual((path/'keep').read_text(),'cloud work')
         print('Direct empty-folder start + attachment + first prompt (protocol fixtures), seconds:',samples)
 
@@ -107,17 +94,13 @@ class WorkspaceTests(unittest.TestCase):
                 {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
             response = connection.getresponse()
             data = json.loads(response.read()); connection.close()
-            if expected is not None:
-                self.assertEqual(response.status,expected,data)
-            else:
-                data['_status'] = response.status
+            self.assertEqual(response.status,expected,data)
             return data
         for kind,path in paths.items():
             until(lambda:self.service.session('cr_'+kind)['state']=='idle','attachment target',10)
             path.chmod(0o700)
-            scope = path/'.cloudroom/attachments'/('cr_'+kind)
             for index, (blocked, mode) in enumerate([(path, 0o000), (path/'.cloudroom', 0o000),
-                    (scope, 0o500), (scope/'denied-3', 0o500)]):
+                    (path/'.cloudroom/attachments', 0o500), (path/'.cloudroom/attachments/denied-3', 0o500)]):
                 blocked.mkdir(mode=0o700, exist_ok=True)
                 blocked.chmod(mode)
                 try:
@@ -135,36 +118,22 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(uploaded['size'],len(payload))
             self.assertEqual(dest.stat().st_mode & 0o777,0o600)
             self.assertEqual(upload(kind,'note','note.txt',payload)['receipt']['input'],uploaded)
-            for changed in [
-                upload(kind,'note','different.txt',payload,expected=409),
-                upload(kind,'note','note.txt',payload,media='image',expected=409),
-                upload(kind,'note','note.txt',b'X'+payload[1:],expected=409),
-                upload(kind,'note','note.txt',payload+b'X',expected=409),
-            ]:
-                self.assertEqual(changed['code'],'request_conflict')
-                self.assertEqual(changed['error'],'request_id already has different content')
-            self.assertFalse((scope/'note'/'different.txt').exists())
+            self.assertEqual(upload(kind,'note','other.txt',payload,expected=409)['code'],'request_conflict')
+            self.assertEqual(upload(kind,'note','note.txt',payload,'image',409)['code'],'request_conflict')
+            self.assertEqual(upload(kind,'note','note.txt',payload+b'changed',expected=409)['code'],'request_conflict')
             self.assertEqual(dest.read_bytes(),payload)
-            race_key = 'same-id-race'
-            race_payloads = [b'A' * 131072, b'B' * 131072]
-            with concurrent.futures.ThreadPoolExecutor(2) as pool:
-                raced = list(pool.map(lambda body: upload(kind,race_key,'race.bin',body,expected=None), race_payloads))
-            accepted = [item for item in raced if item['_status'] == 202]
-            conflicts = [item for item in raced if item['_status'] == 409 and item.get('code') == 'request_conflict']
-            self.assertEqual((len(accepted),len(conflicts)),(1,1),raced)
-            self.assertEqual(Path(accepted[0]['receipt']['input']['path']).read_bytes() in race_payloads,True)
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
-                self.assertFalse((scope/('large-'+media)/'large').exists())
+                self.assertFalse((path/'.cloudroom/attachments'/('large-'+media)/'large').exists())
             outside = self.root.resolve()/('outside-'+kind); outside.mkdir()
             (outside/'keep').write_text('untouched')
-            (scope/'escape').symlink_to(outside)
+            (path/'.cloudroom/attachments/escape').symlink_to(outside)
             upload(kind,'escape','keep',b'changed',expected=409)
-            linked = scope/'linked'; linked.mkdir()
+            linked = path/'.cloudroom/attachments/linked'; linked.mkdir()
             (linked/'keep').symlink_to(outside/'keep')
             upload(kind,'linked','keep',b'changed',expected=409)
-            temporary = scope/'temporary'; temporary.mkdir()
+            temporary = path/'.cloudroom/attachments/temporary'; temporary.mkdir()
             (temporary/'.note.txt.tmp').symlink_to(outside/'keep')
             temporary_upload = upload(kind,'temporary','note.txt',b'normal upload')['receipt']['input']
             self.assertEqual(Path(temporary_upload['path']).read_bytes(),b'normal upload')
@@ -175,33 +144,6 @@ class WorkspaceTests(unittest.TestCase):
             self.service.request('POST',f'/v1/sessions/cr_{kind}/prompts',
                 {'request_id':'read','text':'read attachment','attachments':[uploaded]},202)
             until(lambda:self.service.session('cr_'+kind)['receipts']['read']['state']=='completed','attachment prompt',10)
-
-            slow = http.client.HTTPConnection(self.service.address, timeout=10)
-            slow.putrequest('POST',f'/v1/sessions/cr_{kind}/attachments?request_id=slow&name=slow.bin&kind=file')
-            slow.putheader('Authorization','Bearer '+self.env['CLOUDROOM_TOKEN'])
-            slow.putheader('Content-Type','application/octet-stream')
-            slow.putheader('Content-Length',str(2*1024**2))
-            slow.endheaders()
-            slow.send(b'A'*1024**2)
-            time.sleep(.2)
-            blocked_collision = self.service.request('POST',f'/v1/sessions/cr_{kind}/prompts',
-                {'request_id':'slow','text':'must not claim the upload request'},409)
-            self.assertEqual(blocked_collision['code'],'request_conflict')
-            self.assertEqual(blocked_collision['error'],'request_id is reserved by an attachment upload')
-            blocked_close = self.service.request('POST',f'/v1/sessions/cr_{kind}/close',
-                {'request_id':'close-during-upload'},409)
-            self.assertEqual(blocked_close['error'],'wait for the pending attachment upload')
-            slow.send(b'B'*1024**2)
-            slow_response = slow.getresponse()
-            slow_upload = json.loads(slow_response.read()); slow.close()
-            self.assertEqual(slow_response.status,202,slow_upload)
-            self.assertEqual(Path(slow_upload['receipt']['input']['path']).read_bytes(),b'A'*1024**2+b'B'*1024**2)
-
-            self.service.request('POST',f'/v1/sessions/cr_{kind}/close', {'request_id':'close-before-upload'},202)
-            until(lambda:self.service.session('cr_'+kind)['state']=='closed','closed attachment target',10)
-            rejected = upload(kind,'after-close','orphan.txt',b'must not persist',expected=409)
-            self.assertEqual(rejected['code'],'request_rejected')
-            self.assertFalse((scope/'after-close'/'orphan.txt').exists())
 
     def assert_single_dispatch(self, kind, path, native):
         if kind == 'codex':

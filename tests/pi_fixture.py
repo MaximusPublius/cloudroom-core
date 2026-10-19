@@ -103,6 +103,7 @@ try:
                 content = [{'type':'text','text':text}, *v['images']] if v.get('images') else text
                 entry({'role':'user','content':content})
                 send({'type':'turn_start'})
+                send({'type':'message_start','message':{'role':'assistant','content':[]}})
                 if text in ('hold', 'hold-native-queue'):
                     native_queue = text == 'hold-native-queue'
                     code = "from pathlib import Path;import time,os\np=Path("+repr(native+'.ticks')+");Path("+repr(native+'.pid')+").write_text(str(os.getpid()))\nfor n in range(10000):\n p.write_text(str(n));time.sleep(.05)"

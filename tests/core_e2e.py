@@ -5,7 +5,7 @@ Copies only the selected account's auth.json to a private disposable Codex home.
 Never changes existing databases, checkouts, services, or harness configuration.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import http.client
 import json
@@ -258,7 +258,8 @@ def main():
         evidence["checks"].append(label)
         print("PASS:", label, flush=True)
     try:
-        with fixture_root() as root:
+        with fixture_root() as root, ExitStack() as cleanup:
+            cleanup.callback(lambda: service.stop() if service else None)
             repo = root / "repo"
             repo.mkdir()
             run("git", "init", "--quiet", str(repo))
@@ -381,8 +382,28 @@ def main():
             assert run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
                        "SET ROLE diagnostics_browser; SELECT count(*) FROM cloudroom_diagnostics").splitlines()[-1] == "0"
             passed("local/SQL diagnostics, missing-migration recovery, request correlation, resource measurements, redaction and browser RLS")
+            success_ids = set()
+            for route in ["/v1/health", "/v1/capabilities", "/v1/dashboard"]:
+                for _ in range(20):
+                    service.request("GET", route + "?secret=never-log-query")
+                    success_ids.add(service.diagnostic_id)
+            until(lambda: sum(r.get("requests", 0) for r in diagnostics() if r["kind"] == "api_summary") >= 60,
+                  "minute-level API summaries", 75)
+            stored = diagnostics()
+            assert not any(f'{r["run_id"]}-{r["sequence"]}' in success_ids for r in stored)
+            assert success_ids <= {f'{r["run_id"]}-{r["sequence"]}' for r in local_diagnostics()}
+            assert any(f'{r["run_id"]}-{r["sequence"]}' == denied_id for r in stored)
+            assert "never-log-query" not in json.dumps(stored)
+            summaries = [r for r in stored if r["kind"] == "api_summary"]
+            assert len(summaries) <= 6 and all(r["total_duration_ms"] >= r["max_duration_ms"] for r in summaries)
+            summary_count = sum(r["requests"] for r in summaries)
+            service.request("GET", "/v1/health")
+            service.stop()
+            assert sum(r.get("requests", 0) for r in diagnostics() if r["kind"] == "api_summary") > summary_count
+            passed("routine API calls become minute summaries; local correlation, errors, redaction and shutdown flush remain")
             run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1", "-c",
-                f"INSERT INTO cloudroom_diagnostics VALUES ('{name}', 'retention', 1, 0, '{{\"kind\":\"retention_fixture\"}}'), ('another-owner', 'retention', 1, 0, '{{\"kind\":\"retention_fixture\"}}')")
+                f"INSERT INTO cloudroom_diagnostics SELECT '{name}', 'retention', n, 0, '{{\"kind\":\"retention_fixture\"}}'::jsonb FROM generate_series(1,2501) n; "
+                "INSERT INTO cloudroom_diagnostics VALUES ('another-owner', 'retention', 1, 0, '{\"kind\":\"retention_fixture\"}')")
             service.stop()
             service = Service(env, root / "retention.log").start()
             until(lambda: run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",

@@ -75,6 +75,7 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     }
     let method = if let Some(saved) = &handle.resume {
         params["threadId"] = json!(saved.id);
+        params["path"] = json!(saved.path);
         params["excludeTurns"] = json!(true);
         "thread/resume"
     } else {
@@ -95,6 +96,13 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
 }
 fn prompt_items(input: &Value) -> Vec<Value> {
     let mut items = Vec::new();
+    if let Some(text) = input["text"].as_str() {
+        items.push(json!({
+            "type":"text",
+            "text":text,
+            "text_elements":[]
+        }));
+    }
     if let Some(content) = input["content"].as_array() {
         for part in content {
             match part["type"].as_str() {
@@ -124,7 +132,7 @@ fn prompt_items(input: &Value) -> Vec<Value> {
     if items.is_empty() {
         items.push(json!({
             "type":"text",
-            "text":input["text"].as_str().unwrap_or(""),
+            "text":"",
             "text_elements":[]
         }));
     }
@@ -235,25 +243,6 @@ pub(super) async fn rewind(handle: &Handle, input: &Value) -> io::Result<Value> 
 pub(super) async fn notice(handle: &Handle, text: &str) -> io::Result<()> {
     handle.call("thread/inject_items", json!({"threadId":handle.native()?,"items":[{"type":"message","role":"developer","content":[{"type":"input_text","text":text}]}]})).await?;
     Ok(())
-}
-
-pub(super) fn checkpoint(
-    previous: &Value,
-    data: &Value,
-    native: Option<&str>,
-) -> io::Result<Value> {
-    let offset = data["offset"]
-        .as_u64()
-        .ok_or_else(|| io::Error::other("missing native offset"))?;
-    if offset != previous["offset"].as_u64().unwrap_or(0) {
-        return Err(io::Error::other("native record offset mismatch"));
-    }
-    let length = native
-        .ok_or_else(|| io::Error::other("missing native record"))?
-        .len() as u64;
-    Ok(
-        json!({"offset":offset.checked_add(length).ok_or_else(||io::Error::other("native offset overflow"))?}),
-    )
 }
 
 pub(super) async fn interrupt(handle: &Handle, state: Progress) -> io::Result<()> {
@@ -451,6 +440,17 @@ impl Adapter for Protocol {
         if value["id"].as_u64() == self.prompt_id && value.get("error").is_some() {
             state.finished = true;
         }
+        let limited = Some(&json!("usageLimitExceeded"));
+        if root
+            && (params.pointer("/turn/error/codexErrorInfo") == limited
+                || params.pointer("/error/codexErrorInfo") == limited)
+        {
+            events.push(Event::Record {
+                kind: "usage_limited",
+                data: json!({"harness":"codex"}),
+                native: None,
+            });
+        }
         match if root { method } else { "" } {
             "turn/started" => {
                 if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) {
@@ -471,8 +471,14 @@ impl Adapter for Protocol {
                     == state.native_turn.as_deref()
                     && state.native_turn.is_some() =>
             {
-                events
-                    .extend(state.finished(params["turn"]["status"].as_str().unwrap_or("unknown")));
+                let error = params
+                    .pointer("/turn/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                events.extend(state.finished(
+                    params["turn"]["status"].as_str().unwrap_or("unknown"),
+                    error,
+                ));
             }
             _ => {}
         }
@@ -485,10 +491,16 @@ impl Adapter for Protocol {
         let id = value["id"].as_u64()?;
         Some((
             id,
-            if value.get("error").is_some() {
+            if let Some(error) = value.get("error") {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "harness rejected command; see native history",
+                    format!(
+                        "harness rejected command (code {}): {}",
+                        error["code"],
+                        error["message"]
+                            .as_str()
+                            .unwrap_or("no error message returned")
+                    ),
                 ))
             } else {
                 Ok(value.get("result").cloned().unwrap_or(Value::Null))
@@ -621,5 +633,31 @@ pub(super) fn recover(
         if before == tail.read_offset {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_items;
+    use serde_json::json;
+
+    #[test]
+    fn prompt_items_preserve_top_level_instruction_with_structured_content() {
+        let items = prompt_items(&json!({
+            "text":"Follow the repository instructions before inspecting the image.",
+            "content":[{"type":"image","path":"/tmp/screenshot.png"}]
+        }));
+
+        assert_eq!(
+            items,
+            vec![
+                json!({
+                    "type":"text",
+                    "text":"Follow the repository instructions before inspecting the image.",
+                    "text_elements":[]
+                }),
+                json!({"type":"localImage","path":"/tmp/screenshot.png"})
+            ]
+        );
     }
 }

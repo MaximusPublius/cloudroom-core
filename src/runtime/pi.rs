@@ -30,6 +30,7 @@ pub(super) fn command(
     config: &Config,
     profile: &HarnessConfig,
     saved: Option<&Resume>,
+    command_guard_enabled: bool,
 ) -> io::Result<(Command, PathBuf, PathBuf)> {
     let directory = profile.home.join("sessions/cloudroom");
     let path = saved
@@ -60,7 +61,10 @@ pub(super) fn command(
         .arg(&directory)
         .arg(&path)
         .arg(&helper)
-        .arg(CONTEXT)
+        .arg(format!(
+            "{}\nconst commandGuardEnabled = {command_guard_enabled};\n{CONTEXT}",
+            super::command_guard::SOURCE
+        ))
         .arg(&profile.binary)
         .args(["--mode", "rpc", "--session"])
         .arg(&path)
@@ -191,106 +195,24 @@ fn prompt_text(input: &Value) -> String {
     text
 }
 
-fn mime_type(path: &str) -> &'static str {
-    match Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("heic") => "image/heic",
-        _ => "application/octet-stream",
-    }
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[(n >> 18) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-fn image_params(handle: &Handle, input: &Value) -> io::Result<Vec<Value>> {
-    let mut images = Vec::new();
-    // Keep the existing per-image upload limit and the total native RPC frame limit.
-    let envelope =
-        json!({"id":u64::MAX.to_string(),"type":"prompt","message":prompt_text(input),"images":[]});
-    let mut remaining = MAX_LINE.saturating_sub(serde_json::to_vec(&envelope)?.len() + 1);
-    let mut push = |path: &str| -> io::Result<()> {
-        let limit = 10 * 1024 * 1024;
-        let file = super::files::open(&handle.repository, Path::new(path), handle.file_identity)?;
-        if file.metadata()?.len() > limit {
-            return Err(io::Error::other("image exceeds the attachment size limit"));
-        }
-        let mut bytes = Vec::new();
-        file.take(limit + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > limit {
-            return Err(io::Error::other("image exceeds the attachment size limit"));
-        }
-        let image = json!({"type":"image","data":base64_encode(&bytes),"mimeType":mime_type(path)});
-        remaining = remaining
-            .checked_sub(serde_json::to_vec(&image)?.len() + 1)
-            .ok_or_else(|| io::Error::other("images exceed the native request size limit"))?;
-        images.push(image);
-        Ok(())
-    };
-    if let Some(content) = input["content"].as_array() {
-        for part in content {
-            if matches!(part["type"].as_str(), Some("image" | "localImage"))
-                && let Some(path) = part["path"].as_str().or_else(|| part["url"].as_str())
-            {
-                push(path)?;
-            }
-        }
-    }
-    if let Some(attachments) = input["attachments"].as_array() {
-        for attachment in attachments {
-            if attachment["kind"] == "image"
-                && let Some(path) = attachment["path"].as_str()
-            {
-                push(path)?;
-            }
-        }
-    }
-    Ok(images)
-}
-
 pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<()> {
     let mut params = json!({"message":prompt_text(input)});
     let reader = handle.clone();
     let input = input.clone();
-    let images = tokio::task::spawn_blocking(move || image_params(&reader, &input))
-        .await
-        .map_err(io::Error::other)
-        .and_then(|result| result)
-        // No prompt was sent: reject this request and allow queued work to continue.
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cannot read image attachment: {error}"),
-            )
-        })?;
+    let envelope = json!({"id":u64::MAX.to_string(),"type":"prompt","message":prompt_text(&input),"images":[]});
+    let remaining = MAX_LINE.saturating_sub(serde_json::to_vec(&envelope)?.len() + 1);
+    let images =
+        tokio::task::spawn_blocking(move || super::files::images(&reader, &input, remaining))
+            .await
+            .map_err(io::Error::other)
+            .and_then(|result| result)
+            // No prompt was sent: reject this request and allow queued work to continue.
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cannot read image attachment: {error}"),
+                )
+            })?;
     if !images.is_empty() {
         params["images"] = json!(images);
     }
@@ -541,9 +463,9 @@ impl Adapter for Protocol {
             let id = data["sessionId"]
                 .as_str()
                 .ok_or_else(|| io::Error::other("missing Pi identity"))?;
-            if (self.expected.as_deref().is_some_and(|old| old != id)
-                || data["sessionFile"].as_str() != self.capture.path.to_str())
-                && !self.forking
+            if !self.forking
+                && (self.expected.as_deref().is_some_and(|old| old != id)
+                    || data["sessionFile"].as_str() != self.capture.path.to_str())
             {
                 return Err(io::Error::other("Pi identity changed"));
             }
@@ -616,7 +538,7 @@ impl Adapter for Protocol {
                     "unknown"
                 }
                 .to_owned();
-                events.extend(s.finished(&status));
+                events.extend(s.finished(&status, None));
             }
         }
         if t == "response"
@@ -635,6 +557,17 @@ impl Adapter for Protocol {
             }
             "message_end" if v["message"]["role"] == "assistant" => {
                 s.last_usage = v["message"]["usage"].clone();
+                if v["message"]["stopReason"] == "error"
+                    && v["message"]["errorMessage"]
+                        .as_str()
+                        .is_some_and(|m| m.to_ascii_lowercase().contains("usage limit"))
+                {
+                    events.push(Event::Record {
+                        kind: "usage_limited",
+                        data: json!({"harness":"pi"}),
+                        native: None,
+                    });
+                }
                 s.status = match v["message"]["stopReason"].as_str() {
                     Some("aborted") => "interrupted",
                     Some("error" | "length") => "failed",
@@ -671,7 +604,11 @@ impl Adapter for Protocol {
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Pi rejected command; see native history",
+                    format!(
+                        "Pi rejected the {} command: {}",
+                        v["command"].as_str().unwrap_or("unknown"),
+                        v["error"].as_str().unwrap_or("no error message returned")
+                    ),
                 ))
             },
         ))

@@ -12,6 +12,9 @@ use std::{
 use tokio::{io::AsyncWriteExt, process::Command};
 use tokio_stream::StreamExt;
 
+/// Reserved workspace ID for sessions that start in the workspace root itself.
+pub const ROOT: &str = "root";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Workspace {
     pub id: String,
@@ -229,6 +232,7 @@ impl Workspaces {
                 policy.agent_uid,
                 policy.agent_gid,
                 None,
+                true,
             )?;
         }
         let mut child = command.spawn()?;
@@ -264,6 +268,7 @@ impl Workspaces {
                     policy.agent_uid,
                     policy.agent_gid,
                     None,
+                    true,
                 )?;
             }
             let output =
@@ -279,19 +284,98 @@ impl Workspaces {
         Ok(serde_json::json!({"path":workspace.path,"branch":branch,"head":head}))
     }
 
+    pub async fn install_transfer(
+        &self,
+        workspace: &Workspace,
+        id: &str,
+        entry: &crate::session::teleport::Entry,
+        source: &Path,
+        native: Option<(&crate::config::HarnessConfig, crate::runtime::Kind, &str)>,
+        guard: &storage::Guard,
+    ) -> io::Result<String> {
+        self.ensure_directory(workspace).await?;
+        let (root, relative) = match native {
+            // Claude resumes by ID only from the project folder named after the cwd.
+            Some((profile, crate::runtime::Kind::Claude, native_id)) => (
+                profile.home.join("projects"),
+                format!(
+                    "{}/{native_id}.jsonl",
+                    workspace
+                        .path
+                        .to_string_lossy()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                        .collect::<String>()
+                ),
+            ),
+            Some((profile, crate::runtime::Kind::Cursor, _)) => {
+                (profile.home.join("chats"), format!(".teleport-{id}.jsonl"))
+            }
+            Some((profile, _, _)) => (
+                profile.home.join("sessions"),
+                format!("teleport/{id}/{}", entry.path),
+            ),
+            None => (
+                workspace.path.clone(),
+                format!(".cloudroom/teleport/{id}/{}/{}", entry.kind, entry.path),
+            ),
+        };
+        let request = serde_json::json!({"op":"teleport","tree":{"root":root,"create":true},
+            "path":relative,"size":entry.size,"sha256":entry.sha256,"executable":entry.executable,"symlink":entry.symlink,
+            "project_path":(entry.kind == "project").then_some(&entry.path),
+            "native":native.map(|(_,kind,native_id)| serde_json::json!({"harness":kind,"id":native_id,"cwd":workspace.path}))});
+        let mut command = Command::new("python3");
+        command
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .args(["-I", "-c", include_str!("../sync/files.py")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let (mut child, _workload) = guard.spawn_writer(&mut command)?;
+        let mut input = child.stdin.take().unwrap();
+        let mut file = fs::File::open(source)?;
+        let result = async {
+            use std::io::Read;
+            input.write_all(&serde_json::to_vec(&request)?).await?;
+            input.write_all(b"\n").await?;
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                input.write_all(&buffer[..count]).await?;
+            }
+            Ok::<_, io::Error>(())
+        }
+        .await;
+        drop(input);
+        let output = child.wait_with_output().await?;
+        let installed = file_result(output)?;
+        result?;
+        let path = installed["path"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("transfer path missing"))?;
+        match native {
+            Some((profile, crate::runtime::Kind::Cursor, _)) => {
+                restore_cursor(&profile.home.join("chats"), &path, workspace, guard).await
+            }
+            _ => Ok(path),
+        }
+    }
+
     pub async fn attach(
         &self,
         workspace: &Workspace,
-        spec: AttachmentSpec<'_>,
+        request_id: &str,
+        name: &str,
+        kind: &str,
         body: Body,
         guard: &storage::Guard,
     ) -> io::Result<serde_json::Value> {
-        let AttachmentSpec {
-            session_id,
-            request_id,
-            name,
-            kind,
-        } = spec;
         if guard.blocks() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -299,7 +383,6 @@ impl Workspaces {
             ));
         }
         self.ensure_directory(workspace).await?;
-        valid_id(session_id)?;
         valid_id(request_id)?;
         if kind != "image" && kind != "file" {
             return Err(io::Error::other("attachment kind must be image or file"));
@@ -314,7 +397,7 @@ impl Workspaces {
         {
             return Err(io::Error::other("invalid attachment name"));
         }
-        let relative = format!(".cloudroom/attachments/{session_id}/{request_id}/{name}");
+        let relative = format!(".cloudroom/attachments/{request_id}/{name}");
         let limit = if kind == "image" {
             10 * 1024 * 1024
         } else {
@@ -364,20 +447,11 @@ impl Workspaces {
     }
 }
 
-pub struct AttachmentSpec<'a> {
-    pub session_id: &'a str,
-    pub request_id: &'a str,
-    pub name: &'a str,
-    pub kind: &'a str,
-}
-
 fn file_result(output: std::process::Output) -> io::Result<serde_json::Value> {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     if !output.status.success() || result["ok"] != true {
         return Err(if result["error"] == "attachment_too_large" {
             io::ErrorKind::FileTooLarge.into()
-        } else if result["error"] == "attachment_conflict" {
-            io::ErrorKind::AlreadyExists.into()
         } else {
             result["errno"]
                 .as_i64()
@@ -387,6 +461,55 @@ fn file_result(output: std::process::Output) -> io::Result<serde_json::Value> {
         });
     }
     Ok(result)
+}
+
+/// Unpack a teleported Cursor snapshot into chats/<md5 of the workspace>/<chat ID>.
+async fn restore_cursor(
+    root: &Path,
+    snapshot: &str,
+    workspace: &Workspace,
+    guard: &storage::Guard,
+) -> io::Result<String> {
+    let mut command = Command::new("python3");
+    command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .args([
+            "-I",
+            "-c",
+            include_str!("../runtime/cursor-history.py"),
+            "restore",
+        ])
+        .arg(root)
+        .arg(&workspace.path)
+        .stdin(fs::File::open(snapshot)?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let (child, _workload) = guard.spawn_writer(&mut command)?;
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Cursor session restore failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let restored: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    restored["path"]
+        .as_str()
+        .map(|path| format!("{path}/meta.json"))
+        .ok_or_else(|| io::Error::other("Cursor session restore returned no path"))
+}
+
+pub fn transfer_destination(
+    workspace: &Workspace,
+    id: &str,
+    entry: &crate::session::teleport::Entry,
+) -> PathBuf {
+    workspace.path.join(format!(
+        ".cloudroom/teleport/{id}/{}/{}",
+        entry.kind, entry.path
+    ))
 }
 
 pub fn valid_name(name: &str) -> io::Result<()> {

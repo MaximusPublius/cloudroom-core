@@ -25,8 +25,13 @@ impl Workload {
         let (paused, _) = watch::channel(false);
         Ok(Self { directory, paused })
     }
-    pub fn attach(&self, command: &mut Command, uid: u32, gid: u32) -> io::Result<()> {
-        as_agent(command, uid, gid, Some(&self.directory))
+    pub fn attach(
+        &self,
+        command: &mut Command,
+        policy: &crate::workspace::storage::Policy,
+    ) -> io::Result<()> {
+        let (uid, gid) = (policy.agent_uid, policy.agent_gid);
+        as_agent(command, uid, gid, Some(&self.directory), !policy.agent_sudo)
     }
     pub fn paused(&self) -> watch::Receiver<bool> {
         self.paused.subscribe()
@@ -61,6 +66,10 @@ impl Workload {
             self.paused.send_replace(false);
         }
         Ok(())
+    }
+    pub fn process_count(&self) -> Option<usize> {
+        let procs = fs::read_to_string(self.directory.join("cgroup.procs")).ok()?;
+        Some(procs.lines().filter(|line| !line.is_empty()).count())
     }
     pub fn terminate(&self) -> io::Result<()> {
         // The directory is created exclusively by this Runtime, never supplied by a client.
@@ -98,6 +107,7 @@ pub(crate) fn as_agent(
     uid: u32,
     gid: u32,
     group: Option<&Path>,
+    no_new_privs: bool,
 ) -> io::Result<()> {
     use std::{io::Write, os::unix::process::CommandExt};
     unsafe extern "C" {
@@ -124,7 +134,7 @@ pub(crate) fn as_agent(
             if let Some(file) = membership.as_mut() {
                 file.write_all(b"0")?;
             }
-            if prctl(38, 1_u64, 0_u64, 0_u64, 0_u64) != 0 // PR_SET_NO_NEW_PRIVS
+            if (no_new_privs && prctl(38, 1_u64, 0_u64, 0_u64, 0_u64) != 0) // PR_SET_NO_NEW_PRIVS
             || setgroups(0, std::ptr::null()) != 0 || setgid(gid) != 0 || setuid(uid) != 0
             || prctl(47, 4_u64, 0_u64, 0_u64, 0_u64) != 0 // clear ambient capabilities
             || capset(&[0x20080522, 0], &[0; 6]) != 0
@@ -137,7 +147,13 @@ pub(crate) fn as_agent(
     Ok(())
 }
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn as_agent(_: &mut Command, _: u32, _: u32, _: Option<&Path>) -> io::Result<()> {
+pub(crate) fn as_agent(
+    _: &mut Command,
+    _: u32,
+    _: u32,
+    _: Option<&Path>,
+    _: bool,
+) -> io::Result<()> {
     Err(io::Error::other("disk protection requires Linux"))
 }
 

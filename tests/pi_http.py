@@ -238,6 +238,8 @@ class MixedHarnessTests(unittest.TestCase):
         for text in ['handled','dialog','retry','failure','reject']:
             self.send('pi',text,text)
             self.settled('pi',text,'failed' if text in ['failure','reject'] else 'completed')
+        self.assertEqual(self.service.session('cr_pi')['receipts']['reject'].get('error'),
+                         'Pi rejected the prompt command: rejected before acceptance')
         self.send('pi','hold','hold')
         until(lambda:(self.repo/'pi-native.ticks').exists(),'tool before close',5)
         self.send('pi','must-not-run','hello')
