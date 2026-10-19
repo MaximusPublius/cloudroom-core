@@ -4,6 +4,7 @@ import contextlib
 from http.server import BaseHTTPRequestHandler
 import http.client
 import importlib.util
+import json
 from pathlib import Path
 import socketserver
 import tempfile
@@ -144,6 +145,25 @@ class PreviewTests(unittest.TestCase):
             self.assertFalse(jobs.approve(core, job))
             self.assertEqual(jobs.trusted, set())
             self.assertEqual(popen.call_count, 2)
+
+    def test_mac_job_without_session_posts_terminal_result(self):
+        folder = Path(self.directory.name)
+        (folder / 'config.json').write_text(json.dumps({'macAccess': 'ask'}))
+        (folder / 'config.json').chmod(0o600)
+        jobs = preview.MacJobs(folder)
+        posted = []
+        core = SimpleNamespace(
+            key='core', url='https://core.example', headers={},
+            fetch=lambda _url, body, *_args: posted.append(body),
+        )
+        dialog = SimpleNamespace(communicate=lambda: ('Deny\n', ''))
+
+        with mock.patch.object(preview.sys, 'platform', 'darwin'), \
+             mock.patch.object(preview.subprocess, 'Popen', return_value=dialog):
+            jobs.execute(core, 'device', {'id': 'legacy', 'command': 'touch legacy', 'write': True})
+
+        self.assertEqual([result['state'] for result in posted], ['running', 'done'])
+        self.assertEqual(posted[-1]['code'], 126)
 
 
 if __name__ == '__main__':
