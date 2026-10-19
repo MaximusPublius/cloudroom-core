@@ -58,6 +58,23 @@ test("accepts the Pi key endpoint's synchronous HTTP 200 response", async (t) =>
   });
 });
 
+test("accepts Teleport preflight HTTP 202 and gives it the long timeout", async (t) => {
+  const result = { ok: true } as const;
+  const check = { harness: "codex", model: "synthetic-model", reasoning: null, service_tier: null } as const;
+  const service = await fixture(async (req, res, body) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/v1/teleports/check");
+    assert.deepEqual(body, check);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    sendJson(res, result, 202);
+  }, 1);
+  t.after(() => service.close());
+  assert.deepEqual(
+    await service.client.checkTeleport(check),
+    result,
+  );
+});
+
 test("routes Cursor account operations and rejects off-domain login links", async (t) => {
   let url = "https://cursor.com/loginDeepControl?challenge=fixture";
   const bodies: Record<string, unknown>[] = [];

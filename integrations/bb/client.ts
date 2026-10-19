@@ -314,7 +314,7 @@ export class CloudroomClient {
   }
   async checkTeleport(check: TeleportCheck, signal?: AbortSignal): Promise<TeleportCheckResult> {
     // One real model request runs on the VM, so allow longer than ordinary commands.
-    return await this.#json("/v1/teleports/check", check, signal, undefined, 120_000) as unknown as TeleportCheckResult;
+    return await this.#json("/v1/teleports/check", check, signal, undefined, 202, 120_000) as unknown as TeleportCheckResult;
   }
   async teleportStatus(id: string): Promise<TeleportStatus> {
     return await this.#json(`/v1/teleports/${encodeURIComponent(id)}`) as unknown as TeleportStatus;

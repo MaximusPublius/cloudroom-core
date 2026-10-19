@@ -80,6 +80,8 @@ pub struct Device {
 }
 
 struct Job {
+    /// Cloudroom session that started the job. Retained results stay private to this thread.
+    session: String,
     device: String,
     acked: bool,
     result: Option<Value>,
@@ -311,16 +313,23 @@ fn local_auth(m: &Manager, peer: Peer) -> Result<()> {
     }
 }
 
+fn local_session(m: &Manager, peer: Peer) -> Result<String> {
+    local_auth(m, peer)?;
+    peer.1
+        .and_then(|pid| m.harness_session(&crate::secrets::ancestors(pid)))
+        .ok_or_else(|| conflict("Run cloudroom mac from a Cloudroom cloud thread"))
+}
+
+fn visible_job<'a>(jobs: &'a BTreeMap<String, Job>, id: &str, session: &str) -> Option<&'a Job> {
+    jobs.get(id).filter(|job| job.session == session)
+}
+
 async fn local_run(
     State(m): State<Arc<Manager>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     Json(run): Json<Run>,
 ) -> Result<Json<Value>> {
-    local_auth(&m, peer)?;
-    let session = peer
-        .1
-        .and_then(|pid| m.harness_session(&crate::secrets::ancestors(pid)))
-        .ok_or(conflict("Run cloudroom mac from a Cloudroom cloud thread"))?;
+    let session = local_session(&m, peer)?;
     validate(&run)?;
     let mac = &m.mac;
     let mut changed = mac.changed.subscribe();
@@ -349,6 +358,7 @@ async fn local_run(
         jobs.insert(
             id.clone(),
             Job {
+                session: session.clone(),
                 device,
                 acked: false,
                 result: None,
@@ -417,9 +427,9 @@ async fn local_result(
     ConnectInfo(peer): ConnectInfo<Peer>,
     RoutePath(id): RoutePath<String>,
 ) -> Result<Json<Value>> {
-    local_auth(&m, peer)?;
+    let session = local_session(&m, peer)?;
     let jobs = m.mac.jobs.lock().unwrap();
-    let job = jobs.get(&id).ok_or(Failure(
+    let job = visible_job(&jobs, &id, &session).ok_or(Failure(
         StatusCode::NOT_FOUND,
         "Unknown or expired Mac job".into(),
     ))?;
@@ -759,4 +769,28 @@ async fn print_result(value: Value) -> io::Result<i32> {
     std::io::stdout().flush()?;
     std::io::stderr().write_all(&stderr)?;
     Ok(code.unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(session: &str) -> Job {
+        Job {
+            session: session.into(),
+            device: "synthetic-device".into(),
+            acked: true,
+            result: Some(json!({"state":"done"})),
+            at: Instant::now(),
+            parts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn retained_results_are_visible_only_to_the_originating_session() {
+        let jobs = BTreeMap::from([("123-0".into(), job("session-a"))]);
+        assert!(visible_job(&jobs, "123-0", "session-a").is_some());
+        assert!(visible_job(&jobs, "123-0", "session-b").is_none());
+        assert!(visible_job(&jobs, "missing", "session-a").is_none());
+    }
 }
