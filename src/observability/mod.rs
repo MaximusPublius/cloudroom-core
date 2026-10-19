@@ -30,6 +30,10 @@ const LOCAL_BYTES: u64 = 8 * 1024 * 1024;
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 const SLOW_API_MS: u64 = 1000;
 const PRUNE_BATCH: i64 = 1000;
+
+fn retention_days(kind: &str) -> i32 {
+    if kind == "resource" { 30 } else { 7 }
+}
 const STDERR_CAPACITY: usize = 32;
 const STDERR_BATCH: usize = 8;
 const STDERR_FILE_BYTES: u64 = 1024 * 1024;
@@ -415,13 +419,15 @@ impl Observability {
             }
             if Instant::now() >= prune_at {
                 // Scope retention to this store; never touch session history or another owner.
-                // Every kind, resource samples included, lives 7 days: one index range, no row-by-row filter.
+                // Resource charts cover 30 days; other diagnostics retain seven days.
                 let prune = sqlx::query(
                     "DELETE FROM cloudroom_diagnostics WHERE store=$1 AND ctid IN (\
                      SELECT ctid FROM cloudroom_diagnostics WHERE store=$1 \
-                     AND timestamp_ms < (extract(epoch FROM now() - interval '7 days') * 1000)::bigint \
+                     AND timestamp_ms < (extract(epoch FROM now() - \
+                     (CASE WHEN record->>'kind'='resource' THEN $3 ELSE $4 END) * interval '1 day') * 1000)::bigint \
                      ORDER BY timestamp_ms LIMIT $2)")
-                    .bind(&config.store).bind(PRUNE_BATCH).execute(&pool);
+                    .bind(&config.store).bind(PRUNE_BATCH)
+                    .bind(retention_days("resource")).bind(retention_days("other")).execute(&pool);
                 let delay = match tokio::time::timeout(Duration::from_secs(2), prune).await {
                     Ok(Ok(result)) if result.rows_affected() == PRUNE_BATCH as u64 => 1,
                     Ok(Ok(_)) => 3600,

@@ -218,6 +218,33 @@ fn notice_ids(child: &str, request: &str) -> (String, String) {
     (format!("{queued}_steer"), queued)
 }
 
+fn pending_notice<'a>(c: &'a Session, p: &Session, child: &str) -> Option<(&'a Receipt, bool)> {
+    c.receipts.values().find_map(|r| {
+        if r.command != "prompt" || !FINISHED.contains(&r.state.as_str()) {
+            return None;
+        }
+        let (steer, queued) = notice_ids(child, &r.request_id);
+        let tried = p.receipts.get(&steer);
+        // Delivered, or still being steered into the turn it targets.
+        let settled = p.receipts.contains_key(&queued)
+            || tried.is_some_and(|s| {
+                s.state == "completed"
+                    || (s.state == "accepted"
+                        && s.input["target_request_id"].as_str() == p.current_request.as_deref())
+            });
+        (!settled).then(|| (r, tried.is_none()))
+    })
+}
+
+fn completed_reply(c: &Session, request: Option<&str>) -> Option<String> {
+    request
+        .map_or_else(
+            || c.replies.last(),
+            |request| c.replies.iter().find(|(id, _)| id == request),
+        )
+        .map(|(_, text)| text.clone())
+}
+
 fn title(session: &Session) -> Option<String> {
     session
         .receipts
@@ -516,31 +543,13 @@ impl Manager {
                     if p.close_request.is_some() || p.state == "closed" {
                         return;
                     }
-                    let finished = c.receipts.values().find_map(|r| {
-                        if r.command != "prompt" || !FINISHED.contains(&r.state.as_str()) {
-                            return None;
-                        }
-                        let (steer, queued) = notice_ids(&child, &r.request_id);
-                        let tried = p.receipts.get(&steer);
-                        // Delivered, or still being steered into the turn it targets.
-                        let settled = p.receipts.contains_key(&queued)
-                            || tried.is_some_and(|s| {
-                                s.state == "completed"
-                                    || (s.state == "accepted"
-                                        && s.input["target_request_id"].as_str()
-                                            == p.current_request.as_deref())
-                            });
-                        (!settled).then(|| (r, tried.is_none()))
-                    });
+                    let finished = pending_notice(c, p, &child);
                     match finished {
                         Some((r, steer)) => Some((
                             p.session_id.clone(),
                             r.request_id.clone(),
                             r.state.clone(),
-                            c.replies
-                                .iter()
-                                .find(|(id, _)| *id == r.request_id)
-                                .map(|(_, text)| text.clone()),
+                            completed_reply(c, Some(&r.request_id)),
                             title(c),
                             p.current_request.clone().filter(|_| steer),
                         )),
@@ -605,9 +614,7 @@ impl Manager {
             let handle = child
                 .filter(|c| c.current_request.is_none())
                 .and_then(|c| c.handle.clone());
-            let kept = child
-                .and_then(|c| c.replies.last())
-                .map(|(_, text)| text.clone());
+            let kept = child.and_then(|c| completed_reply(c, None));
             (items, handle, kept)
         };
         let reply = match handle {
@@ -618,5 +625,98 @@ impl Manager {
             item["reply"] = json!(reply);
         }
         json!({"children":items})
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn closed_child_output_and_pending_notice_survive_restart() {
+        // Keep the fixture as evidence: no deletion or runtime/provider launch.
+        let dir = std::env::temp_dir().join(format!(
+            "cloudroom-reply-restart-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut local = Local::open(&dir).unwrap();
+        let receipt = |id: &str, command: &str, state: &str, input: Value| json!({"request_id":id,"command":command,"state":state,"input":input});
+        local
+            .append(
+                "parent",
+                "receipt",
+                receipt("parent_start", "start", "completed", json!({})),
+                None,
+            )
+            .unwrap();
+        local
+            .append(
+                "child",
+                "receipt",
+                receipt(
+                    "child_start",
+                    "start",
+                    "completed",
+                    json!({"parent_session":"parent"}),
+                ),
+                None,
+            )
+            .unwrap();
+        local
+            .append(
+                "child",
+                "receipt",
+                receipt("task", "prompt", "completed", json!({"text":"fixture"})),
+                None,
+            )
+            .unwrap();
+        local
+            .append("child", "state", json!({"state":"closed"}), None)
+            .unwrap();
+        // The live Finished handler supplies these bounded replies before shutdown saves.
+        local.sessions.get_mut("child").unwrap().replies =
+            vec![("task".into(), "saved child answer".into())];
+        local.save_snapshot();
+        drop(local);
+        let local = Local::open(&dir).unwrap();
+        let child = &local.sessions["child"];
+        let parent = &local.sessions["parent"];
+        assert_eq!(child.state, "closed");
+        assert!(child.handle.is_none());
+        assert_eq!(
+            completed_reply(child, None).as_deref(),
+            Some("saved child answer")
+        );
+        let (receipt, steer) = pending_notice(child, parent, "child").unwrap();
+        assert_eq!(receipt.request_id, "task");
+        assert!(steer);
+        let text = notice(
+            "child",
+            title(child),
+            &receipt.state,
+            completed_reply(child, Some(&receipt.request_id)),
+        );
+        assert!(text.contains("saved child answer"));
+        drop(local);
+        // Delivery recorded after the snapshot must suppress duplicate notices on replay.
+        let mut local = Local::open(&dir).unwrap();
+        let (_, queued) = notice_ids("child", "task");
+        local
+            .append("parent", "receipt", receipt_value(&queued), None)
+            .unwrap();
+        drop(local);
+        let local = Local::open(&dir).unwrap();
+        assert!(
+            pending_notice(&local.sessions["child"], &local.sessions["parent"], "child").is_none()
+        );
+        assert_eq!(
+            completed_reply(&local.sessions["child"], None).as_deref(),
+            Some("saved child answer")
+        );
+    }
+
+    fn receipt_value(id: &str) -> Value {
+        json!({"request_id":id,"command":"prompt","state":"accepted","input":{"text":"notice"}})
     }
 }

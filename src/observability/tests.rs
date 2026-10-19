@@ -248,3 +248,17 @@ fn private_stderr_rejects_unsafe_existing_paths_without_touching_targets() {
         assert_eq!(fs::read(&target).unwrap(), b"UNCHANGED");
     }
 }
+
+#[test]
+fn retention_preserves_the_full_resource_chart_range() {
+    assert_eq!(retention_days("resource"), 30);
+    for kind in [
+        "api",
+        "agent_exit",
+        "diagnostics",
+        "history_fault",
+        "future_kind",
+    ] {
+        assert_eq!(retention_days(kind), 7, "{kind}");
+    }
+}

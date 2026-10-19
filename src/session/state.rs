@@ -25,6 +25,10 @@ struct Saved<S = Session> {
 /// Fields `apply` builds that the session API leaves out (`serde(skip)`). Any new one belongs here too.
 #[derive(Serialize, Deserialize)]
 struct Derived {
+    // Old snapshots predate completed-reply persistence and restore an empty cache.
+    // They remain usable; output absent from those snapshots cannot be reconstructed here.
+    #[serde(default)]
+    replies: Vec<(String, String)>,
     failure: Option<String>,
     has_dispatched: bool,
     last_activity: Option<u64>,
@@ -37,9 +41,19 @@ struct Derived {
     usage_limited: bool,
 }
 
+// Apply the live cache limits at both snapshot boundaries, including imported snapshots.
+fn bounded_replies(mut replies: Vec<(String, String)>) -> Vec<(String, String)> {
+    replies.drain(..replies.len().saturating_sub(8));
+    for (_, text) in &mut replies {
+        *text = text.chars().take(32768).collect();
+    }
+    replies
+}
+
 impl Derived {
     fn of(s: &Session) -> Self {
         Self {
+            replies: bounded_replies(s.replies.clone()),
             failure: s.failure.clone(),
             has_dispatched: s.has_dispatched,
             last_activity: s.last_activity,
@@ -54,6 +68,7 @@ impl Derived {
     }
 
     fn restore(self, s: &mut Session) {
+        s.replies = bounded_replies(self.replies);
         s.failure = self.failure;
         s.has_dispatched = self.has_dispatched;
         s.last_activity = self.last_activity;
@@ -581,6 +596,46 @@ mod tests {
             .map(|s| json!([s, Derived::of(s)]))
             .collect();
         json!([sessions, local.sequences])
+    }
+
+    #[test]
+    fn reply_snapshot_compatibility_and_bounds() {
+        let session = Session::default();
+        let mut legacy = serde_json::to_value(Derived::of(&session)).unwrap();
+        legacy.as_object_mut().unwrap().remove("replies");
+        let derived: Derived = serde_json::from_value(legacy).unwrap();
+        let mut restored = Session::default();
+        derived.restore(&mut restored);
+        assert!(restored.replies.is_empty());
+        let replies: Vec<_> = (0..10)
+            .map(|n| (n.to_string(), "é".repeat(32770)))
+            .collect();
+        let session = Session {
+            replies,
+            ..Default::default()
+        };
+        let saved = Derived::of(&session);
+        assert_eq!(saved.replies.len(), 8);
+        assert_eq!(saved.replies[0].0, "2");
+        assert!(
+            saved
+                .replies
+                .iter()
+                .all(|(_, text)| text.chars().count() == 32768)
+        );
+        let mut imported = serde_json::to_value(saved).unwrap();
+        imported["replies"] = json!(session.replies);
+        serde_json::from_value::<Derived>(imported)
+            .unwrap()
+            .restore(&mut restored);
+        assert_eq!(restored.replies.len(), 8);
+        assert_eq!(restored.replies[0].0, "2");
+        assert!(
+            restored
+                .replies
+                .iter()
+                .all(|(_, text)| text.chars().count() == 32768)
+        );
     }
 
     #[test]
