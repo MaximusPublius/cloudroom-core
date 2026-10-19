@@ -118,6 +118,10 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(uploaded['size'],len(payload))
             self.assertEqual(dest.stat().st_mode & 0o777,0o600)
             self.assertEqual(upload(kind,'note','note.txt',payload)['receipt']['input'],uploaded)
+            self.assertEqual(upload(kind,'note','other.txt',payload,expected=409)['code'],'request_conflict')
+            self.assertEqual(upload(kind,'note','note.txt',payload,'image',409)['code'],'request_conflict')
+            self.assertEqual(upload(kind,'note','note.txt',payload+b'changed',expected=409)['code'],'request_conflict')
+            self.assertEqual(dest.read_bytes(),payload)
             # Large files arrive in 4 MiB parts: a repeated part is ignored, a gap is refused, the last part saves.
             big, size = secrets.token_bytes(9*1024**2), 4*1024**2
             def part(offset, expected=202):
@@ -129,6 +133,10 @@ class WorkspaceTests(unittest.TestCase):
             saved = part(2*size)['receipt']['input']
             self.assertEqual(Path(saved['path']).read_bytes(),big)
             self.assertEqual(part(2*size)['receipt']['input'],saved)
+            self.assertEqual(upload(kind,'parts','other.bin',big[2*size:],expected=409,parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
+            self.assertEqual(upload(kind,'parts','big.bin',b'changed',expected=409,parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
+            self.assertEqual(upload(kind,'parts','big.bin',big[2*size:],expected=409,parts=f'&offset={2*size}&total={len(big)+1}')['code'],'request_conflict')
+            self.assertEqual(Path(saved['path']).read_bytes(),big)
             self.assertEqual(upload(kind,'parts-large','big.bin',b'x',expected=409,parts=f'&offset=0&total={25*1024**2+1}')['code'],'attachment_too_large')
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)

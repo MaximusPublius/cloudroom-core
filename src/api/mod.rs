@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -1159,20 +1160,62 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
-    // A part is read before any reply, so a retried last part gets its receipt instead of a reset connection.
-    let (body, part) = match query.total {
-        Some(_) => (
-            Body::empty(),
-            Some(
-                axum::body::to_bytes(body, PART_BYTES)
-                    .await
-                    .map_err(|_| session::Error::Conflict("upload part exceeds 8 MiB"))?,
-            ),
-        ),
-        None => (body, None),
+    let bytes = axum::body::to_bytes(
+        body,
+        if query.total.is_some() {
+            PART_BYTES
+        } else {
+            26 << 20
+        },
+    )
+    .await
+    .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
+    let previous = manager.receipt(&id, &query.request_id);
+    if let Some(receipt) = &previous {
+        if receipt.command != "attach"
+            || receipt.input["name"] != query.name
+            || receipt.input["kind"] != query.kind
+            || query
+                .total
+                .is_some_and(|total| receipt.input["size"] != total)
+        {
+            return Err(session::Error::Conflict(
+                "request_id already has different content",
+            ));
+        }
+    }
+    let key = format!("{id}/{}", query.request_id);
+    let bytes = match (query.offset, query.total) {
+        (None, None) => bytes.to_vec(),
+        (Some(offset), Some(total)) => {
+            let limit = if query.kind == "image" {
+                10 << 20
+            } else {
+                25 << 20
+            };
+            if total > limit {
+                return Err(session::Error::Conflict(if query.kind == "image" {
+                    "image exceeds the 10 MiB limit"
+                } else {
+                    "file exceeds the 25 MiB limit"
+                }));
+            }
+            match attach_part(&key, offset, total, &bytes).map_err(session::Error::Conflict)? {
+                (_, Some(whole)) => whole,
+                (received, None) => {
+                    return Ok((StatusCode::ACCEPTED, Json(json!({ "received": received }))));
+                }
+            }
+        }
+        _ => {
+            return Err(session::Error::Conflict(
+                "offset and total must be sent together",
+            ));
+        }
     };
-    if let Some(receipt) = manager.receipt(&id, &query.request_id) {
-        if receipt.command != "attach" {
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(receipt) = previous {
+        if receipt.input["size"] != bytes.len() || receipt.input["sha256"] != sha256 {
             return Err(session::Error::Conflict(
                 "request_id already has different content",
             ));
@@ -1196,35 +1239,6 @@ async fn attach(
             "storage unsafe; uploads are blocked",
         ));
     }
-    let key = format!("{id}/{}", query.request_id);
-    let body = match (query.offset, query.total, part) {
-        (None, None, _) => body,
-        (Some(offset), Some(total), Some(part)) => {
-            let limit = if query.kind == "image" {
-                10 << 20
-            } else {
-                25 << 20
-            };
-            if total > limit {
-                return Err(session::Error::Conflict(if query.kind == "image" {
-                    "image exceeds the 10 MiB limit"
-                } else {
-                    "file exceeds the 25 MiB limit"
-                }));
-            }
-            match attach_part(&key, offset, total, &part).map_err(session::Error::Conflict)? {
-                (_, Some(whole)) => Body::from(whole),
-                (received, None) => {
-                    return Ok((StatusCode::ACCEPTED, Json(json!({ "received": received }))));
-                }
-            }
-        }
-        _ => {
-            return Err(session::Error::Conflict(
-                "offset and total must be sent together",
-            ));
-        }
-    };
     let written = manager
         .workspaces
         .attach(
@@ -1232,7 +1246,7 @@ async fn attach(
             &query.request_id,
             &query.name,
             &query.kind,
-            body,
+            Body::from(bytes),
             &manager.storage,
         )
         .await
@@ -1253,8 +1267,9 @@ async fn attach(
                 _ => "attachment upload failed",
             })
         })?;
+    let mut written = written;
+    written["sha256"] = json!(sha256);
     let receipt = manager.command(&id, query.request_id, "attach", written)?;
-    PARTS.lock().unwrap().remove(&key);
     Ok(accepted(&manager, &id, receipt))
 }
 
@@ -1264,8 +1279,8 @@ type Partial = (usize, Vec<u8>, Instant);
 static PARTS: LazyLock<Mutex<HashMap<String, Partial>>> = LazyLock::new(Default::default);
 const PART_BYTES: usize = 8 << 20;
 
-/// Adds one part; returns the bytes received and, once complete, the whole file. The partial stays until its
-/// receipt is recorded, so a retried last part can save it again.
+/// Adds one part; returns the bytes received and, once complete, the whole file. Completed bytes
+/// remain briefly for digest-checked last-part retries, and yield capacity to new uploads.
 fn attach_part(
     key: &str,
     offset: usize,
@@ -1275,6 +1290,9 @@ fn attach_part(
     let mut parts = PARTS.lock().unwrap();
     parts.retain(|_, (_, _, at)| at.elapsed() < Duration::from_secs(600));
     if offset == 0 && !parts.contains_key(key) {
+        if parts.len() >= 8 {
+            parts.retain(|_, (size, bytes, _)| bytes.len() != *size);
+        }
         if parts.len() >= 8 {
             return Err("too many uploads in progress; try again");
         }
@@ -1305,6 +1323,8 @@ pub(crate) fn append_part(
         buffer.extend_from_slice(part);
     } else if end > buffer.len() {
         return Err("upload part out of order");
+    } else if buffer[offset..end] != *part {
+        return Err("request_id already has different content");
     }
     Ok(())
 }

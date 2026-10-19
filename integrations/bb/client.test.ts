@@ -659,3 +659,39 @@ test("reads core status without exposing private fields as client configuration"
   assert.equal(state.receipts.p2.state, "accepted");
   assert.deepEqual(state.queue, ["p2"]);
 });
+
+test("accepts synchronous Pi key writes and preserves receipt errors", async (t) => {
+  const service = await fixture((req, res) => {
+    if (req.url === "/v1/accounts/pi/key") return sendJson(res, { providers: ["openai"] });
+    sendJson(res, {
+      session: {
+        ...snapshot(1).session,
+        receipts: {
+          failed: {
+            request_id: "failed",
+            command: "prompt",
+            state: "failed",
+            input: { text: "hello" },
+            error: "provider unavailable",
+          },
+        },
+      },
+    });
+  });
+  t.after(() => service.close());
+  assert.deepEqual(await service.client.piApiKey("openai", "synthetic-key"), { providers: ["openai"] });
+  assert.equal((await service.client.session("s1")).receipts.failed.error, "provider unavailable");
+});
+
+test("preserves nullable receipt errors and rejects invalid errors", async (t) => {
+  let error: unknown = null;
+  const service = await fixture((_req, res) => sendJson(res, {
+    session: { ...snapshot(1).session, receipts: {
+      failed: { request_id: "failed", command: "prompt", state: "failed", input: {}, error },
+    } },
+  }));
+  t.after(() => service.close());
+  assert.equal((await service.client.session("s1")).receipts.failed.error, null);
+  error = 42;
+  await assert.rejects(service.client.session("s1"), /Invalid Cloudroom response/);
+});

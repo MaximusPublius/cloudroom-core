@@ -42,7 +42,7 @@ export type Receipt = {
   input: Json;
   model?: string;
   provider?: string;
-  error?: string;
+  error?: string | null;
 };
 export type Acceptance = { session_id: string; receipt: Receipt; saving: Json };
 export type SessionRecord = {
@@ -226,6 +226,7 @@ function receipt(value: unknown): Receipt {
     input: json(item.input),
     ...(item.model === undefined ? {} : { model: text(item.model) }),
     ...(item.provider === undefined ? {} : { provider: text(item.provider) }),
+    ...(item.error === undefined ? {} : { error: item.error === null ? null : text(item.error) }),
   };
 }
 
