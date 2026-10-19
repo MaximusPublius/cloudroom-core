@@ -132,10 +132,6 @@ impl Journal {
         self.writable
     }
 
-    pub fn writable(&self) -> bool {
-        self.writable
-    }
-
     pub fn last(&self) -> u64 {
         self.next - 1
     }
