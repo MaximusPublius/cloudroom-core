@@ -50,11 +50,13 @@ pub(crate) fn is_api_key(value: &str) -> bool {
 /// the subscription token is dropped. A rejected key leaves the old login intact.
 async fn save_key(config: &Config, key: &str) -> Result<(), &'static str> {
     let path = claude::key_path(config);
-    save_private(&path, &format!("{key}\n")).map_err(|_| "Could not save the API key.")?;
-    if claude::probe(config, "haiku", None).await.is_err() {
-        let _ = remove(&path);
+    if claude::probe_with_key(config, "haiku", None, Some(key))
+        .await
+        .is_err()
+    {
         return Err("Anthropic did not accept this API key. Check the key and its credits.");
     }
+    save_private(&path, &format!("{key}\n")).map_err(|_| "Could not save the API key.")?;
     remove(&claude::token_path(config)).map_err(|_| "Could not remove the old Claude token.")
 }
 struct Protocol;
@@ -325,5 +327,175 @@ impl ClaudeLogin {
     }
     pub async fn shutdown(&self) {
         self.0.lock().await.login = None;
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::{config::HarnessConfig, runtime::Kind};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn fixture(script: &str) -> Config {
+        let root = std::env::temp_dir().join(format!(
+            "cloudroom-claude-retained-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let binary = root.join("fake-claude");
+        fs::write(&binary, script).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("retained synthetic Claude fixture: {}", root.display());
+        Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            token: String::new(),
+            state_dir: root.clone(),
+            repository: root.clone(),
+            database_url: String::new(),
+            store: "synthetic".into(),
+            allow_insecure_database: true,
+            instance: None,
+            account_home: root.clone(),
+            default_harness: Kind::Claude,
+            harnesses: [(
+                Kind::Claude,
+                HarnessConfig {
+                    binary,
+                    home: root.join(".claude"),
+                    model: "fixture".into(),
+                    provider: None,
+                },
+            )]
+            .into(),
+            storage: None,
+            rpc_timeout: Duration::from_secs(2),
+            diagnostic_upload: Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_probe_preserves_saved_credentials() {
+        let config = fixture(
+            r#"#!/bin/sh
+[ "$ANTHROPIC_API_KEY" = "synthetic-candidate" ] || exit 2
+[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] || exit 3
+[ -z "$CLAUDE_CODE_SUBSCRIPTION_TYPE" ] || exit 4
+[ "$(cat "$HOME/claude-api-key")" = "synthetic-previous" ] || exit 5
+printf '{"is_error":true}'
+"#,
+        );
+        fs::write(claude::key_path(&config), "synthetic-previous\n").unwrap();
+        fs::write(
+            claude::token_path(&config),
+            "synthetic-subscription\nplan\n",
+        )
+        .unwrap();
+        assert!(save_key(&config, "synthetic-candidate").await.is_err());
+        assert_eq!(
+            fs::read_to_string(claude::key_path(&config)).unwrap(),
+            "synthetic-previous\n"
+        );
+        assert_eq!(
+            fs::read_to_string(claude::token_path(&config)).unwrap(),
+            "synthetic-subscription\nplan\n"
+        );
+        // A malformed/transient CLI response must preserve the same credentials too.
+        fs::write(
+            &config.harnesses[&Kind::Claude].binary,
+            "#!/bin/sh\nprintf unavailable\n",
+        )
+        .unwrap();
+        assert!(save_key(&config, "synthetic-candidate").await.is_err());
+        assert_eq!(
+            fs::read_to_string(claude::key_path(&config)).unwrap(),
+            "synthetic-previous\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_probe_uses_candidate_without_publishing_it() {
+        let config = fixture(
+            r#"#!/bin/sh
+[ "$ANTHROPIC_API_KEY" = "synthetic-candidate" ] || exit 2
+[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] || exit 3
+[ -z "$CLAUDE_CODE_SUBSCRIPTION_TYPE" ] || exit 4
+[ "$(cat "$HOME/claude-api-key")" = "synthetic-previous" ] || exit 5
+printf '{"is_error":false}'
+"#,
+        );
+        fs::write(claude::key_path(&config), "synthetic-previous\n").unwrap();
+        fs::write(
+            claude::token_path(&config),
+            "synthetic-subscription\nplan\n",
+        )
+        .unwrap();
+        claude::probe_with_key(&config, "haiku", None, Some("synthetic-candidate"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(claude::key_path(&config)).unwrap(),
+            "synthetic-previous\n"
+        );
+        assert!(claude::token_path(&config).is_file());
+    }
+
+    #[tokio::test]
+    async fn validated_candidate_replaces_key_only_after_probe() {
+        let config = fixture(
+            r#"#!/bin/sh
+[ "$ANTHROPIC_API_KEY" = "synthetic-candidate" ] || exit 2
+[ "$(cat "$HOME/claude-api-key")" = "synthetic-previous" ] || exit 3
+printf '{"is_error":false}'
+"#,
+        );
+        fs::write(claude::key_path(&config), "synthetic-previous\n").unwrap();
+        save_key(&config, "synthetic-candidate").await.unwrap();
+        assert_eq!(
+            fs::read_to_string(claude::key_path(&config)).unwrap(),
+            "synthetic-candidate\n"
+        );
+        assert!(!claude::token_path(&config).exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_first_key_does_not_create_saved_credentials() {
+        let config = fixture("#!/bin/sh\nprintf '{\"is_error\":true}'\n");
+        assert!(save_key(&config, "synthetic-candidate").await.is_err());
+        assert!(!claude::key_path(&config).exists());
+        assert!(!claude::token_path(&config).exists());
+    }
+
+    #[tokio::test]
+    async fn stable_launcher_observes_version_target_change() {
+        let mut config = fixture("#!/bin/sh\nprintf version-one\n");
+        let root = &config.state_dir;
+        let launcher = root.join("launcher");
+        symlink(&config.harnesses[&Kind::Claude].binary, &launcher).unwrap();
+        config.harnesses.get_mut(&Kind::Claude).unwrap().binary =
+            crate::config::launcher_path(&launcher).unwrap();
+        assert_eq!(
+            claude::run_output(&config, &["--version"], 2)
+                .await
+                .unwrap()
+                .1,
+            b"version-one"
+        );
+        let second = root.join("version-two");
+        fs::write(&second, "#!/bin/sh\nprintf version-two\n").unwrap();
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
+        // Retain the old launcher as evidence instead of deleting it.
+        fs::rename(&launcher, root.join("launcher-old")).unwrap();
+        symlink(&second, &launcher).unwrap();
+        assert_eq!(
+            claude::run_output(&config, &["--version"], 2)
+                .await
+                .unwrap()
+                .1,
+            b"version-two"
+        );
     }
 }

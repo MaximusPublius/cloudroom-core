@@ -147,6 +147,16 @@ pub(super) async fn auth_ready(config: &Config) -> io::Result<bool> {
 /// One tiny real request with the exact model and effort. `auth status` can report
 /// "logged in" for a token Anthropic rejects, so Teleport verifies with inference.
 pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>) -> io::Result<()> {
+    probe_with_key(config, model, reasoning, None).await
+}
+
+/// Candidate credentials are passed only to this probe, never published to the saved profile.
+pub(super) async fn probe_with_key(
+    config: &Config,
+    model: &str,
+    reasoning: Option<&str>,
+    key: Option<&str>,
+) -> io::Result<()> {
     // The prompt goes first: `--tools` takes a list and would swallow a trailing prompt.
     let mut args = vec![
         "-p",
@@ -162,7 +172,9 @@ pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>)
     if let Some(effort) = reasoning.filter(|effort| *effort != "none") {
         args.extend(["--effort", effort]);
     }
-    let (_, value) = run_json(config, &args, 40).await?;
+    let (_, bytes) = run_output_with_key(config, &args, 40, key).await?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::other("Claude returned an unreadable response"))?;
     if value["is_error"] == false {
         return Ok(());
     }
@@ -190,6 +202,15 @@ pub(super) async fn run_output(
     args: &[&str],
     seconds: u64,
 ) -> io::Result<(Option<i32>, Vec<u8>)> {
+    run_output_with_key(config, args, seconds, None).await
+}
+
+async fn run_output_with_key(
+    config: &Config,
+    args: &[&str],
+    seconds: u64,
+    key: Option<&str>,
+) -> io::Result<(Option<i32>, Vec<u8>)> {
     use tokio::io::AsyncReadExt;
     let profile = config
         .harnesses
@@ -197,6 +218,11 @@ pub(super) async fn run_output(
         .ok_or_else(|| io::Error::other("Claude is not configured"))?;
     let mut command = super::command(&profile.binary, config);
     profile_env(&mut command, config, profile);
+    if let Some(key) = key {
+        command.env("ANTHROPIC_API_KEY", key);
+        command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+        command.env_remove("CLAUDE_CODE_SUBSCRIPTION_TYPE");
+    }
     command.args(args).stderr(std::process::Stdio::null());
     let group = config
         .storage

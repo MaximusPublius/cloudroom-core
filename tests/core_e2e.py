@@ -405,12 +405,25 @@ def main():
                 f"INSERT INTO cloudroom_diagnostics SELECT '{name}', 'retention', n, 0, '{{\"kind\":\"retention_fixture\"}}'::jsonb FROM generate_series(1,2501) n; "
                 "INSERT INTO cloudroom_diagnostics VALUES ('another-owner', 'retention', 1, 0, '{\"kind\":\"retention_fixture\"}')")
             service.stop()
+            # Use a real serialized producer sample, not a hand-written kind spelling.
+            resource_record = json.dumps(resource).replace("'", "''")
+            run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-v", "ON_ERROR_STOP=1", "-c",
+                f"INSERT INTO cloudroom_diagnostics SELECT '{name}', 'resource-retention', age, "
+                "(extract(epoch FROM now() - age * interval '1 day') * 1000)::bigint, "
+                f"'{resource_record}'::jsonb FROM unnest(ARRAY[6,8,29,31]) age; "
+                f"INSERT INTO cloudroom_diagnostics SELECT '{name}', 'ordinary-retention', age, "
+                "(extract(epoch FROM now() - age * interval '1 day') * 1000)::bigint, "
+                "'{\"kind\":\"retention_fixture\"}'::jsonb FROM unnest(ARRAY[6,8,29,31]) age")
             service = Service(env, root / "retention.log").start()
             until(lambda: run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
                               f"SELECT count(*) FROM cloudroom_diagnostics WHERE store='{name}' AND run_id='retention'") == "0", "seven-day diagnostic retention", 15)
             assert run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
                        "SELECT count(*) FROM cloudroom_diagnostics WHERE store='another-owner' AND run_id='retention'") == "1"
-            passed("retention removes only this owner's old diagnostics")
+            for run_id, expected in [("resource-retention", "6,8,29"), ("ordinary-retention", "6")]:
+                until(lambda: run("docker", "exec", name, "psql", "-U", "postgres", "-d", "cloudroom_core_test", "-Atc",
+                                  f"SELECT string_agg(sequence::text, ',' ORDER BY sequence) FROM cloudroom_diagnostics WHERE store='{name}' AND run_id='{run_id}'") == expected,
+                      f"{run_id} age boundaries", 15)
+            passed("retention preserves producer resources through day 29, ordinary diagnostics through day 6, and other owners")
             if args.foundation:
                 evidence["kind"] = "foundation only; no Codex inference"
                 return

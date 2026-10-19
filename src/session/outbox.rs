@@ -26,9 +26,9 @@ impl Journal {
         Self::open_from(directory, 0)
     }
 
-    /// `known` is the last record a replay snapshot covers. Listing every record of a large journal is slow,
-    /// so a present `known` record skips the listing and only the records after it are counted.
-    pub fn open_from(directory: &Path, known: u64) -> io::Result<Self> {
+    /// A snapshot skips record replay, not integrity checks: later records must not
+    /// be hidden by a missing sequence after the snapshot.
+    pub fn open_from(directory: &Path, _known: u64) -> io::Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -42,15 +42,7 @@ impl Journal {
             .open(directory.join("lock"))?;
         lock.try_lock()
             .map_err(|_| io::Error::other("state directory already in use"))?;
-        let last = if known > 0 && directory.join(record_name(known)).is_file() {
-            let mut last = known;
-            while directory.join(record_name(last + 1)).is_file() {
-                last += 1;
-            }
-            last
-        } else {
-            Self::count(directory)?
-        };
+        let last = Self::count(directory)?;
         let saved = match fs::read_to_string(directory.join("saved")) {
             Ok(value) => value
                 .parse()
@@ -159,15 +151,28 @@ impl Journal {
         // Refuse further writes until reopening, rather than overwrite that record.
         self.writable = false;
         let temporary = self.directory.join("pending.tmp");
+        // A crash after hard-link publication can leave pending.tmp sharing a
+        // committed inode. Unlink that name before creating a new inode; never truncate it.
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(temporary, self.directory.join(name))?;
+        if name.ends_with(".record") {
+            // Publish the complete inode without replacing an existing sequence,
+            // including one that appeared after open. Never retry an uncertain write.
+            fs::hard_link(&temporary, self.directory.join(name))?;
+            fs::remove_file(&temporary)?;
+        } else {
+            fs::rename(temporary, self.directory.join(name))?;
+        }
         File::open(&self.directory)?.sync_all()?;
         self.writable = true;
         Ok(())

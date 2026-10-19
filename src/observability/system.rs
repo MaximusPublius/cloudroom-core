@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs;
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub(crate) struct Resources {
     cpu_used_percent: Option<f64>,
     memory_total_bytes: Option<u64>,

@@ -477,6 +477,7 @@ export class CloudroomClient {
     command: string,
     body: { request_id: string } & Record<string, Json>,
     sessionId?: string,
+    receiptId: string = body.request_id,
   ): Promise<Acceptance> {
     requestId(body.request_id);
     const value = await this.#json(path, body);
@@ -487,7 +488,7 @@ export class CloudroomClient {
     };
     if (
       (sessionId !== undefined && accepted.session_id !== sessionId) ||
-      accepted.receipt.request_id !== body.request_id ||
+      accepted.receipt.request_id !== receiptId ||
       accepted.receipt.command !== command
     ) {
       throw new CloudroomError(
@@ -571,7 +572,9 @@ export class CloudroomClient {
   start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; prompt?: string; title?: string; fork?: { session: string; before?: string; last_turn_id?: string } } = {}) {
     if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx" && harness !== "opencode")
       throw new CloudroomError("Unsupported Cloudroom harness");
-    return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
+    return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options },
+      options.parent_session !== undefined ? `cr_child_${id}` : undefined,
+      options.parent_session !== undefined ? `child_${id}` : id);
   }
 
   prompt(

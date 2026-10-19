@@ -695,3 +695,29 @@ test("preserves nullable receipt errors and rejects invalid errors", async (t) =
   error = 42;
   await assert.rejects(service.client.session("s1"), /Invalid Cloudroom response/);
 });
+
+
+test("child starts validate their derived receipt and session without relaxing ordinary commands", async (t) => {
+  let receiptId = "child_kid";
+  let sessionId = "cr_child_kid";
+  let command = "start";
+  const service = await fixture((_req, res, body) => {
+    assert.equal(body.request_id, "kid");
+    sendJson(res, { session_id: sessionId, receipt: { request_id: receiptId,
+      command, input: body, state: "accepted" }, saving: "pending" }, 202);
+  });
+  t.after(() => service.close());
+  const child = () => service.client.start("kid", "codex", { parent_session: "parent", prompt: "work" });
+  assert.equal((await child()).receipt.request_id, "child_kid");
+  await assert.rejects(service.client.start("kid"), /does not match/);
+  await assert.rejects(service.client.prompt("cr_child_kid", "kid", "work"), /does not match/);
+  receiptId = "kid";
+  await assert.rejects(child(), /does not match/);
+  assert.equal((await service.client.start("kid")).receipt.request_id, "kid");
+  receiptId = "child_kid";
+  sessionId = "wrong";
+  await assert.rejects(child(), /does not match/);
+  sessionId = "cr_child_kid";
+  command = "prompt";
+  await assert.rejects(child(), /does not match/);
+});

@@ -251,13 +251,21 @@ fn private_stderr_rejects_unsafe_existing_paths_without_touching_targets() {
 
 #[test]
 fn retention_preserves_the_full_resource_chart_range() {
-    assert_eq!(retention_days("resource"), 30);
+    let record = serde_json::to_value(Signal::Resources(system::Resources::default())).unwrap();
+    let kind = record["kind"].as_str().unwrap();
+    assert_eq!(kind, RESOURCE_KIND);
+    assert_eq!(retention_days(kind), 30);
+    for age in [6, 8, 29, 31] {
+        assert_eq!(age > retention_days(kind), age == 31);
+        assert_eq!(age > retention_days("api"), age >= 8);
+    }
     for kind in [
         "api",
         "agent_exit",
         "diagnostics",
         "history_fault",
         "future_kind",
+        "resource",
     ] {
         assert_eq!(retention_days(kind), 7, "{kind}");
     }

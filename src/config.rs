@@ -223,3 +223,10 @@ fn required(name: &str) -> io::Result<String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| io::Error::other(format!("{name} is required")))
 }
+
+/// Validate the launcher now, but retain its final symlink so native version switches
+/// are observed by every subsequent invocation. Anchor relative paths before cwd changes.
+pub(crate) fn launcher_path(path: &std::path::Path) -> io::Result<PathBuf> {
+    path.canonicalize()?;
+    std::path::absolute(path)
+}

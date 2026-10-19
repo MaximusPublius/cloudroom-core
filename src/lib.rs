@@ -61,9 +61,13 @@ pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error:
     use std::{future::IntoFuture, time::Duration};
     config.account_home = config.account_home.canonicalize()?;
     config.repository = config.repository.canonicalize()?;
-    for profile in config.harnesses.values_mut() {
+    for (kind, profile) in &mut config.harnesses {
         profile.home = profile.home.canonicalize()?;
-        profile.binary = profile.binary.canonicalize()?;
+        profile.binary = if *kind == runtime::Kind::Claude {
+            config::launcher_path(&profile.binary)?
+        } else {
+            profile.binary.canonicalize()?
+        };
     }
     // A bind failure must not mutate saved sessions or claim their recovery.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
