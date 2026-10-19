@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Disk safety on an explicitly disposable Linux VM. Run as root, never a customer host.
-Uses real ext4 user quotas, cgroup freezing, the Rust API and a protocol fixture.
+Uses a small disposable tmpfs, cgroup freezing, the Rust API and a protocol fixture.
 Model/DB fixtures are not a claim of BB or real-inference delivery.
 """
-import errno
+import base64
 import hashlib
 import http.client
 import json
@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / 'docs/database'
@@ -35,6 +36,10 @@ def fixture():
         v = json.loads(line); method = v.get('method'); p = v.get('params', {})
         if 'id' not in v: continue
         result = {}
+        if method == 'account/read':
+            result = {'account': {'type': 'chatgpt', 'email': 'fixture@example.invalid', 'planType': 'plus'}, 'requiresOpenaiAuth': True}
+        elif method == 'account/rateLimits/read':
+            result = {'rateLimits': {'primary': {'usedPercent': 0}, 'secondary': None}}
         if method == 'thread/inject_items':
             if (Path.cwd() / 'hold-cache').exists():
                 held.append(open((Path.cwd() / 'hold-cache').read_text(), 'rb'))
@@ -44,6 +49,17 @@ def fixture():
             turn = p['clientUserMessageId']
             send({'method': 'turn/started', 'params': {'threadId': native, 'turn': {'id': turn, 'status': 'inProgress'}}})
             result = {'turn': {'id': turn}}
+            if p['input'][0].get('text') == 'verify attachments':
+                images = [Path(item['path']).read_bytes() for item in p['input'] if item['type'] == 'localImage']
+                files = [Path(item['text'][16:-1]).read_bytes() for item in p['input']
+                         if item['type'] == 'text' and item['text'].startswith('[Attached file: ')]
+                assert len(images) == len(files) == 1
+                proof = 'attachments read: ' + ' '.join(hashlib.sha256(data).hexdigest() for data in images + files)
+                with rollout.open('a') as f: f.write(json.dumps({'turn':turn,'proof':proof})+'\n')
+                send({'id':v['id'],'result':result})
+                send({'method':'item/agentMessage/delta','params':{'threadId':native,'turnId':turn,'itemId':'proof','delta':proof}})
+                send({'method':'turn/completed','params':{'threadId':native,'turn':{'id':turn,'status':'completed'}}})
+                continue
             # Detached child proves freeze covers descendants even after setsid().
             child = subprocess.Popen([sys.executable, '-c',
                 "from pathlib import Path; import time,os\np=Path('ticks-" + native + "');Path('pid-" + native + "').write_text(str(os.getpid()))\nfor n in range(10000):\n p.write_text(str(n));time.sleep(.05)"],
@@ -74,11 +90,18 @@ def main():
     assert os.geteuid() == 0 and sys.argv[1:] in (['--disposable'], ['--disposable', '--mixed']), 'Explicit disposable VM only'
     mixed = '--mixed' in sys.argv
     agent = pwd.getpwnam('cr-disk-test'); service = pwd.getpwnam('cr-service-test')
-    run('setquota', '-u', agent.pw_name, '0', '0', '0', '0', '/')
     unit = 'cloudroom-storage-e2e-' + secrets.token_hex(4)
     base = Path('/var/lib') / unit; base.mkdir(mode=0o755)
+    run('mount', '-t', 'tmpfs', '-o', 'size=512m,mode=0755', 'tmpfs', str(base))
+    # Test users cannot traverse the CI runner's private checkout. Keep executables
+    # outside it and outside the deliberately small data filesystem.
+    tools = base.with_name(unit + '-bin'); tools.mkdir(mode=0o755)
+    for source in (ROOT/'target/debug/cloudroom', Path(__file__), ROOT/'tests/pi_fixture.py'):
+        target = tools/source.name; shutil.copyfile(source, target); target.chmod(0o755)
+    for name in ('tmp', 'var-tmp'):
+        (base / name).mkdir(); (base / name).chmod(0o1777)
     work = base / 'work'; home = base / 'home'; cache = base / 'cache'; state = base / 'state'
-    for p in (work, home, cache):
+    for p in (work, home, cache, base / 'code'):
         p.mkdir(mode=0o700); os.chown(p, agent.pw_uid, agent.pw_gid)
     state.mkdir(mode=0o700); os.chown(state, service.pw_uid, service.pw_gid)
     (home / '.codex').mkdir(); os.chown(home / '.codex', agent.pw_uid, agent.pw_gid)
@@ -88,34 +111,32 @@ def main():
         for p in (home / '.pi', home / '.pi/agent'):
             os.chown(p, agent.pw_uid, agent.pw_gid); p.chmod(0o700)
     run('runuser', '-u', agent.pw_name, '--', 'git', 'init', '-q', str(work))
-    used = int(next(l for l in run('repquota', '-u', '/').splitlines() if l.startswith(agent.pw_name+' ')).split()[2])
-    hard = used + 256 * 1024
-    run('setquota', '-u', agent.pw_name, '0', str(hard), '0', '1000000', '/')
     # An owner-local disposable PostgreSQL; no production data/credentials.
     container = unit
     token = secrets.token_hex(24)
-    policy = dict(agent_uid=agent.pw_uid, agent_gid=agent.pw_gid, quota_mount='/', quota_limit_bytes=hard*1024,
-                  cache_dir=str(cache), cgroup_root='/sys/fs/cgroup/system.slice/'+unit+'.service/agents', reserve_bytes=10_000_000_000,
-                  warning_bytes=64*1024*1024, pause_bytes=32*1024*1024, resume_bytes=80*1024*1024)
+    policy = dict(agent_uid=agent.pw_uid, agent_gid=agent.pw_gid,
+                  cache_dir=str(cache), cgroup_root='/sys/fs/cgroup/system.slice/'+unit+'.service/agents',
+                  warning_bytes=200*1024*1024, pause_bytes=100*1024*1024, resume_bytes=160*1024*1024)
     policy_file = base / 'policy.json'; policy_file.write_text(json.dumps(policy)); policy_file.chmod(0o644)
     env = base / 'env'
     env.write_text('\n'.join([f'CLOUDROOM_TOKEN={token}',f'CLOUDROOM_STORAGE_POLICY={policy_file}',f'CLOUDROOM_STATE_DIR={state}',
         f'CLOUDROOM_REPOSITORY={work}',f'CLOUDROOM_ACCOUNT_HOME={home}',f'CLOUDROOM_CODEX_HOME={home}/.codex',
-        f'CLOUDROOM_CODEX_BINARY={__file__}', 'CLOUDROOM_MODEL=fixture','CLOUDROOM_MAX_HARNESSES=2','CLOUDROOM_LISTEN=127.0.0.1:19842',
+        f'CLOUDROOM_CODEX_BINARY={tools}/storage_e2e.py', 'CLOUDROOM_MODEL=fixture','CLOUDROOM_LISTEN=127.0.0.1:19842',
         'CLOUDROOM_ALLOW_INSECURE_DATABASE=1','CLOUDROOM_STORE=disk-fixture','CLOUDROOM_DATABASE_URL=postgres://postgres:fixture@127.0.0.1:19843/disk_fixture'])+'\n')
     if mixed:
         with env.open('a') as f:
-            f.write(f'CLOUDROOM_PI_BINARY={ROOT}/tests/pi_fixture.py\nCLOUDROOM_PI_HOME={home}/.pi/agent\nCLOUDROOM_PI_MODEL=fixture\nCLOUDROOM_PI_PROVIDER=fixture\n')
+            f.write(f'CLOUDROOM_PI_BINARY={tools}/pi_fixture.py\nCLOUDROOM_PI_HOME={home}/.pi/agent\nCLOUDROOM_PI_MODEL=fixture\nCLOUDROOM_PI_PROVIDER=fixture\n')
     env.chmod(0o600)
     def ticks():
         return list(work.glob('ticks-*')) + list(work.glob('*.ticks'))
     def request(method, path, body=None, status=200):
         c=http.client.HTTPConnection('127.0.0.1',19842,timeout=5)
-        c.request(method,path,json.dumps(body) if body is not None else None,{'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+        c.request(method,path,body if isinstance(body,bytes) else json.dumps(body) if body is not None else None,
+                  {'Authorization':'Bearer '+token,'Content-Type':'application/octet-stream' if isinstance(body,bytes) else 'application/json'})
         r=c.getresponse();text=r.read();c.close(); assert r.status==status,(r.status,text)
         return json.loads(text)
     def ready():
-        try:return request('GET','/v1/health')['storage']['level']=='normal'
+        try:return request('GET','/v1/health')['storage']['level']!='blocked'
         except (OSError,AssertionError):return False
     def session(sid):return request('GET','/v1/sessions/'+sid)['session']
     def events(sid):return request('GET','/v1/sessions/'+sid+'/events')['events']
@@ -125,10 +146,10 @@ def main():
     checks=[]
     def passed(text):checks.append(text);print('PASS:',text,flush=True)
     try:
-        probe = """import errno,os,shutil\nfrom pathlib import Path\na=Path('quota-home'); b=Path('/tmp/"""+unit+"""-quota')\ntry:\n a.write_bytes(b'x'*1048576*16)\n with b.open('wb') as f:\n  for _ in range(300):f.write(b'x'*1048576);f.flush()\n raise AssertionError('quota did not stop writes')\nexcept OSError as e:\n assert e.errno==errno.EDQUOT,e\n assert shutil.disk_usage('/').free>10000000000\nfinally:\n a.unlink(missing_ok=True);b.unlink(missing_ok=True)\n"""
-        run('runuser','-u',agent.pw_name,'--','python3','-c',probe,cwd=work)
+        write_as_agent(work/'large-output',300)
+        (work/'large-output').unlink()
         run('runuser','-u',service.pw_name,'--','sh','-c','echo protected > '+str(state/'probe'))
-        passed('kernel quota stops writes across workspace and /tmp; protected service retains 10 GB and can write')
+        passed('agent writes use actual filesystem capacity, without the former fixed test quota')
         run('docker','run','-d','--name',container,'--memory','256m','--cpus','.5','--pids-limit','64','-e','POSTGRES_PASSWORD=fixture','-e','POSTGRES_DB=disk_fixture','-p','127.0.0.1:19843:5432','postgres:16-alpine',timeout=120)
         wait(lambda: subprocess.run(['docker','exec',container,'pg_isready','-h','127.0.0.1','-U','postgres'],capture_output=True).returncode==0,'database')
         for name in ('0001-session-records.sql', '0002-diagnostics.sql'):
@@ -136,9 +157,57 @@ def main():
         run('systemd-run','--unit='+unit,'--property=User='+service.pw_name,'--property=Group='+service.pw_name,
             '--property=Delegate=yes','--property=AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL',
             '--property=CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL','--property=NoNewPrivileges=yes',
-            '--property=KillMode=control-group','--property=EnvironmentFile='+str(env),str(ROOT/'target/debug/cloudroom'))
+            '--property=KillMode=control-group',f'--property=BindPaths={base}/tmp:/tmp {base}/var-tmp:/var/tmp {base}/code:/code',
+            '--property=EnvironmentFile='+str(env),str(tools/'cloudroom'))
         wait(ready,'protected core ready')
-        passed('protected service starts with verified root quota and delegated workload groups')
+        assert 'agent_remaining_bytes' not in request('GET','/v1/health')['storage']
+        passed('protected service starts with actual free space and delegated workload groups')
+        # The same HTTP path that failed in agent-owned 0700 project folders.
+        images = [base64.b64decode(value) for value in [
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGOoZ/gPAAKAAX8wLww/AAAAAElFTkSuQmCC',
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNg+M8AAAICAQB7CYF4AAAAAElFTkSuQmCC']]
+        for harness in ['codex','pi'] if mixed else ['codex']:
+            sid=request('POST','/v1/sessions',{'request_id':'attachments-'+harness,'harness':harness},202)['session_id']
+            peer=request('POST','/v1/sessions',{'request_id':'attachment-retry-'+harness,'harness':harness},202)['session_id']
+            native = None
+            for turn,image in zip(['initial','follow-up'],images):
+                attachments=[]
+                payloads=[('image','pixel.png',image),('file','note.txt',('READ_'+harness+'_'+turn+'\n').encode()*8192)]
+                for kind,name,content in payloads:
+                    key=harness+'-'+turn+'-'+kind
+                    url='/v1/sessions/'+sid+'/attachments?'+urlencode(dict(request_id=key,name=name,kind=kind))
+                    uploaded=request('POST',url,content,202)['receipt']['input']
+                    dest=Path(uploaded['path'])
+                    assert dest.read_bytes()==content and uploaded['size']==len(content)
+                    for path,mode in [(dest,0o600), *((p,0o700) for p in [dest.parent,dest.parent.parent,dest.parent.parent.parent])]:
+                        info=path.stat()
+                        assert (info.st_uid,info.st_gid,info.st_mode & 0o777)==(agent.pw_uid,agent.pw_gid,mode),path
+                    assert run('runuser','-u',agent.pw_name,'--','sha256sum',str(dest)).split()[0]==hashlib.sha256(content).hexdigest()
+                    before=dest.stat()
+                    assert request('POST',url,content,202)['receipt']['input']==uploaded
+                    # A new session has no upload receipt: retry also exercises the file helper's existing-file path.
+                    retry_url=url.replace('/'+sid+'/', '/'+peer+'/')
+                    assert request('POST',retry_url,content,202)['receipt']['input']==uploaded
+                    after=dest.stat()
+                    assert (before.st_ino,before.st_mtime_ns)==(after.st_ino,after.st_mtime_ns)
+                    assert dest.read_bytes()==content and not list(dest.parent.glob('.attachment-*'))
+                    attachments.append(uploaded)
+                prompt=dict(request_id=turn,text='verify attachments',attachments=attachments)
+                request('POST','/v1/sessions/'+sid+'/prompts',prompt,202)
+                wait(lambda:session(sid)['receipts'][turn]['state']=='completed','attachment read by '+harness)
+                current=session(sid)
+                if native is not None: assert current['native_id']==native
+                native=current['native_id']
+                request('POST','/v1/sessions/'+sid+'/prompts',prompt,202)
+                proof='attachments read: '+' '.join(hashlib.sha256(data).hexdigest() for _,_,data in payloads)
+                wait(lambda:any(proof in json.dumps(record) for record in events(sid)),'attachment read proof')
+                dispatches=[r for r in events(sid) if r['kind']=='state' and r['data'].get('state')=='starting_turn' and r['data'].get('request_id')==turn]
+                assert len(dispatches)==1
+            for target in [sid,peer]:
+                wait(lambda:session(target)['state']=='idle','attachment session idle')
+                request('POST','/v1/sessions/'+target+'/close',{'request_id':'close'},202)
+                wait(lambda:session(target)['state']=='closed','attachment session closed')
+            passed(harness+' initial/follow-up image and file: HTTP bytes, agent UID/GID/modes/read proof, upload and prompt retries')
         ids=[]
         for name in ('a','b'):
             body = {'request_id':name}
@@ -171,8 +240,14 @@ def main():
         for p in (linked.parent.parent,linked.parent,linked):os.chown(p,agent.pw_uid,agent.pw_gid)
         os.link(linked,work/'kept-output')
         symlink=blob.parent/('e'*124);symlink.symlink_to(sensitive)
-        filler=work/'large-output'; write_as_agent(filler,105)
+        filler=work/'large-output'; write_as_agent(filler,shutil.disk_usage(base).free//1048576-180)
+        filler_size=filler.stat().st_size
         wait(lambda:request('GET','/v1/health')['storage']['level']=='low_space','warning threshold')
+        storage=request('GET','/v1/dashboard')['storage']
+        assert storage['level']=='low_space' and storage['reason']=='disk_capacity'
+        assert 0 < storage['workspace_available_bytes'] <= storage['workspace_total_bytes']
+        assert 0 < storage['history_available_bytes'] <= storage['history_total_bytes']
+        assert 0 <= time.time()*1000-storage['sampled_at'] < 5000
         wait(lambda:all((work/('warning-'+n)).exists() for n in names),'native warning delivered to every busy agent')
         for sid in ids:
             records=events(sid); warnings=[r for r in records if r['kind']=='storage_warning'];assert len(warnings)==1
@@ -185,25 +260,33 @@ def main():
                 if line.startswith('data:'):
                     assert json.loads(line[5:])['kind']=='storage_warning';break
             response.close();c.close()
-        request('POST','/v1/sessions',{'request_id':'blocked'},409)
-        request('POST','/v1/sessions/'+ids[0]+'/prompts',{'request_id':'blocked-input','text':'never run'},409)
-        passed('warning reaches both busy harnesses and replay history; new sessions and execution blocked')
+        assert request('GET','/v1/ready')['ready']
+        extra_sid=request('POST','/v1/sessions',{'request_id':'warning-allowed'},202)['session_id']
+        wait(lambda:session(extra_sid)['state']=='idle','new session during warning')
+        request('POST','/v1/sessions/'+extra_sid+'/close',{'request_id':'close'},202)
+        request('POST','/v1/sessions/'+ids[0]+'/prompts',{'request_id':'warning-input','text':'hold'},202)
+        request('POST','/v1/sync',{'device':'fixture','repositories':[]})
+        request('GET','/v1/sync/settings-codex?device=fixture')
+        passed('warning reaches busy harnesses and replay; new sessions, queued prompts and sync still work')
         time.sleep(3)
         for n in names:assert len((work/('warning-'+n)).read_text().splitlines())==1
         passed('warnings are deduplicated during one low-space episode')
-        extra=work/'more-output'; write_as_agent(extra,30)
+        extra=work/'more-output'; write_as_agent(extra,105)
         wait(lambda:not blob.exists(),'safe cache cleanup',40)
         wait(ready,'automatic recovery after cache cleanup',40)
+        wait(lambda:all(not session(s)['storage_paused'] for s in ids),'resume while warning remains')
+        for n in names:assert len((work/('warning-'+n)).read_text().splitlines())==1
         assert fake.read_text()=='do not delete' and sensitive.read_text()=='synthetic-secret'
         assert active.read_bytes()==active_data and linked.read_bytes()==linked_data and symlink.is_symlink()
         passed('active cache files, hardlinked outputs, symlinks and wrong-hash files survive cleanup')
-        assert filler.stat().st_size==105*1048576 and extra.stat().st_size==30*1048576
+        assert filler.stat().st_size==filler_size and extra.stat().st_size==105*1048576
+        assert request('GET','/v1/health')['storage']['level']=='low_space'
         for sid,n in zip(ids,names):
             records=events(sid)
             assert any(r['kind']=='storage_pause' for r in records)
-            assert any(r['kind']=='storage_recovered' for r in records)
+            assert any(r['kind']=='storage_pause' and not r['data']['paused'] for r in records)
             assert session(sid)['native_id']==n
-        passed('cache cleanup frees space; protected files/outputs survive; same workloads resume')
+        passed('same workloads resume above the recovery threshold while the low-space warning remains')
         before={p:p.read_text() for p in ticks()};time.sleep(.3)
         assert all(p.read_text()!=v for p,v in before.items())
         passed('descendants resume in place without duplicate prompts')
@@ -213,33 +296,42 @@ def main():
         before={p:p.read_text() for p in ticks()};time.sleep(.3)
         assert all(p.read_text()==v for p,v in before.items())
         assert request('GET','/v1/health')['status']=='ready'
-        assert shutil.disk_usage('/').free>10_000_000_000
-        passed('failed cleanup leaves both workloads frozen while core and 10 GB reserve remain available')
+        assert next(h for h in request('GET','/v1/capabilities')['harnesses'] if h['id']=='codex')['models'] is None
+        request('POST','/v1/sessions',{'request_id':'blocked'},409)
+        request('POST','/v1/sessions/'+ids[0]+'/prompts',{'request_id':'blocked-input','text':'never run'},409)
+        assert request('GET','/v1/sessions/'+ids[0]+'/events')['events']
+        passed('emergency pause blocks new writes but leaves core and saved history readable')
         (work/'final-output').unlink();filler.unlink();extra.unlink()
         wait(ready,'operator recovery',30)
         wait(lambda:all(not session(s)['storage_paused'] for s in ids),'confirmed thaw')
         passed('operator frees output; only storage-paused workloads are thawed')
         run('docker','stop','-t','2',container)
-        write_as_agent(work/'db-outage-output',230)
+        write_as_agent(work/'db-outage-output',shutil.disk_usage(base).free//1048576-75)
         wait(lambda:all(session(s)['storage_paused'] for s in ids),'disk emergency during DB outage')
         assert request('GET','/v1/health')['saving']['pending_records']>0
         (work/'db-outage-output').unlink(); wait(ready,'disk recovery during DB outage')
         passed('database outage preserves pending history while local disk emergency pauses work')
-        # The storage guard never authorizes work when kernel quota enforcement disappears.
-        run('setquota','-u',agent.pw_name,'0','0','0','0','/')
-        wait(lambda:request('GET','/v1/health')['storage']['reason']=='measurement_unavailable','missing quota fails closed')
-        request('POST','/v1/sessions',{'request_id':'no-quota'},409)
-        passed('missing or mismatched kernel quota blocks execution rather than claiming protection')
+        missing=base/'unavailable'; work.rename(missing)
+        wait(lambda:request('GET','/v1/health')['storage']['reason']=='measurement_unavailable','missing filesystem fails closed')
+        request('POST','/v1/sessions',{'request_id':'missing-disk'},409)
+        missing.rename(work); wait(ready,'filesystem measurements recover')
+        passed('failed filesystem measurements pause work; restored measurements permit recovery')
+    except Exception:
+        subprocess.run(['journalctl','--unit='+unit,'--no-pager','--lines=80'],check=False)
+        try: print('Core health:',json.dumps(request('GET','/v1/health')),flush=True)
+        except (OSError,AssertionError): pass
+        raise
     finally:
         subprocess.run(['systemctl','stop',unit],capture_output=True,timeout=20)
         subprocess.run(['docker','rm','-f','-v',container],capture_output=True)
-        run('setquota','-u',agent.pw_name,'0','0','0','0','/')
         evidence=ROOT/'private/storage-e2e.json';evidence.parent.mkdir(exist_ok=True)
         evidence.write_text(json.dumps({'checks':checks,'fixture':True,'harnesses':['codex','pi'] if mixed else ['codex'],'root':str(base)},indent=2))
         os.chown(evidence.parent,ROOT.stat().st_uid,ROOT.stat().st_gid)
         os.chown(evidence,ROOT.stat().st_uid,ROOT.stat().st_gid)
         # Keep logs/history for investigation; discard only this test's large filler files.
         for p in work.glob('*output'):p.unlink(missing_ok=True)
+        shutil.copytree(state,evidence.parent/(unit+'-history'))
+        run('umount',str(base));base.rmdir();shutil.rmtree(tools)
     print('Storage checks:',len(checks))
 
 if __name__=='__main__':

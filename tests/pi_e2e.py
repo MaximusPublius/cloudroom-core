@@ -10,6 +10,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -132,4 +133,85 @@ def main():
         evidence_file=ROOT/'private/pi-e2e-last.json';evidence_file.parent.mkdir(exist_ok=True)
         evidence_file.write_text(json.dumps(evidence,indent=2)+'\n')
 
-if __name__=='__main__':main()
+def native_fixture():
+    """Real installed Pi/tool/fork lifecycle with scripted inference, no credentials."""
+    from core_fixture import ReplayTests
+    binary = shutil.which('pi')
+    node = shutil.which('node')
+    if not binary or not node:
+        raise SystemExit('BLOCKED: installed Pi 0.85.1 and Node are required')
+    test = ReplayTests(); test.setUp()
+    try:
+        home = test.root / 'pi'
+        (home / 'sessions').mkdir(parents=True)
+        provider = test.root / 'provider.ts'
+        provider.write_text('''
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+export default function(pi) {
+  pi.registerProvider('cloudroom-fixture', {
+    api: 'cloudroom-fixture', baseUrl: 'http://127.0.0.1:1', apiKey: 'synthetic-not-a-credential',
+    models: [{ id: 'fixture', name: 'Fixture', reasoning: false, input: ['text'], contextWindow: 100000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    streamSimple(model, context) {
+      const stream = createAssistantMessageEventStream();
+      const user = context.messages.filter(m => m.role === 'user').at(-1);
+      const text = typeof user?.content === 'string' ? user.content : JSON.stringify(user?.content);
+      const child = context.messages.find(m => m.role === 'toolResult' && m.toolName === 'cloudroom_subagent');
+      const delegate = text?.includes('PARENT_TASK') && !child;
+      const message = {
+        role: 'assistant', api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(),
+        content: delegate ? [{ type: 'toolCall', id: 'fixture-call', name: 'cloudroom_subagent', arguments: { prompt: 'CHILD_TASK' } }] : [{ type: 'text', text: child ? 'PARENT_RECEIVED_CHILD: ' + JSON.stringify(child.content) : 'CHILD_RESULT' }],
+        stopReason: delegate ? 'toolUse' : 'stop',
+        usage: { input: 128, output: 16, cacheRead: 0, cacheWrite: 0, totalTokens: 144, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+      queueMicrotask(() => { stream.push({ type: 'start', partial: message }); stream.push({ type: 'done', reason: message.stopReason, message }); stream.end(); });
+      return stream;
+    },
+  });
+}
+''')
+        wrapper = test.root / 'pi-wrapper'
+        safe_path = str(Path(node).parent) + ':/usr/local/bin:/usr/bin:/bin'
+        wrapper.write_text('#!/bin/sh\nexport PATH=' + shlex.quote(safe_path) + '\nexec ' + shlex.quote(binary) + ' "$@" --no-context-files --no-extensions -e ' + shlex.quote(str(provider)) + '\n')
+        wrapper.chmod(0o700)
+        native = home / 'sessions/seed.jsonl'
+        native.write_text(json.dumps({'type':'session','version':3,'id':'synthetic-parent','cwd':str(test.repo),'timestamp':'2026-09-18T00:00:00Z'}) + '\n')
+        records = [('receipt',{'request_id':'pi','command':'start','input':{'harness':'pi'},'state':'completed','model':'fixture','provider':'cloudroom-fixture'}),('native_identity',{'id':'synthetic-parent','path':str(native)}),('state',{'state':'idle'})]
+        for i,(kind,data) in enumerate(records,1):
+            (test.state/f'{i:020}.record').write_text(json.dumps({'sequence':i,'session_id':'cr_pi','kind':kind,'data':data}))
+        test.env.update(CLOUDROOM_PI_HOME=str(home), CLOUDROOM_PI_BINARY=str(wrapper), CLOUDROOM_PI_PROVIDER='cloudroom-fixture', CLOUDROOM_PI_MODEL='fixture')
+        test.start()
+        service = test.service
+        until(lambda: service.session('cr_pi')['state'] == 'idle', 'real Pi ready', 30)
+        service.request('POST','/v1/sessions/cr_pi/prompts',{'request_id':'parent','text':'PARENT_TASK'},202)
+        until(lambda: service.session('cr_pi')['receipts']['parent']['state'] == 'completed', 'real Pi parent/child', 30)
+        records = service.records('cr_pi')
+        links = [r['data'] for r in records if r['kind'] == 'child']
+        assert [r['state'] for r in links] == ['started','completed'], links
+        assert service.session(links[0]['id'])['parent_session'] == 'cr_pi'
+        assert any('PARENT_RECEIVED_CHILD' in r.get('native','') for r in records)
+        print('PASS: real Pi tool executes through a core-owned child and receives its result')
+        checkpoint = next(r['data']['id'] for r in records if r['kind'] == 'checkpoint' and r['data']['request_id'] == 'parent')
+        body = {'request_id':'rewind','before':checkpoint,'replacement':{'request_id':'corrected','text':'CORRECTED_TASK'}}
+        service.request('POST','/v1/sessions/cr_pi/rewind',body,202)
+        until(lambda: service.session('cr_pi')['receipts'].get('corrected',{}).get('state') == 'completed', 'real Pi replacement', 30)
+        session = service.session('cr_pi')
+        fork = Path(session['native_path'])
+        assert fork != native
+        raw = fork.read_text()
+        assert 'CORRECTED_TASK' in raw and 'PARENT_TASK' not in raw and 'PARENT_RECEIVED_CHILD' not in raw
+        print('PASS: native empty fork is durable and excludes discarded context')
+        until(lambda: any(r['kind']=='usage' and r['data'].get('contextUsage',{}).get('tokens') is not None for r in service.records('cr_pi')), 'native context usage', 5)
+        saved = service.records('cr_pi')
+        service.stop(); service.start()
+        until(lambda: service.session('cr_pi')['state'] == 'idle', 'native fork restart', 30)
+        assert service.session('cr_pi')['native_id'] == session['native_id']
+        assert service.records('cr_pi')[:len(saved)] == saved
+        service.request('POST','/v1/sessions/cr_pi/rewind',body,202)
+        assert fork.read_text().count('CORRECTED_TASK') == 1
+        print('PASS: context usage, replay and exactly-once replacement survive restart')
+    finally:
+        test.tearDown()
+
+
+if __name__=='__main__':
+    native_fixture() if sys.argv[1:] == ['--fixture'] else main()
