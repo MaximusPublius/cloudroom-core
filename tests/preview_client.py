@@ -129,6 +129,22 @@ class PreviewTests(unittest.TestCase):
             self.assertFalse(jobs.approve(core, other))
             self.assertEqual(popen.call_count, 2)
 
+    def test_mac_approval_without_session_is_not_cached(self):
+        jobs = preview.MacJobs(Path(self.directory.name))
+        core = SimpleNamespace(key='core')
+        answers = [b'Allow for this thread\n', b'Deny\n']
+
+        def process(*_args, **_kwargs):
+            answer = answers.pop(0).decode()
+            return SimpleNamespace(communicate=lambda: (answer, ''))
+
+        with mock.patch.object(preview.subprocess, 'Popen', side_effect=process) as popen:
+            job = {'id': 'legacy', 'command': 'touch legacy'}
+            self.assertTrue(jobs.approve(core, job))
+            self.assertFalse(jobs.approve(core, job))
+            self.assertEqual(jobs.trusted, set())
+            self.assertEqual(popen.call_count, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

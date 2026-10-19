@@ -522,8 +522,9 @@ class MacJobs:
 
     def approve(self, core, job):
         with self.asking:
-            trust = (core.key, job['session'])
-            if trust in self.trusted:
+            session = job.get('session')
+            trust = (core.key, session) if session is not None else None
+            if trust is not None and trust in self.trusted:
                 return True
             text = f"A cloud agent wants to change your Mac.\n\nFolder: {job.get('cwd') or '~'}\n\n{job['command'][:600]}"
             process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -533,7 +534,7 @@ class MacJobs:
             answer = process.communicate()[0].strip()
             with self.lock:
                 self.running.pop(job['id'], None)
-            if answer == 'Allow for this thread':
+            if answer == 'Allow for this thread' and trust is not None:
                 self.trusted.add(trust)
             return answer in ('Allow', 'Allow for this thread')
 
