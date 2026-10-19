@@ -1171,18 +1171,17 @@ async fn attach(
     .await
     .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
     let previous = manager.receipt(&id, &query.request_id);
-    if let Some(receipt) = &previous {
-        if receipt.command != "attach"
+    if let Some(receipt) = &previous
+        && (receipt.command != "attach"
             || receipt.input["name"] != query.name
             || receipt.input["kind"] != query.kind
             || query
                 .total
-                .is_some_and(|total| receipt.input["size"] != total)
-        {
-            return Err(session::Error::Conflict(
-                "request_id already has different content",
-            ));
-        }
+                .is_some_and(|total| receipt.input["size"] != total))
+    {
+        return Err(session::Error::Conflict(
+            "request_id already has different content",
+        ));
     }
     let key = format!("{id}/{}", query.request_id);
     let bytes = match (query.offset, query.total) {
