@@ -21,7 +21,7 @@ CLOUDROOM_PI_PROVIDER=openai-codex
 CLOUDROOM_PI_MODEL=gpt-6-astra
 ```
 
-Use the official `@earendil-works/pi-coding-agent` **0.85.1**, with its supported Node runtime on `/usr/local/bin:/usr/bin:/bin`. Provision the harness and its account credentials separately; the core does not install packages or perform login. Adapter startup verifies the resolved model/provider, native identity, and bundled context extension. Protocol compatibility must be tested before upgrading Pi.
+Use the official `@earendil-works/pi-coding-agent` **0.85.1 or newer** (images ship 1.0.0), with its supported Node runtime on `/usr/local/bin:/usr/bin:/bin`. Provision the harness and its account credentials separately; the core does not install packages or perform login. Adapter startup verifies the resolved model/provider, native identity, and bundled context extension. Protocol compatibility must be tested before upgrading Pi.
 
 Pi runs through `--mode rpc`; it is not embedded or forked. Startup networking/telemetry are disabled through Pi's process flags. Existing Pi settings/resources and explicit project-trust decisions still apply. Prepare trusted packages before service startup. The account directory is separate from Cloudroom's protected state directory. Every configured harness home must share the monitored filesystem with the workspace. Neither API/database tokens nor administrative environment variables are inherited by either harness. Pi credentials are available to that agent account; this is not isolation of inference credentials from its own tools.
 
@@ -35,11 +35,11 @@ Use **Connect Claude** with Cloud selected. Approve Anthropic's browser sign-in,
 
 The `claude_auth` capability exposes authenticated `GET /v1/accounts/claude` and `POST /v1/accounts/claude/{login,cancel,complete}`. Mutations take `request_id`; `complete` also takes `code` and OAuth `state`. Duplicate starts reuse the pending flow; cancellation targets its ID. The isolated, tool-free CLI process expires after ten minutes and produces no conversation records. Tested with Claude **2.1.280**. Upgrade core and GUI together.
 
-Terminal fallback: run `claude auth login` and `claude auth status` as the configured agent account (`sudo -iu cloudroom-agent` on managed VMs), never root or the protected core account.
+Terminal fallback: run `claude auth login` and `claude auth status` as the configured agent account (`sudo -iu cloudroom-agent`), never root or the protected core account.
 
 Create sessions with `"harness":"claude-code"`. Missing login returns `claude_auth_required` before acceptance; verification failures return `claude_auth_unavailable`. The GUI retains the task and offers **Retry start** after native login. This is login guidance, not an embedded OAuth flow or a live subscription-limit check.
 
-The adapter disables native steering, Fast mode, structured questions and hidden native subagents. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
+Steering writes the message into the running turn, as Local's Claude does; a steer that misses its turn runs as Claude's own turn. The adapter disables Fast mode, structured questions and hidden native subagents. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
 
 ### Selected skills
 
@@ -65,11 +65,11 @@ The desktop helper attempts this import before showing sign-in or starting Codex
 
 ## Cloud Pi logins
 
-Only after the user agrees in first-run setup ([ADR 0130](../../docs/adr/0130-reuse-local-logins-and-keys.md)), the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when a Mac Pi file changes. VM logins always win. `!command` and `$VAR` keys are resolved on the Mac first, because the VM cannot run Mac secret managers or see Mac shell variables; unresolved keys are skipped.
+Only after the user agrees in first-run setup, the Mac sync helper copies Pi providers from `~/.pi/agent/auth.json` (or `PI_CODING_AGENT_DIR`) that the VM lacks. It runs every sync cycle and before each Cloud Pi start, and resends only when a Mac Pi file changes. VM logins always win. `!command` and `$VAR` keys are resolved on the Mac first, because the VM cannot run Mac secret managers or see Mac shell variables; unresolved keys are skipped.
 
 With `pi_setup`, the helper also copies custom providers from `models.json` (Mac wins per provider; VM-only providers stay), syncs `extensions/`, and sends the `packages` list from `settings.json`. `POST /v1/accounts/pi/setup` saves the providers and runs `pi install` in the background for remote packages the VM lacks. Local-path packages stay on the Mac.
 
-`GET /v1/accounts/pi` lists provider names, never secrets. `POST /v1/accounts/pi/import` adds valid missing providers. `POST /v1/accounts/pi/key` with `{"provider","key"}` saves or replaces one API key; the CLI is `cloudroom cloud pi key PROVIDER`, reading the key from stdin. Copied OAuth logins refresh separately on each machine, so one side may need to sign in again.
+`GET /v1/accounts/pi` lists provider names, never secrets. `POST /v1/accounts/pi/import` adds valid missing providers. `POST /v1/accounts/pi/key` with `{"provider","key"}` saves or replaces one API key; the CLI is `room-cli cloud pi key PROVIDER`, reading the key from stdin. Copied OAuth logins refresh separately on each machine, so one side may need to sign in again.
 
 ### Continue after a usage limit
 
@@ -98,7 +98,7 @@ for a session with `command_guard_enabled: false` in `POST /v1/sessions`; this
 choice survives resume and passes to Cloudroom-managed Pi and Claude children. The guard
 runs on the execution machine without the GUI. It never edits personal hooks or
 trusts unrelated Codex hooks. It never blocks a harness from starting, and a
-guard error allows the command ([ADR 0114](../../docs/adr/0114-command-guard-never-blocks-work.md)).
+guard error allows the command.
 
 Rules cover root/home deletion, disk wipes, hosted repository deletion, and fork
 bombs. Blocks return a named reason to the agent. This is regex-based accident
@@ -113,19 +113,27 @@ byte-identical when preparing a release.
 
 ## Cursor implementation preview
 
-The core discovers `cursor-agent` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.cursor` home. Use `harness: "cursor"` in the API; the GUI provider remains `acp-cursor`. No new Cloudroom service environment variables are required. After upgrading core and the GUI, use **Settings → Cloudroom → Cursor → Manage connection**, or `cloudroom cloud cursor login --request-id ID` followed by `cloudroom cloud cursor status`. Browser login runs on the VM, with `NO_OPEN_BROWSER=1` confined to the Cursor login child. Credentials stay in the shared native account home.
+The core discovers `cursor-agent` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.cursor` home. Use `harness: "cursor"` in the API; the GUI provider remains `acp-cursor`. No new Cloudroom service environment variables are required. After upgrading core and the GUI, use **Settings → Cloudroom → Cursor → Manage connection**, or `room-cli cloud cursor login --request-id ID` followed by `room-cli cloud cursor status`. Browser login runs on the VM, with `NO_OPEN_BROWSER=1` confined to the Cursor login child. Credentials stay in the shared native account home.
 
-The authenticated account API exposes `GET /v1/accounts/cursor` and `POST /v1/accounts/cursor/{login,cancel,key}`. Mutations use `{ "request_id": "ID" }`; `/key` additionally takes `api_key`. Mutations return HTTP 202. An active login is reused, cancellation targets its request ID, and missing authentication rejects session creation before acceptance. Keys are verified with `--list-models` (`status` ignores API keys), saved privately as `.cursor/cloudroom-api-key`, and supplied through `CURSOR_API_KEY` only to Cursor children. The GUI clears its password field after submission; CLI key input uses `cloudroom cloud cursor key` through stdin, never a key argument. Neither login links nor keys enter conversation records or sync. Close live Cursor sessions before changing their login.
+The authenticated account API exposes `GET /v1/accounts/cursor` and `POST /v1/accounts/cursor/{login,cancel,key}`. Mutations use `{ "request_id": "ID" }`; `/key` additionally takes `api_key`. Mutations return HTTP 202. An active login is reused, cancellation targets its request ID, and missing authentication rejects session creation before acceptance. Keys are verified with `--list-models` (`status` ignores API keys), saved privately as `.cursor/cloudroom-api-key`, and supplied through `CURSOR_API_KEY` only to Cursor children. The GUI clears its password field after submission; CLI key input uses `room-cli cloud cursor key` through stdin, never a key argument. Neither login links nor keys enter conversation records or sync. Close live Cursor sessions before changing their login.
 
 Cursor runs in print mode. Cursor's ACP mode only runs each model at its default reasoning, so the core's built-in driver (`src/runtime/cursor_print.rs`) speaks the small ACP subset the adapter uses and runs one `cursor-agent -p --output-format stream-json --resume CHAT --model VARIANT` per prompt. It shares the process driver, durable queue and history. Steering and Stop end the running prompt, including its shell tools, and the chat resumes with the next message. Prompt dispatch is not completion.
 
-`cursor_models.rs` groups `--list-models` into model families with reasoning levels, named like the GUI picker (`auto` is `default`; the `cursor-` prefix is dropped). Capabilities advertise them, and launch resolves the family and level to the exact variant, e.g. `gpt-5.6-sol` + `xhigh` → `gpt-5.6-sol-xhigh`. Reasoning remains fixed for a session. Fast is per turn, like Codex: a `fast` service tier runs the variant's `-fast` twin when Cursor offers one, otherwise the normal variant. Manual compaction, rewind, direct image inputs, independent subagent controls and context-only notices are not advertised.
+`cursor_models.rs` groups `--list-models` into model families with reasoning levels, named like the GUI picker (`auto` is `default`; the `cursor-` prefix is dropped). Capabilities advertise them, and launch resolves the family and level to the exact variant, e.g. `gpt-5.6-sol` + `xhigh` → `gpt-5.6-sol-xhigh`. Reasoning remains fixed for a session. Fast is per turn, like Codex: a `fast` service tier runs the variant's `-fast` twin when Cursor offers one, otherwise the normal variant. Images are sent as file paths, which Cursor's headless mode documents for images; its agent opens them with its read tool (tested live with seven models). Manual compaction, rewind, independent subagent controls and context-only notices are not advertised.
 
 Cursor runs without Command Guard: its tested versions do not run native safety hooks for Cloudroom, so `command_guard_enabled` has no effect on Cursor sessions.
 
 Chats live at `.cursor/chats/<md5 of the working folder>/<chat ID>`. The adapter records bounded native SQLite snapshot chunks, including metadata and WAL-backed data. The Python helper uses SQLite backup with query-only SQL; read/write opening permits required WAL sidecars after Cursor exits. `cursor-history.py restore ROOT CWD` accepts one complete snapshot's native JSONL on stdin, checks its digest, writes it under `ROOT/<md5 of CWD>`, and never replaces an existing session. It restores native history, not workspace files or credentials.
 
 Initial sync discovery includes Cursor skills, global rules and the `notifications`, `hints`, and `suggestNextPrompt` preferences. Existing paired roots are preserved. Credentials, session stores, hooks, plugins and MCP configuration do not sync.
+
+## OpenCode
+
+Core discovers `opencode` in the agent account's `.local/bin` or `/usr/local/bin`, with an existing `.local/share/opencode` data folder, and runs `opencode acp` through the shared ACP adapter. Use `harness: "opencode"` in the API; the GUI provider is `acp-opencode`. No Cloudroom service variables are needed. OpenCode 1 (npm `opencode-ai`) and OpenCode 2 (npm `@opencode/cli`) both work; both install `opencode`. OpenCode 2's `acp` starts a private server child, which Core's workload containment stops with the harness. Core sets `OPENCODE_CONFIG_CONTENT` to turn off the question tool (it ends OpenCode 2 turns over ACP) and auto-update.
+
+Models are OpenCode's `provider/model` values. Launch selects the model, then the reasoning effort the same way Local threads do (`low` falls back to `minimal`, `max` to `xhigh`); a model without that effort keeps OpenCode's default. Reasoning stays fixed for the session. Sessions live in OpenCode's `opencode.db`; resume uses ACP `session/load`. Images are sent as file paths. Compaction, rewind, Fast, subagents and context-only notices are not advertised.
+
+Sign in with `opencode auth login` as the agent account. OpenCode 1 keeps logins in `.local/share/opencode/auth.json`; OpenCode 2 keeps them in `opencode.db` and moves them with `opencode auth export` and `opencode auth import`. Cloudroom's hosted sandboxes copy the user's Mac logins either way. Free `opencode/*` models need no login. Tested on Linux with OpenCode 1.18.34 and 2.0.22: start, effort selection, a shell tool call, a question prompt, and resume after a Core restart.
 
 ## Queue, completion and recovery
 

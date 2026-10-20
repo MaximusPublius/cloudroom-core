@@ -17,12 +17,18 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{convert::Infallible, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub fn router(manager: Arc<Manager>, token: String) -> Router {
     Router::new()
         .merge(crate::preview::routes())
+        .merge(crate::runtime::terminal::routes())
         .merge(crate::mac::routes())
         .merge(crate::secrets::routes())
         .route("/v1/health", get(health))
@@ -77,6 +83,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/sessions/{id}/reorder", post(reorder))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/compact", post(compact))
+        .route("/v1/sessions/{id}/goal", post(goal))
         .route("/v1/sessions/{id}/rewind", post(rewind))
         .route(
             "/v1/sessions/{id}/attachments",
@@ -169,7 +176,10 @@ async fn claude_account(
         })
     };
     let token = secret(&input.token, "sk-ant-oat");
-    let key = secret(&input.api_key, "sk-ant-api");
+    let key = input
+        .api_key
+        .as_deref()
+        .is_some_and(crate::runtime::claude_login::is_api_key);
     if !matches!(
         action.as_str(),
         "login" | "cancel" | "complete" | "token" | "key"
@@ -444,12 +454,19 @@ async fn observe(
 }
 
 async fn authenticate(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
-    let authorized = request
-        .headers()
+    // Some sandbox proxies replace Authorization with their own login, so the token may also arrive in X-Cloudroom-Token.
+    let headers = request.headers();
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|supplied| same_token(supplied, token.as_str()));
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let custom = headers
+        .get("x-cloudroom-token")
+        .and_then(|h| h.to_str().ok());
+    let authorized = [bearer, custom]
+        .into_iter()
+        .flatten()
+        .any(|supplied| same_token(supplied, token.as_str()));
     let mut response = if authorized {
         next.run(request).await
     } else {
@@ -528,7 +545,6 @@ impl IntoResponse for session::Error {
             "connect Codex before starting cloud work" => "codex_auth_required",
             "connect Claude Code before starting cloud work" => "claude_auth_required",
             "Claude account could not be verified" => "claude_auth_unavailable",
-            "Claude live steering is not supported" => "unsupported_command",
             "Codex usage limit reached" => "codex_usage_limit",
             "Codex account could not be verified" => "codex_auth_unavailable",
             "connect Cursor before starting cloud work" => "cursor_auth_required",
@@ -559,6 +575,14 @@ struct Start {
     provider: Option<String>,
     workspace_name: Option<String>,
     command_guard_enabled: Option<bool>,
+    strip_ai_co_authors: Option<bool>,
+    system_prompt: Option<String>,
+    /// Starts a child thread in this parent's folder; it inherits the parent's settings.
+    parent_session: Option<String>,
+    prompt: Option<String>,
+    title: Option<String>,
+    /// Starts a side chat on a copy of this session's conversation; it inherits the source's settings.
+    fork: Option<session::ForkFrom>,
 }
 
 async fn workspace(
@@ -638,12 +662,17 @@ struct Rewind {
     before: Option<String>,
     #[serde(default)]
     last_turn_id: Option<String>,
+    #[serde(default)]
+    fork: bool,
 }
 #[derive(Deserialize)]
 struct AttachQuery {
     request_id: String,
     name: String,
     kind: String,
+    /// Large files arrive in parts (`upload_parts`): this part's byte offset and the whole file's size.
+    offset: Option<usize>,
+    total: Option<usize>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -779,6 +808,72 @@ async fn start(
     {
         return Err(session::Error::Conflict("invalid reasoning effort"));
     }
+    if body
+        .system_prompt
+        .as_ref()
+        .is_some_and(|p| p.trim().is_empty() || p.len() > 32768 || p.contains('\0'))
+    {
+        return Err(session::Error::Conflict("invalid system prompt"));
+    }
+    if let Some(fork) = body.fork {
+        if body.parent_session.is_some()
+            || body.prompt.is_some()
+            || body.title.is_some()
+            || body.model.is_some()
+            || body.reasoning.is_some()
+            || body.workspace.is_some()
+            || body.workspace_name.is_some()
+            || body.provider.is_some()
+            || body.command_guard_enabled.is_some()
+            || body.strip_ai_co_authors.is_some()
+            || body.system_prompt.is_some()
+        {
+            return Err(session::Error::Conflict(
+                "a side chat takes only harness and fork",
+            ));
+        }
+        let (id, receipt) = manager.fork(body.request_id, body.harness, fork).await?;
+        return Ok(accepted(&manager, &id, receipt));
+    }
+    if let Some(parent) = body.parent_session {
+        let prompt = body
+            .prompt
+            .filter(|p| !p.trim().is_empty() && p.len() <= 32768);
+        let title = body.title.map(|t| t.trim().to_owned());
+        if body.workspace.is_some()
+            || body.workspace_name.is_some()
+            || body.provider.is_some()
+            || body.command_guard_enabled.is_some()
+            || body.strip_ai_co_authors.is_some()
+            || body.system_prompt.is_some()
+            || title.as_ref().is_some_and(|t| {
+                t.is_empty() || t.chars().count() > 200 || t.chars().any(char::is_control)
+            })
+        {
+            return Err(session::Error::Conflict(
+                "a child takes only harness, model, reasoning, title and prompt",
+            ));
+        }
+        let prompt = prompt.ok_or(session::Error::Conflict(
+            "prompt must contain 1-32768 bytes of text",
+        ))?;
+        let spawn = session::Spawn {
+            harness: body.harness,
+            model: body.model,
+            reasoning: body.reasoning,
+            title,
+            prompt,
+        };
+        let (id, receipt) = manager
+            .spawn_child(&parent, &body.request_id, spawn)
+            .await?;
+        return Ok(accepted(&manager, &id, receipt));
+    }
+    if body.prompt.is_some() || body.title.is_some() {
+        return Err(session::Error::Conflict(
+            "prompt and title require parent_session",
+        ));
+    }
     let (id, receipt) = manager
         .start(
             body.request_id,
@@ -786,7 +881,12 @@ async fn start(
             body.model,
             body.reasoning,
             (body.workspace, body.workspace_name),
-            (body.provider, body.command_guard_enabled),
+            (
+                body.provider,
+                body.command_guard_enabled,
+                body.strip_ai_co_authors,
+                body.system_prompt,
+            ),
         )
         .await?;
     Ok(accepted(&manager, &id, receipt))
@@ -970,6 +1070,42 @@ async fn steer(
     Ok(accepted(&manager, &id, receipt))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Goal {
+    request_id: String,
+    status: Option<String>,
+    objective: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+/// The user's goal control: pause, resume, replace the objective, or clear.
+async fn goal(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(body): Json<Goal>,
+) -> Result<impl IntoResponse> {
+    key(&body.request_id)?;
+    if body
+        .status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "active" | "paused"))
+        || body
+            .objective
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty() || text.len() > 4000)
+        || (body.clear == (body.status.is_some() || body.objective.is_some()))
+    {
+        return Err(session::Error::Conflict(
+            "goal needs clear, or an active/paused status and/or an objective of 1-4000 bytes",
+        ));
+    }
+    let input = json!({"status":body.status,"objective":body.objective,"clear":body.clear});
+    let receipt = manager.command(&id, body.request_id, "goal", input)?;
+    Ok(accepted(&manager, &id, receipt))
+}
+
 async fn compact(
     State(manager): State<Arc<Manager>>,
     Path(id): Path<String>,
@@ -992,6 +1128,9 @@ async fn rewind(
     }
     if let Some(last_turn_id) = body.last_turn_id {
         input["last_turn_id"] = json!(last_turn_id);
+    }
+    if body.fork {
+        input["fork"] = json!(true);
     }
     if let Some(prompt) = body.replacement {
         key(&prompt.request_id)?;
@@ -1021,17 +1160,61 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
-    let bytes = axum::body::to_bytes(body, 26 * 1024 * 1024)
-        .await
-        .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    if let Some(receipt) = manager.receipt(&id, &query.request_id) {
-        if receipt.command != "attach"
+    let bytes = axum::body::to_bytes(
+        body,
+        if query.total.is_some() {
+            PART_BYTES
+        } else {
+            26 << 20
+        },
+    )
+    .await
+    .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
+    let previous = manager.receipt(&id, &query.request_id);
+    if let Some(receipt) = &previous
+        && (receipt.command != "attach"
             || receipt.input["name"] != query.name
             || receipt.input["kind"] != query.kind
-            || receipt.input["size"] != bytes.len()
-            || receipt.input["sha256"] != sha256
-        {
+            || query
+                .total
+                .is_some_and(|total| receipt.input["size"] != total))
+    {
+        return Err(session::Error::Conflict(
+            "request_id already has different content",
+        ));
+    }
+    let key = format!("{id}/{}", query.request_id);
+    let bytes = match (query.offset, query.total) {
+        (None, None) => bytes.to_vec(),
+        (Some(offset), Some(total)) => {
+            let limit = if query.kind == "image" {
+                10 << 20
+            } else {
+                25 << 20
+            };
+            if total > limit {
+                return Err(session::Error::Conflict(if query.kind == "image" {
+                    "image exceeds the 10 MiB limit"
+                } else {
+                    "file exceeds the 25 MiB limit"
+                }));
+            }
+            match attach_part(&key, offset, total, &bytes).map_err(session::Error::Conflict)? {
+                (_, Some(whole)) => whole,
+                (received, None) => {
+                    return Ok((StatusCode::ACCEPTED, Json(json!({ "received": received }))));
+                }
+            }
+        }
+        _ => {
+            return Err(session::Error::Conflict(
+                "offset and total must be sent together",
+            ));
+        }
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(receipt) = previous {
+        if receipt.input["size"] != bytes.len() || receipt.input["sha256"] != sha256 {
             return Err(session::Error::Conflict(
                 "request_id already has different content",
             ));
@@ -1087,6 +1270,62 @@ async fn attach(
     written["sha256"] = json!(sha256);
     let receipt = manager.command(&id, query.request_id, "attach", written)?;
     Ok(accepted(&manager, &id, receipt))
+}
+
+/// Attachments arriving in parts, by session and request: (total size, bytes so far, last part). Some sandbox
+/// proxies drop requests over about 8 MB, so clients send large files in 4 MiB parts. Unfinished uploads expire.
+type Partial = (usize, Vec<u8>, Instant);
+static PARTS: LazyLock<Mutex<HashMap<String, Partial>>> = LazyLock::new(Default::default);
+const PART_BYTES: usize = 8 << 20;
+
+/// Adds one part; returns the bytes received and, once complete, the whole file. Completed bytes
+/// remain briefly for digest-checked last-part retries, and yield capacity to new uploads.
+fn attach_part(
+    key: &str,
+    offset: usize,
+    total: usize,
+    part: &[u8],
+) -> std::result::Result<(usize, Option<Vec<u8>>), &'static str> {
+    let mut parts = PARTS.lock().unwrap();
+    parts.retain(|_, (_, _, at)| at.elapsed() < Duration::from_secs(600));
+    if offset == 0 && !parts.contains_key(key) {
+        if parts.len() >= 8 {
+            parts.retain(|_, (size, bytes, _)| bytes.len() != *size);
+        }
+        if parts.len() >= 8 {
+            return Err("too many uploads in progress; try again");
+        }
+        parts.insert(key.to_owned(), (total, Vec::new(), Instant::now()));
+    }
+    let (size, bytes, at) = parts.get_mut(key).ok_or("upload part out of order")?;
+    if *size != total {
+        return Err("upload size changed");
+    }
+    append_part(bytes, offset, part, total)?;
+    *at = Instant::now();
+    Ok((bytes.len(), (bytes.len() == total).then(|| bytes.clone())))
+}
+
+/// Appends one part of an upload that arrives in pieces. A repeated part is ignored, so retrying after a lost
+/// response is safe; a gap or overflow is refused.
+pub(crate) fn append_part(
+    buffer: &mut Vec<u8>,
+    offset: usize,
+    part: &[u8],
+    total: usize,
+) -> std::result::Result<(), &'static str> {
+    let end = offset
+        .checked_add(part.len())
+        .filter(|end| *end <= total)
+        .ok_or("upload part exceeds the upload size")?;
+    if offset == buffer.len() {
+        buffer.extend_from_slice(part);
+    } else if end > buffer.len() {
+        return Err("upload part out of order");
+    } else if buffer[offset..end] != *part {
+        return Err("request_id already has different content");
+    }
+    Ok(())
 }
 async fn interrupt(
     State(manager): State<Arc<Manager>>,

@@ -25,13 +25,15 @@ pub mod cursor_print;
 mod files;
 mod fx;
 pub(crate) mod linux;
+mod opencode;
 mod pi;
 pub(crate) mod pi_auth;
 mod process;
+pub mod terminal;
 
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
 // Cold Pi handshakes exceeded the ordinary 30s RPC deadline during VM recovery.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const STARTUP_RPC_MULTIPLIER: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +45,8 @@ pub enum Kind {
     #[serde(rename = "claude-code")]
     Claude,
     Fx,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 impl Kind {
     /// Harnesses that accept a per-turn `fast` service tier. Claude Fast stays off (ADR 0133).
@@ -94,6 +98,8 @@ pub fn supports(kind: Kind, models: &[Model], model: &str, reasoning: &str) -> R
 }
 
 pub const PI_REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+pub use opencode::REASONING_LEVELS as OPENCODE_REASONING_LEVELS;
+pub use opencode::import as import_opencode;
 
 pub async fn claude_auth_ready(config: &Config) -> io::Result<bool> {
     claude::auth_ready(config).await
@@ -153,6 +159,14 @@ pub struct Resume {
     pub reasoning: Option<String>,
 }
 
+/// A side chat's history: a copy of another session's conversation, cut before user message
+/// `before` (Claude Code) or after turn `last_turn_id` (Codex). The source is only read.
+pub struct Fork {
+    pub source: Resume,
+    pub before: Option<String>,
+    pub last_turn_id: Option<String>,
+}
+
 pub struct ChildRequest {
     pub request: String,
     pub id: String,
@@ -173,6 +187,8 @@ pub enum Event {
     Started {
         request: String,
         native_turn: Option<String>,
+        /// The harness began this turn by itself, without a Cloudroom prompt.
+        auto: bool,
     },
     Finished {
         request: String,
@@ -220,6 +236,7 @@ struct Progress {
     last_text: String,
     model: Option<String>,
     processes: HashSet<String>,
+    auto: bool,
 }
 impl Progress {
     fn started(&mut self) -> Option<Event> {
@@ -231,6 +248,7 @@ impl Progress {
         Some(Event::Started {
             request,
             native_turn: self.native_turn.clone(),
+            auto: self.auto,
         })
     }
     fn finished(&mut self, status: &str, error: Option<String>) -> Option<Event> {
@@ -278,6 +296,29 @@ trait Adapter: Send {
     }
 }
 
+/// A Git 2.54+ config hook that drops AI agent Co-authored-by lines from every commit message.
+fn strip_ai_co_authors_env(command: &mut Command) {
+    const HOOK: &str = r#"cloudroom_strip_ai_co_authors() { grep -viE '^co-authored-by:.*(claude|anthropic|cursor|codex|openai|chatgpt|copilot|gemini|aider\.chat|devin-ai|windsurf|codeium)' "$1" > "$1.cloudroom"; [ $? -le 1 ] && mv "$1.cloudroom" "$1" || rm -f "$1.cloudroom"; }; cloudroom_strip_ai_co_authors"#;
+    command.envs([
+        ("GIT_CONFIG_COUNT", "3"),
+        (
+            "GIT_CONFIG_KEY_0",
+            "hook.cloudroom-strip-ai-co-authors.command",
+        ),
+        ("GIT_CONFIG_VALUE_0", HOOK),
+        (
+            "GIT_CONFIG_KEY_1",
+            "hook.cloudroom-strip-ai-co-authors.event",
+        ),
+        ("GIT_CONFIG_VALUE_1", "prepare-commit-msg"),
+        (
+            "GIT_CONFIG_KEY_2",
+            "hook.cloudroom-strip-ai-co-authors.event",
+        ),
+        ("GIT_CONFIG_VALUE_2", "commit-msg"),
+    ]);
+}
+
 #[derive(Clone)]
 pub struct Handle {
     process: process::Process,
@@ -292,6 +333,8 @@ pub struct Handle {
     baseline: Arc<Mutex<Option<String>>>,
     rpc_timeout: Duration,
     command_guard_enabled: bool,
+    strip_ai_co_authors: bool,
+    system_prompt: Option<String>,
     controls: Arc<tokio::sync::Mutex<()>>,
 }
 impl Handle {
@@ -300,7 +343,7 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
-        Self::spawn_guarded(config, kind, resume, true)
+        Self::spawn_guarded(config, kind, resume, true, true, None)
     }
 
     pub fn spawn_guarded(
@@ -308,15 +351,65 @@ impl Handle {
         kind: Kind,
         resume: Option<Resume>,
         command_guard_enabled: bool,
+        strip_ai_co_authors: bool,
+        system_prompt: Option<String>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
-        Self::spawn_inner(config, kind, resume, command_guard_enabled, None)
+        Self::spawn_inner(
+            config,
+            kind,
+            resume,
+            (command_guard_enabled, strip_ai_co_authors),
+            system_prompt,
+            None,
+        )
+    }
+
+    /// Claude Code forks through its resume flags; Codex starts fresh and forks in `start_fork`.
+    pub fn spawn_fork(
+        config: &Config,
+        kind: Kind,
+        fork: &Fork,
+        command_guard_enabled: bool,
+        strip_ai_co_authors: bool,
+        system_prompt: Option<String>,
+    ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
+        if kind != Kind::Claude {
+            return Self::spawn_guarded(
+                config,
+                kind,
+                None,
+                command_guard_enabled,
+                strip_ai_co_authors,
+                system_prompt,
+            );
+        }
+        let profile = config
+            .harnesses
+            .get(&kind)
+            .ok_or_else(|| io::Error::other("harness not configured"))?;
+        let identity = config.storage.as_ref().map(|p| (p.agent_uid, p.agent_gid));
+        // An empty checkpoint copies the whole conversation.
+        let at = match &fork.before {
+            Some(before) => claude::checkpoint_parent(profile, &fork.source, before, identity)?,
+            None => String::new(),
+        };
+        let resume = Some(fork.source.clone());
+        Self::spawn_inner(
+            config,
+            kind,
+            resume,
+            (command_guard_enabled, strip_ai_co_authors),
+            system_prompt,
+            Some(&at),
+        )
     }
 
     fn spawn_inner(
         config: &Config,
         kind: Kind,
         resume: Option<Resume>,
-        command_guard_enabled: bool,
+        (command_guard_enabled, strip_ai_co_authors): (bool, bool),
+        system_prompt: Option<String>,
         fork: Option<&str>,
     ) -> io::Result<(Self, mpsc::Receiver<Event>)> {
         let mut profile = config
@@ -343,6 +436,8 @@ impl Handle {
                     resume.as_ref(),
                     fork,
                     command_guard_enabled,
+                    strip_ai_co_authors,
+                    system_prompt.as_deref(),
                 )?;
                 let saved = resume.as_ref().filter(|_| fork.is_none());
                 (
@@ -388,9 +483,25 @@ impl Handle {
                 None,
                 None,
             ),
+            Kind::OpenCode => (
+                opencode::command(config, &profile)?,
+                Box::new(cursor::Protocol::new(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    opencode::OPENCODE,
+                )),
+                None,
+                None,
+            ),
             Kind::Pi => {
-                let (command, path, helper) =
-                    pi::command(config, &profile, resume.as_ref(), command_guard_enabled)?;
+                let (command, path, helper) = pi::command(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    command_guard_enabled,
+                    system_prompt.as_deref(),
+                )?;
                 (
                     command,
                     Box::new(pi::Protocol::new(
@@ -404,6 +515,10 @@ impl Handle {
                 )
             }
         };
+        let mut command = command;
+        if strip_ai_co_authors {
+            strip_ai_co_authors_env(&mut command);
+        }
         let (process, events) = process::Process::spawn(config, command, adapter)?;
         Ok((
             Self {
@@ -414,8 +529,10 @@ impl Handle {
                 file_identity,
                 reasoning: resume.as_ref().and_then(|saved| saved.reasoning.clone()),
                 baseline: Arc::new(Mutex::new(None)),
-                rpc_timeout: Duration::from_secs(30),
+                rpc_timeout: config.rpc_timeout,
                 command_guard_enabled,
+                strip_ai_co_authors,
+                system_prompt,
                 controls: Arc::new(tokio::sync::Mutex::new(())),
                 resume,
                 session_file,
@@ -465,23 +582,33 @@ impl Handle {
         Ok(data)
     }
     pub fn capabilities(&self) -> Value {
-        if matches!(self.kind, Kind::Cursor | Kind::Fx) {
+        if matches!(self.kind, Kind::Cursor | Kind::Fx | Kind::OpenCode) {
             return cursor::capabilities(self.kind);
         }
         json!({"resume":true,"interrupt":true,"system_notice":true,"interactive_dialogs":false,
-            "steer":self.kind!=Kind::Claude,"compact":true,"rewind":true,"attachments":true,
-            "service_tier":self.kind.fast(),"subagents":true,"usage":true})
+            "steer":true,"compact":true,"rewind":true,"attachments":true,
+            "service_tier":self.kind.fast(),"subagents":true,"usage":true,"goal":self.kind==Kind::Codex})
     }
     pub async fn start_session(&self) -> io::Result<String> {
         let mut startup = self.clone();
-        startup.rpc_timeout = STARTUP_TIMEOUT;
+        startup.rpc_timeout = self.rpc_timeout * STARTUP_RPC_MULTIPLIER;
         match self.kind {
-            Kind::Codex => codex::start(&startup).await,
+            Kind::Codex => codex::start(&startup, None).await,
             Kind::Pi => pi::start(&startup).await,
             Kind::Claude => claude::start(&startup).await,
             Kind::Cursor => cursor::start(&startup).await,
             Kind::Fx => fx::start(&startup).await,
+            Kind::OpenCode => opencode::start(&startup).await,
         }
+    }
+    /// Starts a `spawn_fork` harness and returns the side chat's new native ID.
+    pub async fn start_fork(&self, fork: &Fork) -> io::Result<String> {
+        if self.kind != Kind::Codex {
+            return self.start_session().await;
+        }
+        let mut startup = self.clone();
+        startup.rpc_timeout = self.rpc_timeout * STARTUP_RPC_MULTIPLIER;
+        codex::start(&startup, Some(fork)).await
     }
     /// Pi confirms the turn's thinking level before the prompt. Codex sends effort with turn/start.
     pub async fn prepare_turn(&self) -> io::Result<()> {
@@ -493,14 +620,19 @@ impl Handle {
         Ok(())
     }
     pub async fn send(&self, request: &str, text: &str) -> io::Result<()> {
-        self.send_prompt(request, &json!({"text": text})).await
+        self.send_prompt(request, &json!({"text": text}))
+            .await
+            .map(drop)
     }
-    pub async fn send_prompt(&self, request: &str, input: &Value) -> io::Result<()> {
+    /// Delivers a prompt. Returns warnings the user should see, such as a skill that could not load.
+    pub async fn send_prompt(&self, request: &str, input: &Value) -> io::Result<Vec<Value>> {
         match self.kind {
-            Kind::Codex => codex::send(self, request, input).await,
-            Kind::Pi => pi::send(self, request, input).await,
+            Kind::Codex => codex::send(self, request, input).await.map(|()| Vec::new()),
+            Kind::Pi => pi::send(self, request, input).await.map(|()| Vec::new()),
             Kind::Claude => claude::send(self, request, input).await,
-            Kind::Cursor | Kind::Fx => cursor::send(self, request, input).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::send(self, request, input)
+                .await
+                .map(|()| Vec::new()),
         }
     }
     pub async fn steer(&self, request: &str, text: &str) -> io::Result<()> {
@@ -514,11 +646,8 @@ impl Handle {
         match self.kind {
             Kind::Codex => codex::steer(self, state, text).await,
             Kind::Pi => pi::steer(self, request, text).await,
-            Kind::Claude => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Claude live steering is not supported",
-            )),
-            Kind::Cursor | Kind::Fx => cursor::steer(self, request, text).await,
+            Kind::Claude => claude::steer(self, request, text).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::steer(self, request, text).await,
         }
     }
     pub async fn compact(&self) -> io::Result<()> {
@@ -526,9 +655,19 @@ impl Handle {
             Kind::Codex => codex::compact(self).await,
             Kind::Pi => pi::compact(self).await,
             Kind::Claude => claude::compact(self).await,
-            Kind::Cursor | Kind::Fx => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ACP compaction is not supported",
+            )),
+        }
+    }
+    /// Sets, pauses, resumes, or clears the harness's durable goal as the user.
+    pub async fn goal(&self, input: &Value) -> io::Result<()> {
+        match self.kind {
+            Kind::Codex => codex::goal(self, input).await,
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "goal controls are only supported for Codex",
             )),
         }
     }
@@ -539,7 +678,7 @@ impl Handle {
             Kind::Claude => Err(io::Error::other(
                 "Claude rewind requires native process replacement",
             )),
-            Kind::Cursor | Kind::Fx => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ACP rewind is not supported",
             )),
@@ -553,18 +692,22 @@ impl Handle {
         if self.kind != Kind::Claude {
             return Ok(None);
         }
-        let before = input["before"].as_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Claude requires a user-message checkpoint",
-            )
-        })?;
-        let (saved, parent) = claude::fork_source(self, before)?;
+        let (saved, parent) = match input["before"].as_str() {
+            Some(before) => claude::fork_source(self, before)?,
+            None if input["fork"] == true => claude::fork_tip(self)?,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Claude requires a user-message checkpoint",
+                ));
+            }
+        };
         Self::spawn_inner(
             config,
             self.kind,
             Some(saved),
-            self.command_guard_enabled,
+            (self.command_guard_enabled, self.strip_ai_co_authors),
+            self.system_prompt.clone(),
             Some(&parent),
         )
         .map(|(handle, events)| Some((handle.with_reasoning(self.reasoning.clone()), events)))
@@ -590,9 +733,13 @@ impl Handle {
             .await?;
         Ok(())
     }
+    /// The latest reply text this process has streamed, without asking the harness.
+    pub fn seen_text(&self) -> String {
+        self.process.progress.borrow().last_text.clone()
+    }
     pub async fn last_text(&self) -> io::Result<String> {
-        if self.kind == Kind::Claude {
-            return Ok(self.process.progress.borrow().last_text.clone());
+        if self.kind != Kind::Pi {
+            return Ok(self.seen_text());
         }
         let result = self.call("get_last_assistant_text", json!({})).await?;
         Ok(result["text"].as_str().unwrap_or_default().to_owned())
@@ -602,7 +749,7 @@ impl Handle {
             Kind::Codex => Ok(None),
             Kind::Pi => pi::usage(self).await,
             Kind::Claude => Ok(Some(self.process.progress.borrow().last_usage.clone())),
-            Kind::Cursor | Kind::Fx => Ok(None),
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Ok(None),
         }
     }
     pub async fn interrupt(&self, request: &str) -> io::Result<()> {
@@ -617,7 +764,7 @@ impl Handle {
             Kind::Codex => codex::interrupt(self, state).await,
             Kind::Pi => pi::interrupt(self, request).await,
             Kind::Claude => claude::interrupt(self, request).await,
-            Kind::Cursor | Kind::Fx => cursor::interrupt(self, state).await,
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => cursor::interrupt(self, state).await,
         }
     }
     pub async fn system_message(&self, text: &str) -> io::Result<()> {
@@ -625,7 +772,7 @@ impl Handle {
             Kind::Codex => codex::notice(self, text).await,
             Kind::Pi => pi::notice(self, text).await,
             Kind::Claude => claude::notice(self, text).await,
-            Kind::Cursor | Kind::Fx => Err(io::Error::new(
+            Kind::Cursor | Kind::Fx | Kind::OpenCode => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "ACP context-only notices are unavailable",
             )),
@@ -633,6 +780,10 @@ impl Handle {
     }
     pub async fn pause(&self, paused: bool) -> io::Result<()> {
         self.process.pause(paused).await
+    }
+    /// Stops the tool command filling the disk; see `linux::Workload::kill_top_writer`.
+    pub fn kill_top_writer(&self) -> io::Result<Option<String>> {
+        self.process.kill_top_writer()
     }
     pub fn request_shutdown(&self) {
         self.process.request_shutdown();
@@ -662,6 +813,7 @@ pub fn check_resume_history(
     match kind {
         Kind::Cursor => return cursor::validate(profile, saved, identity),
         Kind::Fx => return fx::validate(profile, saved, identity),
+        Kind::OpenCode => return opencode::validate(profile, saved, identity),
         _ => {}
     }
     let file = files::open(
@@ -693,6 +845,9 @@ pub fn recover_records(
         Kind::Cursor => cursor::recover(profile, saved, policy, emit),
         // fx keeps its own session files; Cloudroom stores the ACP stream only.
         Kind::Fx => fx::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid))),
+        Kind::OpenCode => {
+            opencode::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)))
+        }
         Kind::Codex => codex::recover(
             profile,
             saved,
@@ -732,7 +887,7 @@ pub fn checkpoint(
         Kind::Codex | Kind::Claude => files::checkpoint(previous, data, native),
         Kind::Pi => pi::checkpoint(data, native),
         Kind::Cursor => cursor::checkpoint(previous, data, native),
-        Kind::Fx => Err(io::Error::other("fx has no native records")),
+        Kind::Fx | Kind::OpenCode => Err(io::Error::other("ACP stream has no native records")),
     }
 }
 
@@ -744,8 +899,16 @@ pub(super) fn command(binary: &Path, config: &Config) -> Command {
         path.push(config.account_home.join(folder));
     }
     let mut command = Command::new(binary);
+    command.env_clear();
+    // The user's own variables from Cloud environment settings, one NAME=value per line. Read at every
+    // start, so saved changes reach new agents at once. Core's own values below win over them.
+    let saved = std::fs::read_to_string(config.state_dir.join("environment")).unwrap_or_default();
+    for (name, value) in saved.lines().filter_map(|line| line.split_once('=')) {
+        if !name.is_empty() && !name.contains('\0') && !value.contains('\0') {
+            command.env(name, value);
+        }
+    }
     command
-        .env_clear()
         .env("PATH", path)
         .env("HOME", &config.account_home)
         .env("LANG", "C.UTF-8")
@@ -759,7 +922,7 @@ pub(super) fn command(binary: &Path, config: &Config) -> Command {
 
 pub async fn reconcile(config: &Config) -> io::Result<()> {
     if let Some(policy) = &config.storage {
-        linux::Workload::clear(&policy.cgroup_root).await?;
+        linux::Workload::clear(policy).await?;
     }
     Ok(())
 }

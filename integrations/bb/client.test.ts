@@ -45,6 +45,36 @@ function sendJson(res: ServerResponse, value: unknown, status = 200) {
   res.end(JSON.stringify(value));
 }
 
+test("accepts the Pi key endpoint's synchronous HTTP 200 response", async (t) => {
+  const service = await fixture((req, res, body) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/v1/accounts/pi/key");
+    assert.deepEqual(body, { provider: "synthetic", key: "synthetic-key" });
+    sendJson(res, { providers: ["synthetic"] });
+  });
+  t.after(() => service.close());
+  assert.deepEqual(await service.client.piApiKey("synthetic", "synthetic-key"), {
+    providers: ["synthetic"],
+  });
+});
+
+test("accepts Teleport preflight HTTP 202 and gives it the long timeout", async (t) => {
+  const result = { ok: true } as const;
+  const check = { harness: "codex", model: "synthetic-model", reasoning: null, service_tier: null } as const;
+  const service = await fixture(async (req, res, body) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/v1/teleports/check");
+    assert.deepEqual(body, check);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    sendJson(res, result, 202);
+  }, 1);
+  t.after(() => service.close());
+  assert.deepEqual(
+    await service.client.checkTeleport(check),
+    result,
+  );
+});
+
 test("routes Cursor account operations and rejects off-domain login links", async (t) => {
   let url = "https://cursor.com/loginDeepControl?challenge=fixture";
   const bodies: Record<string, unknown>[] = [];
@@ -62,29 +92,6 @@ test("routes Cursor account operations and rejects off-domain login links", asyn
   for (url of ["https://cursor.com.evil.invalid/loginDeepControl?challenge=fixture", "https://user:pass@cursor.com/loginDeepControl", "https://cursor.com/other", "http://cursor.com/loginDeepControl"]) {
     await assert.rejects(service.client.cursorAuth(), /Unexpected Cursor sign-in URL/);
   }
-});
-
-test("accepts synchronous Pi key writes and preserves receipt errors", async (t) => {
-  const service = await fixture((req, res) => {
-    if (req.url === "/v1/accounts/pi/key") return sendJson(res, { providers: ["openai"] });
-    sendJson(res, {
-      session: {
-        ...snapshot(1).session,
-        receipts: {
-          failed: {
-            request_id: "failed",
-            command: "prompt",
-            state: "failed",
-            input: { text: "hello" },
-            error: "provider unavailable",
-          },
-        },
-      },
-    });
-  });
-  t.after(() => service.close());
-  assert.deepEqual(await service.client.piApiKey("openai", "synthetic-key"), { providers: ["openai"] });
-  assert.equal((await service.client.session("s1")).receipts.failed.error, "provider unavailable");
 });
 
 test("reports allowlisted rejections, keeps temporary conflicts retryable, and shows unknown core errors", async (t) => {
@@ -196,8 +203,8 @@ test("requires secure explicit connection settings", () => {
   assert.equal(JSON.stringify(client), "{}");
 });
 
-test("keeps the Boat gate in a cookie for commands and SSE, never in URLs or errors", async (t) => {
-  const gateToken = "boat-fixture-secret";
+test("keeps the gate token in a cookie for commands and SSE, never in URLs or errors", async (t) => {
+  const gateToken = "gate-fixture-secret";
   const service = await fixture((req, res, body) => {
     assert.equal(req.headers.cookie, `_port_auth=${gateToken}`);
     assert.ok(!req.url!.includes(gateToken));
@@ -651,4 +658,66 @@ test("reads core status without exposing private fields as client configuration"
   assert.equal(state.native_id, "native-1");
   assert.equal(state.receipts.p2.state, "accepted");
   assert.deepEqual(state.queue, ["p2"]);
+});
+
+test("accepts synchronous Pi key writes and preserves receipt errors", async (t) => {
+  const service = await fixture((req, res) => {
+    if (req.url === "/v1/accounts/pi/key") return sendJson(res, { providers: ["openai"] });
+    sendJson(res, {
+      session: {
+        ...snapshot(1).session,
+        receipts: {
+          failed: {
+            request_id: "failed",
+            command: "prompt",
+            state: "failed",
+            input: { text: "hello" },
+            error: "provider unavailable",
+          },
+        },
+      },
+    });
+  });
+  t.after(() => service.close());
+  assert.deepEqual(await service.client.piApiKey("openai", "synthetic-key"), { providers: ["openai"] });
+  assert.equal((await service.client.session("s1")).receipts.failed.error, "provider unavailable");
+});
+
+test("preserves nullable receipt errors and rejects invalid errors", async (t) => {
+  let error: unknown = null;
+  const service = await fixture((_req, res) => sendJson(res, {
+    session: { ...snapshot(1).session, receipts: {
+      failed: { request_id: "failed", command: "prompt", state: "failed", input: {}, error },
+    } },
+  }));
+  t.after(() => service.close());
+  assert.equal((await service.client.session("s1")).receipts.failed.error, null);
+  error = 42;
+  await assert.rejects(service.client.session("s1"), /Invalid Cloudroom response/);
+});
+
+
+test("child starts validate their derived receipt and session without relaxing ordinary commands", async (t) => {
+  let receiptId = "child_kid";
+  let sessionId = "cr_child_kid";
+  let command = "start";
+  const service = await fixture((_req, res, body) => {
+    assert.equal(body.request_id, "kid");
+    sendJson(res, { session_id: sessionId, receipt: { request_id: receiptId,
+      command, input: body, state: "accepted" }, saving: "pending" }, 202);
+  });
+  t.after(() => service.close());
+  const child = () => service.client.start("kid", "codex", { parent_session: "parent", prompt: "work" });
+  assert.equal((await child()).receipt.request_id, "child_kid");
+  await assert.rejects(service.client.start("kid"), /does not match/);
+  await assert.rejects(service.client.prompt("cr_child_kid", "kid", "work"), /does not match/);
+  receiptId = "kid";
+  await assert.rejects(child(), /does not match/);
+  assert.equal((await service.client.start("kid")).receipt.request_id, "kid");
+  receiptId = "child_kid";
+  sessionId = "wrong";
+  await assert.rejects(child(), /does not match/);
+  sessionId = "cr_child_kid";
+  command = "prompt";
+  await assert.rejects(child(), /does not match/);
 });

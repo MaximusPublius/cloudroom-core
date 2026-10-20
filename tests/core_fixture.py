@@ -22,7 +22,7 @@ def codex():
     path = Path(os.environ["CODEX_HOME"]) / "sessions" / (native + ".jsonl")
     path.parent.mkdir(exist_ok=True)
     path.write_text('{"fixture":"start"}\n')
-    children, turn, slow_exit = {}, "", False
+    children, turn, slow_exit, goal = {}, "", False, None
     login_cancelled = threading.Event()
 
     def finish_login(login_id):
@@ -137,7 +137,21 @@ def codex():
                 else:
                     event("item/agentMessage/delta", turnId=turn, itemId="text", delta="hello")
                     event("turn/completed", turn={"id": turn, "status": "completed"})
+                if text == "goal":
+                    # Codex continues an active goal on its own: a turn nobody requested.
+                    goal = {"objective": "fixture goal", "status": "active", "tokenBudget": None, "tokensUsed": 0, "timeUsedSeconds": 0}
+                    turn = str(uuid.uuid4())
+                    event("turn/started", turn={"id": turn, "status": "inProgress"})
+                    event("item/agentMessage/delta", turnId=turn, itemId="goal", delta="continuing")
+                    Path("goal-turn").write_text(turn)
                 continue
+            elif method == "thread/goal/get":
+                result = {"goal": goal}
+            elif method == "thread/goal/set":
+                with Path(native + ".goal").open("a") as file:
+                    file.write(json.dumps(params) + "\n")
+                goal = {**(goal or {}), "status": params.get("status", "active")}
+                result = {"goal": goal}
             elif method == "turn/interrupt":
                 event("turn/completed", turn={"id": turn, "status": "interrupted"})
             elif method == "thread/backgroundTerminals/terminate":
@@ -206,10 +220,11 @@ class ReplayTests(unittest.TestCase):
         (home / ".codex").mkdir(parents=True)
         self.state = self.root / "state"
         self.state.mkdir()
+        # The database is a missing socket: it fails at once, where a refused port is retried for 2s on every shutdown.
         self.env = {
             "PATH": "/usr/local/bin:/usr/bin:/bin", "CLOUDROOM_UNPROTECTED_TEST_MODE": "1", "CLOUDROOM_LISTEN": "127.0.0.1:0",
             "CLOUDROOM_TOKEN": "fixture-token-" + "x" * 32, "CLOUDROOM_STATE_DIR": str(self.state),
-            "CLOUDROOM_REPOSITORY": str(self.repo), "CLOUDROOM_DATABASE_URL": "postgres://127.0.0.1:1/fixture",
+            "CLOUDROOM_REPOSITORY": str(self.repo), "CLOUDROOM_DATABASE_URL": f"postgres://localhost/fixture?host={self.root}/no-database",
             "CLOUDROOM_STORE": "fixture", "CLOUDROOM_ALLOW_INSECURE_DATABASE": "1",
             "CLOUDROOM_CODEX_BINARY": str(Path(__file__).resolve()), "CLOUDROOM_ACCOUNT_HOME": str(home),
             "CLOUDROOM_CODEX_HOME": str(home / ".codex"), "CLOUDROOM_MODEL": "fixture",
@@ -781,6 +796,37 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(self.status()["queue_paused"])
         self.service.request("POST", "/v1/sessions/cr_seed/resume", {"request_id": "resume"}, 202)
         self.assertEqual((self.repo / (self.native + ".requests")).read_text().splitlines(), ["running", "queued"])
+
+    def test_child_notice_steers_a_busy_parent_and_queues_for_an_idle_one(self):
+        self.seed(); self.start(); self.ready()
+        self.prompt("running", "hold")
+        self.wait(lambda: self.status()["state"] == "running", "running turn")
+        self.service.request("POST", "/v1/sessions", {"request_id": "kid", "parent_session": "cr_seed", "prompt": "hello"}, 202)
+        receipts = lambda: self.status()["receipts"]
+        self.wait(lambda: receipts().get("notice_cr_child_kid_task_kid_steer", {}).get("state") == "completed", "steered notice")
+        self.assertIn("completed", receipts()["notice_cr_child_kid_task_kid_steer"]["input"]["text"])
+        self.assertNotIn("notice_cr_child_kid_task_kid", receipts())
+        self.service.request("POST", "/v1/sessions/cr_seed/interrupt", {"request_id": "halt", "target_request_id": "running"}, 202)
+        self.ready()
+        self.service.request("POST", "/v1/sessions/cr_child_kid/prompts", {"request_id": "again", "text": "hello"}, 202)
+        self.wait(lambda: receipts().get("notice_cr_child_kid_again", {}).get("state") == "completed", "queued notice")
+        self.assertNotIn("notice_cr_child_kid_again_steer", receipts())
+
+    def test_codex_goal_turns_are_tracked_paused_by_stop_and_resumed_by_the_user(self):
+        self.seed(); self.start(); self.ready()
+        self.prompt("first", "goal")
+        self.wait(lambda: (self.repo / "goal-turn").exists(), "goal continuation")
+        auto = "auto_" + (self.repo / "goal-turn").read_text()
+        self.wait(lambda: self.status()["state"] == "running" and auto in self.status()["receipts"], "tracked goal turn")
+        self.prompt("queued", "hello")
+        self.assertEqual(self.status()["queue"], ["queued"])
+        self.service.request("POST", "/v1/sessions/cr_seed/stop", {"request_id": "stop"}, 202)
+        self.wait(lambda: self.status()["receipts"][auto]["state"] == "interrupted", "stopped goal turn")
+        goals = lambda: [json.loads(line) for line in (self.repo / (self.native + ".goal")).read_text().splitlines()]
+        self.assertEqual(goals(), [{"threadId": self.native, "status": "paused", "origin": "user"}])
+        self.service.request("POST", "/v1/sessions/cr_seed/goal", {"request_id": "resume-goal", "status": "active"}, 202)
+        self.wait(lambda: self.status()["receipts"]["resume-goal"]["state"] == "completed", "resumed goal")
+        self.assertEqual(goals()[-1], {"threadId": self.native, "status": "active", "origin": "user"})
 
     def test_agent_crash_recovers_once_and_failed_resume_settles_queue(self):
         self.seed(); self.start(); self.ready()

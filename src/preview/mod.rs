@@ -175,7 +175,7 @@ impl Previews {
                     || config
                         .storage
                         .as_ref()
-                        .is_some_and(|p| m.uid() == p.agent_uid)
+                        .is_some_and(|p| !p.container() && m.uid() == p.agent_uid)
                 {
                     return Err(io::Error::other(
                         "preview setup must be protected from agent writes",
@@ -558,17 +558,22 @@ async fn tunnel(
     Query(input): Query<TunnelDevice>,
     mut request: Request,
 ) -> Result<Response> {
-    if request
+    // Some sandbox proxies relay bytes only after a WebSocket handshake, so `websocket` names the same raw tunnel.
+    // No WebSocket frames follow either way.
+    let protocol = match request
         .headers()
         .get(header::UPGRADE)
         .and_then(|v| v.to_str().ok())
-        != Some("cloudroom-tunnel")
     {
-        return Err(Failure(
-            StatusCode::BAD_REQUEST,
-            "Send Upgrade: cloudroom-tunnel".into(),
-        ));
-    }
+        Some("cloudroom-tunnel") => "cloudroom-tunnel",
+        Some("websocket") => "websocket",
+        _ => {
+            return Err(Failure(
+                StatusCode::BAD_REQUEST,
+                "Send Upgrade: websocket or cloudroom-tunnel".into(),
+            ));
+        }
+    };
     let mut upstream = m.previews.connect(port, &input.device).await?;
     let upgrade = hyper::upgrade::on(&mut request);
     let task = tokio::spawn(async move {
@@ -587,7 +592,7 @@ async fn tunnel(
     Ok(Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(header::CONNECTION, "upgrade")
-        .header(header::UPGRADE, "cloudroom-tunnel")
+        .header(header::UPGRADE, protocol)
         .body(Body::empty())
         .unwrap())
 }
@@ -669,11 +674,26 @@ fn agent_listener(port: u16, uid: u32) -> io::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn disconnect_ssh(agent_uid: u32, service_uid: u32) -> io::Result<()> {
+    use std::ffi::c_long;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // musl has no pidfd wrappers, so call the kernel directly. These numbers are the same on every architecture.
     unsafe extern "C" {
-        fn pidfd_open(pid: i32, flags: u32) -> i32;
-        fn pidfd_send_signal(fd: i32, signal: i32, info: *const (), flags: u32) -> i32;
+        fn syscall(number: c_long, ...) -> c_long;
     }
+    const PIDFD_OPEN: c_long = 434;
+    const PIDFD_SEND_SIGNAL: c_long = 424;
+    const NO_FLAGS: c_long = 0;
+    const SIGKILL: c_long = 9;
+    let pidfd_open = |pid: i32| unsafe { syscall(PIDFD_OPEN, c_long::from(pid), NO_FLAGS) as i32 };
+    let pidfd_kill = |fd: i32| unsafe {
+        syscall(
+            PIDFD_SEND_SIGNAL,
+            c_long::from(fd),
+            SIGKILL,
+            std::ptr::null::<()>(),
+            NO_FLAGS,
+        )
+    };
     let passwd = fs::read_to_string("/etc/passwd")?;
     let uid = passwd
         .lines()
@@ -694,7 +714,7 @@ fn disconnect_ssh(agent_uid: u32, service_uid: u32) -> io::Result<()> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        let fd = unsafe { pidfd_open(pid, 0) };
+        let fd = pidfd_open(pid);
         if fd < 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(3) {
@@ -727,9 +747,7 @@ fn disconnect_ssh(agent_uid: u32, service_uid: u32) -> io::Result<()> {
         } else {
             false
         };
-        if (dedicated || monitor)
-            && unsafe { pidfd_send_signal(fd.as_raw_fd(), 9, std::ptr::null(), 0) } != 0
-        {
+        if (dedicated || monitor) && pidfd_kill(fd.as_raw_fd()) != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(3) {
                 return Err(error);

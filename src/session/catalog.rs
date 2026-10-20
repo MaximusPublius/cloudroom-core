@@ -32,7 +32,8 @@ impl Manager {
             "diskThresholds":self.config.storage.as_ref().map(|policy| json!({"warningBytes":policy.warning_bytes,"pauseBytes":policy.pause_bytes})),
             "onboarding":{"localConnected":null,"offlineTaskVerified":null},
             "capabilities":{"settings":true,"updates":false},
-            "sessionCount":sessions.len(),"agents":local.agent_counts(),"sessions":summaries})
+            "sessionCount":sessions.len(),"agents":local.agent_counts(),"sessions":summaries,
+            "terminals":self.terminals.summary()})
     }
 
     /// The latest 1,000 sessions, newest activity first. Prompts, receipts and records stay
@@ -59,6 +60,27 @@ impl Manager {
     }
 
     pub(super) async fn model_catalog(&self, kind: runtime::Kind) -> Result<Vec<runtime::Model>> {
+        self.catalog(kind, false).await
+    }
+
+    /// Whether `model` accepts `reasoning`. The saved list answers first, so a start never waits for a refresh
+    /// (capabilities calls keep it current); a model or effort it lacks gets one fresh check.
+    pub(super) async fn reasoning_supported(
+        &self,
+        kind: runtime::Kind,
+        model: &str,
+        reasoning: &str,
+    ) -> Result<bool> {
+        let check = |models: &[runtime::Model]| {
+            runtime::reasoning_levels(kind, models, model).map(|levels| levels.contains(&reasoning))
+        };
+        if check(&self.catalog(kind, true).await?) == Some(true) {
+            return Ok(true);
+        }
+        check(&self.model_catalog(kind).await?).ok_or(Error::Conflict("invalid model"))
+    }
+
+    async fn catalog(&self, kind: runtime::Kind, saved_ok: bool) -> Result<Vec<runtime::Model>> {
         let cache = match kind {
             runtime::Kind::Codex => &self.codex_models,
             runtime::Kind::Claude => &self.claude_models,
@@ -67,7 +89,7 @@ impl Manager {
         };
         let mut cached = cache.lock().await;
         if let Some((checked, models)) = &*cached
-            && checked.elapsed() < Duration::from_secs(60)
+            && (saved_ok || checked.elapsed() < Duration::from_secs(60))
         {
             return Ok(models.clone());
         }
@@ -106,7 +128,8 @@ impl Manager {
                             Err(_) => Value::Null,
                         }
                     };
-                    harness["steer"] = json!(*kind == runtime::Kind::Codex);
+                    harness["steer"] = json!(true);
+                    harness["goal"] = json!(*kind == runtime::Kind::Codex);
                     harness["compact"] = json!(true);
                     harness["service_tier"] = json!(kind.fast());
                     harness["skill_mentions"] = json!(*kind == runtime::Kind::Claude);
@@ -115,13 +138,19 @@ impl Manager {
                     harness["subagents"] = json!(true);
                     harness["usage"] = json!(true);
                 }
-                runtime::Kind::Cursor | runtime::Kind::Fx => {
+                runtime::Kind::Cursor | runtime::Kind::Fx | runtime::Kind::OpenCode => {
                     let capabilities = runtime::cursor::capabilities(*kind);
                     for (key, value) in capabilities.as_object().unwrap() {
                         harness[key] = value.clone();
                     }
-                    harness["reasoning_levels"] = json!(runtime::PI_REASONING_LEVELS);
-                    harness["attachments"] = json!({"images":false,"files":true});
+                    harness["reasoning_levels"] = json!(if *kind == runtime::Kind::OpenCode {
+                        runtime::OPENCODE_REASONING_LEVELS
+                    } else {
+                        runtime::PI_REASONING_LEVELS
+                    });
+                    // Cursor's print mode has no image input; Cursor and OpenCode open images from the attached path.
+                    harness["attachments"] =
+                        json!({"images":*kind != runtime::Kind::Fx,"files":true});
                     harness["provider_selection"] = json!(false);
                     if *kind == runtime::Kind::Cursor {
                         harness["models"] = if self.storage.blocks() {
@@ -164,8 +193,10 @@ impl Manager {
         let (kind, model) = {
             let local = self.local.lock().unwrap();
             let session = local.sessions.get(id).ok_or(Error::NotFound)?;
-            if matches!(session.harness, runtime::Kind::Cursor | runtime::Kind::Fx)
-                && session.reasoning.as_deref() != Some(reasoning)
+            if matches!(
+                session.harness,
+                runtime::Kind::Cursor | runtime::Kind::Fx | runtime::Kind::OpenCode
+            ) && session.reasoning.as_deref() != Some(reasoning)
             {
                 return Err(Error::Conflict("invalid reasoning effort"));
             }
@@ -179,15 +210,13 @@ impl Manager {
         };
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
-                let models = self.model_catalog(kind).await?;
                 let selected = model.ok_or(Error::Conflict("invalid model"))?;
-                runtime::reasoning_levels(kind, &models, &selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .contains(&reasoning)
+                self.reasoning_supported(kind, &selected, reasoning).await?
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)
             }
+            runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));

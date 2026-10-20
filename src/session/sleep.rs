@@ -32,7 +32,7 @@ impl Session {
         !self.queue.is_empty() && !self.queue_paused
     }
 
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.current_request.is_some()
             || self.has_work()
             || matches!(
@@ -103,10 +103,11 @@ impl Manager {
             return json!({"drained": false});
         }
         // Closed sessions keep their close request forever, but nothing of theirs is running.
+        // A low-disk pause may never lift on its own, so it must not keep the machine awake.
         let busy = local
             .sessions
             .values()
-            .filter(|s| s.state != "closed")
+            .filter(|s| s.state != "closed" && !s.storage_paused)
             .find(|s| {
                 s.busy()
                     || s.compacting
@@ -121,6 +122,8 @@ impl Manager {
             return json!({"drained":false,"reason":"transfer_running"});
         }
         local.draining = true;
+        // The sandbox stops next, so its next start replays almost nothing.
+        local.save_snapshot();
         json!({"drained":true,"pending_records":local.journal.last() - local.journal.saved()})
     }
 
@@ -224,7 +227,7 @@ impl Manager {
     pub(super) fn wake(self: &Arc<Self>, local: &mut Local, id: &str) -> Result<()> {
         let s = &local.sessions[id];
         if s.state == "sleeping" && s.handle.is_none() && s.has_work() && s.can_resume() {
-            self.schedule_resume(local, id)?;
+            self.schedule_resume(local, id, false)?;
         }
         Ok(())
     }

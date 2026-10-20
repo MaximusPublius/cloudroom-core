@@ -42,7 +42,7 @@ def atomic_file(path, content, mode):
 
 
 def archive_move(source, destination):
-    # Copy, verify, then remove. Boat restore lost files inside a renamed directory;
+    # Copy, verify, then remove. A sandbox restore lost files inside a renamed directory;
     # newly written archive files also work when /home and /srv are separate mounts.
     def copy_verified(source_file, destination_file):
         shutil.copy2(source_file, destination_file)

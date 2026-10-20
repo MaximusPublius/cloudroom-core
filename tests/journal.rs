@@ -127,3 +127,57 @@ fn journal_survives_killed_writer() {
     assert_eq!(recovered.append(b"after recovery").unwrap(), 3);
     assert_eq!(recovered.read(1).unwrap(), b"saved fixture record");
 }
+
+// Retained fixtures: these regressions do not remove any files or run providers.
+#[test]
+fn snapshot_gap_is_rejected_and_existing_sequence_is_never_overwritten() {
+    let directory = std::mem::ManuallyDrop::new(Directory::new());
+    let gap = directory.0.clone();
+    // Do not construct a cleanup guard for retained evidence.
+    fs::create_dir_all(&gap).unwrap();
+    fs::write(gap.join("00000000000000000001.record"), b"one").unwrap();
+    fs::write(gap.join("00000000000000000003.record"), b"three").unwrap();
+    assert!(Journal::open_from(&gap, 1).is_err());
+    assert!(Journal::open(&gap).is_err());
+    assert_eq!(
+        fs::read(gap.join("00000000000000000003.record")).unwrap(),
+        b"three"
+    );
+
+    let collision = gap.with_extension("collision");
+    let mut journal = Journal::open(&collision).unwrap();
+    fs::write(collision.join("00000000000000000001.record"), b"existing").unwrap();
+    assert!(journal.append(b"replacement").is_err());
+    assert!(!journal.writable());
+    assert_eq!(journal.last(), 0);
+    assert!(journal.append(b"retry").is_err());
+    assert_eq!(
+        fs::read(collision.join("00000000000000000001.record")).unwrap(),
+        b"existing"
+    );
+    drop(journal);
+    assert_eq!(
+        Journal::open_from(&collision, 1).unwrap().read(1).unwrap(),
+        b"existing"
+    );
+    eprintln!(
+        "retained journal fixtures: {} and {}",
+        gap.display(),
+        collision.display()
+    );
+}
+
+#[test]
+fn published_pending_inode_is_not_truncated_on_recovery() {
+    let dir = Directory::new();
+    fs::create_dir_all(&dir.0).unwrap();
+    let record = dir.0.join("00000000000000000001.record");
+    fs::write(&record, b"committed").unwrap();
+    fs::hard_link(&record, dir.0.join("pending.tmp")).unwrap();
+    let mut journal = Journal::open_from(&dir.0, 1).unwrap();
+    assert_eq!(journal.append(b"next").unwrap(), 2);
+    assert_eq!(journal.read(1).unwrap(), b"committed");
+    assert_eq!(journal.read(2).unwrap(), b"next");
+    drop(journal);
+    assert_eq!(Journal::open_from(&dir.0, 1).unwrap().last(), 2);
+}

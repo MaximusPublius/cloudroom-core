@@ -1,12 +1,12 @@
 //! Disk policy and explicitly disposable npm download-cache cleanup, not history retention.
-use crate::{config::Config, runtime::linux};
+use crate::{config::Config, observability::now_ms, runtime::linux};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::process::Command;
 
@@ -16,7 +16,8 @@ pub struct Policy {
     pub agent_uid: u32,
     pub agent_gid: u32,
     pub cache_dir: PathBuf,
-    pub cgroup_root: PathBuf,
+    /// Null in a container without cgroups or capabilities (see `container`).
+    pub cgroup_root: Option<PathBuf>,
     /// Sandbox deployments give agents sudo: the sandbox itself is the security boundary.
     #[serde(default)]
     pub agent_sudo: bool,
@@ -48,6 +49,11 @@ impl Policy {
         {
             return Err(io::Error::other("invalid disk protection policy"));
         }
+        if policy.container() && !policy.agent_sudo {
+            return Err(io::Error::other(
+                "cgroups are required unless the sandbox is the security boundary (agent_sudo)",
+            ));
+        }
         // Neither the policy nor its ancestors may be replaced by agent writes.
         for part in path.ancestors() {
             let m = fs::symlink_metadata(part)?;
@@ -60,18 +66,25 @@ impl Policy {
         Ok(policy)
     }
 
+    /// A container without cgroups or capabilities, whose agents have sudo: Core runs as the agent account and
+    /// contains work by marking its processes (runtime/linux.rs). Its /var/tmp may be a memory disk.
+    pub fn container(&self) -> bool {
+        self.cgroup_root.is_none()
+    }
+
     fn check_filesystems(&self, config: &Config) -> io::Result<()> {
         let mount = fs::metadata(&config.repository)?;
+        let var_tmp = (!self.container()).then_some(Path::new("/var/tmp"));
         for path in [
             &config.repository,
             &config.state_dir,
             &config.account_home,
             &self.cache_dir,
             Path::new("/tmp"),
-            Path::new("/var/tmp"),
             Path::new("/code"),
         ]
         .into_iter()
+        .chain(var_tmp)
         .chain(
             config
                 .harnesses
@@ -92,7 +105,7 @@ impl Policy {
             return Err(io::Error::other("disk protection requires Linux"));
         }
         self.check_filesystems(config)?;
-        if fs::metadata(&config.state_dir)?.uid() == self.agent_uid {
+        if !self.container() && fs::metadata(&config.state_dir)?.uid() == self.agent_uid {
             return Err(io::Error::other(
                 "history must belong to the protected service account",
             ));
@@ -107,23 +120,24 @@ impl Policy {
                 return Err(io::Error::other("cache root requires protected ancestors"));
             }
         }
+        let Some(root) = &self.cgroup_root else {
+            return Ok(());
+        };
         let current = fs::read_to_string("/proc/self/cgroup")?;
         let current = current
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
             .ok_or_else(|| io::Error::other("cgroup v2 is required"))?;
         let owner = Path::new("/sys/fs/cgroup").join(current.trim_start_matches('/'));
-        if self.cgroup_root != owner.join("agents") {
+        if *root != owner.join("agents") {
             return Err(io::Error::other(
                 "agent cgroups must be inside the core's delegated service",
             ));
         }
-        if !self.cgroup_root.exists() {
-            fs::create_dir(&self.cgroup_root)?;
+        if !root.exists() {
+            fs::create_dir(root)?;
         }
-        if !self.cgroup_root.join("cgroup.freeze").is_file()
-            || !self.cgroup_root.join("cgroup.kill").is_file()
-        {
+        if !root.join("cgroup.freeze").is_file() || !root.join("cgroup.kill").is_file() {
             return Err(io::Error::other(
                 "workload freeze and kill controls are required",
             ));
@@ -131,10 +145,16 @@ impl Policy {
         Ok(())
     }
 
-    fn level(&self, available: u64, previous: Level) -> Level {
-        if available < self.pause_bytes
-            || (previous == Level::Blocked && available <= self.resume_bytes)
-        {
+    /// `floor` replaces the pause threshold after a rescue (`Guard::rescue`).
+    fn level(&self, available: u64, previous: Level, floor: Option<u64>) -> Level {
+        let blocked = match floor {
+            Some(floor) => available < floor,
+            None => {
+                available < self.pause_bytes
+                    || (previous == Level::Blocked && available <= self.resume_bytes)
+            }
+        };
+        if blocked {
             Level::Blocked
         } else if available <= self.warning_bytes {
             Level::LowSpace
@@ -185,10 +205,15 @@ impl Snapshot {
     }
 }
 
+/// How long a guard-loop measurement stays valid.
+pub(crate) const FRESH: Duration = Duration::from_secs(5);
+
 pub struct Guard {
     policy: Option<Policy>,
+    history: PathBuf,
     value: Mutex<(Snapshot, Instant)>,
     writers: Mutex<Vec<Weak<linux::Workload>>>,
+    floor: Mutex<Option<u64>>,
 }
 impl Guard {
     pub fn new(config: &Config) -> io::Result<Self> {
@@ -197,7 +222,9 @@ impl Guard {
         }
         Ok(Self {
             policy: config.storage.clone(),
+            history: config.state_dir.clone(),
             writers: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
             value: Mutex::new((
                 Snapshot::unavailable(config.storage.is_some()),
                 Instant::now(),
@@ -206,22 +233,63 @@ impl Guard {
     }
     pub fn snapshot(&self) -> Snapshot {
         let (value, sampled) = &*self.value.lock().unwrap();
-        if value.enabled && sampled.elapsed() > Duration::from_secs(5) {
-            Snapshot::unavailable(true)
-        } else {
-            value.clone()
+        if !value.enabled || sampled.elapsed() <= FRESH {
+            return value.clone();
+        }
+        // A busy core can delay the guard loop. Re-measure instead of blocking on a stale reading.
+        // History shares the workspace filesystem (`check_filesystems`); failed checks stay blocked.
+        let measured = (self.policy.as_ref())
+            .filter(|_| value.reason == "disk_capacity")
+            .and_then(|p| Some((p, disk(&self.history).ok()?)));
+        let Some((p, d)) = measured else {
+            return Snapshot::unavailable(true);
+        };
+        Snapshot {
+            level: p.level(d.available_bytes, value.level, *self.floor.lock().unwrap()),
+            workspace_available_bytes: Some(d.available_bytes),
+            history_available_bytes: Some(d.available_bytes),
+            sampled_at: Some(now_ms()),
+            ..value.clone()
         }
     }
     pub fn blocks(&self) -> bool {
         self.snapshot().level == Level::Blocked
     }
+    /// Frozen work never frees space. Once Cloudroom has stopped the command filling the disk, work continues
+    /// until half of the space left is used, then pauses again. Space above `resume_bytes` ends the rescue.
+    pub fn rescue(&self) {
+        let (snapshot, _) = &*self.value.lock().unwrap();
+        if let (Some(workspace), Some(history)) = (
+            snapshot.workspace_available_bytes,
+            snapshot.history_available_bytes,
+        ) {
+            *self.floor.lock().unwrap() = Some(workspace.min(history) / 2);
+        }
+    }
     pub(crate) fn spawn_writer(
         &self,
         command: &mut Command,
     ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
+        self.spawn(command, true)
+    }
+
+    /// Emergency operator access: runs while storage is blocked and is never frozen,
+    /// so a person can read work back and free space.
+    pub(crate) fn spawn_operator(
+        &self,
+        command: &mut Command,
+    ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
+        self.spawn(command, false)
+    }
+
+    fn spawn(
+        &self,
+        command: &mut Command,
+        gated: bool,
+    ) -> io::Result<(tokio::process::Child, Option<Arc<linux::Workload>>)> {
         // Serialize admission with pause snapshots so a just-started writer is never missed.
         let mut writers = self.writers.lock().unwrap();
-        if self.blocks() {
+        if gated && self.blocks() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "storage unsafe; file writes are blocked",
@@ -231,14 +299,14 @@ impl Guard {
             .policy
             .as_ref()
             .map(|policy| {
-                let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
+                let group = Arc::new(linux::Workload::create(policy)?);
                 group.attach(command, policy)?;
                 Ok::<_, io::Error>(group)
             })
             .transpose()?;
         let child = command.spawn()?;
         writers.retain(|writer| writer.strong_count() > 0);
-        if let Some(group) = &workload {
+        if let Some(group) = workload.as_ref().filter(|_| gated) {
             writers.push(Arc::downgrade(group));
         }
         Ok((child, workload))
@@ -269,13 +337,15 @@ impl Guard {
         let measured = async {
             p.check_filesystems(config)?;
             workspaces.check_filesystems()?;
-            let (workspace, history) =
-                tokio::join!(disk(workspaces.root()), disk(&config.state_dir));
-            let (workspace, history) = (workspace?, history?);
-            let level = p.level(
-                workspace.available_bytes.min(history.available_bytes),
-                previous,
-            );
+            let (workspace, history) = (disk(workspaces.root())?, disk(&config.state_dir)?);
+            let available = workspace.available_bytes.min(history.available_bytes);
+            let level = {
+                let mut floor = self.floor.lock().unwrap();
+                if available > p.resume_bytes {
+                    *floor = None;
+                }
+                p.level(available, previous, *floor)
+            };
             Ok::<_, io::Error>(Snapshot {
                 enabled: true,
                 level,
@@ -283,12 +353,7 @@ impl Guard {
                 history_available_bytes: Some(history.available_bytes),
                 workspace_total_bytes: Some(workspace.total_bytes),
                 history_total_bytes: Some(history.total_bytes),
-                sampled_at: Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                ),
+                sampled_at: Some(now_ms()),
                 reason: "disk_capacity",
             })
         }
@@ -301,12 +366,16 @@ impl Guard {
         let Some(p) = &self.policy else {
             return Ok(());
         };
+        // Cleanup proves quiescence through frozen cgroups, so containers without them skip it.
+        let Some(groups) = &p.cgroup_root else {
+            return Ok(());
+        };
         let mut command = Command::new(std::env::current_exe()?);
         command
             .env_clear()
             .arg("--clean-npm-cache")
             .arg(&p.cache_dir)
-            .arg(&p.cgroup_root)
+            .arg(groups)
             .kill_on_drop(true);
         linux::as_agent(&mut command, p.agent_uid, p.agent_gid, None, true)?;
         let result = tokio::time::timeout(Duration::from_secs(5), command.output())
@@ -325,41 +394,35 @@ pub(crate) struct Disk {
     pub used_bytes: u64,
     pub available_bytes: u64,
 }
-pub(crate) async fn disk(path: &Path) -> io::Result<Disk> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(1),
-        Command::new("/bin/df")
-            .env_clear()
-            .env("LC_ALL", "C")
-            .arg("-Pk")
-            .arg(path)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| io::Error::other("filesystem measurement timed out"))??;
-    if !output.status.success() {
-        return Err(io::Error::other("filesystem measurement failed"));
+/// A system call, not `df`: when agents fill the process table, starting `df` fails,
+/// and an unmeasurable disk pauses all work.
+#[cfg(target_os = "linux")]
+pub(crate) fn disk(path: &Path) -> io::Result<Disk> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn statvfs(path: *const std::ffi::c_char, buf: *mut u64) -> i32;
     }
-    let text = String::from_utf8(output.stdout).map_err(io::Error::other)?;
-    let fields: Vec<&str> = text
-        .lines()
-        .nth(1)
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect();
-    let n = |i: usize| {
-        fields
-            .get(i)
-            .and_then(|s| s.parse::<u64>().ok())
-            .and_then(|n| n.checked_mul(1024))
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // 64-bit Linux `struct statvfs` begins f_bsize, f_frsize, f_blocks, f_bfree, f_bavail, each
+    // 8 bytes. The buffer is larger than the whole struct.
+    let mut buf = [0u64; 32];
+    if unsafe { statvfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let [_, unit, blocks, free, available, ..] = buf;
+    let bytes = |n: u64| {
+        n.checked_mul(unit)
             .ok_or_else(|| io::Error::other("invalid filesystem measurement"))
     };
     Ok(Disk {
-        total_bytes: n(1)?,
-        used_bytes: n(2)?,
-        available_bytes: n(3)?,
+        total_bytes: bytes(blocks)?,
+        used_bytes: bytes(blocks.saturating_sub(free))?,
+        available_bytes: bytes(available)?,
     })
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn disk(_: &Path) -> io::Result<Disk> {
+    Err(io::Error::other("disk measurement requires Linux"))
 }
 
 /// Runs only as the agent account, while workloads are frozen or absent. Never traverses
@@ -550,11 +613,13 @@ mod tests {
             (5_000_000_000, Level::Blocked, Level::LowSpace),
             (5_000_000_001, Level::Blocked, Level::Normal),
         ] {
-            let level = policy.level(available, before);
+            let level = policy.level(available, before, None);
             assert_eq!(level, expected, "{available} bytes, previously {before:?}");
             let guard = Guard {
                 policy: None,
+                history: PathBuf::new(),
                 writers: Mutex::new(Vec::new()),
+                floor: Mutex::new(None),
                 value: Mutex::new((
                     Snapshot {
                         enabled: true,
@@ -572,10 +637,52 @@ mod tests {
     }
 
     #[test]
+    fn a_rescue_resumes_work_until_half_the_space_left_is_used() {
+        let policy: Policy = serde_json::from_str(
+            r#"{"agent_uid":1001,"agent_gid":1001,"cache_dir":"/cache","cgroup_root":"/agents"}"#,
+        )
+        .unwrap();
+        let floor = Some(900_000_000);
+        assert_eq!(
+            policy.level(1_800_000_000, Level::Blocked, floor),
+            Level::LowSpace
+        );
+        assert_eq!(
+            policy.level(900_000_000, Level::Blocked, floor),
+            Level::LowSpace
+        );
+        assert_eq!(
+            policy.level(899_999_999, Level::LowSpace, floor),
+            Level::Blocked
+        );
+        let guard = Guard {
+            policy: None,
+            history: PathBuf::new(),
+            writers: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
+            value: Mutex::new((
+                Snapshot {
+                    enabled: true,
+                    level: Level::Blocked,
+                    workspace_available_bytes: Some(1_900_000_000),
+                    history_available_bytes: Some(1_800_000_000),
+                    reason: "disk_capacity",
+                    ..Snapshot::unavailable(true)
+                },
+                Instant::now(),
+            )),
+        };
+        guard.rescue();
+        assert_eq!(*guard.floor.lock().unwrap(), floor);
+    }
+
+    #[test]
     fn missing_or_stale_measurements_do_not_authorize_writes() {
         let guard = Guard {
             policy: None,
+            history: PathBuf::new(),
             writers: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
             value: Mutex::new((Snapshot::unavailable(true), Instant::now())),
         };
         assert!(guard.blocks());

@@ -43,10 +43,12 @@ class MixedHarnessTests(unittest.TestCase):
         self.send('pi','before-slow-restart','hello'); self.settled('pi','before-slow-restart')
         native = self.service.session('cr_pi')['native_id']
         self.service.stop()
-        (self.repo/'startup-delay').write_text('31')
+        # 2s RPC and 8s startup deadlines: this startup outlasts an ordinary RPC but not startup.
+        self.env.update(CLOUDROOM_TEST_RPC_TIMEOUT_MS='2000')
+        (self.repo/'startup-delay').write_text('4')
         self.start()
         self.send('pi','during-startup','hello')
-        until(lambda:self.service.session('cr_pi')['receipts']['during-startup']['state']=='completed','slow startup continuation',50)
+        until(lambda:self.service.session('cr_pi')['receipts']['during-startup']['state']=='completed','slow startup continuation',20)
         session = self.service.session('cr_pi')
         self.assertEqual(session['native_id'],native)
         self.assertEqual(session['queue'],[])
@@ -57,9 +59,10 @@ class MixedHarnessTests(unittest.TestCase):
     def test_startup_timeout_preserves_queue_until_explicit_retry(self):
         self.send('pi','original','hello'); self.settled('pi','original')
         native = self.service.session('cr_pi')['native_id']
+        self.env.update(CLOUDROOM_TEST_RPC_TIMEOUT_MS='2000')  # 8s startup deadline.
         self.service.stop(); (self.repo/'startup-delay').write_text('121'); self.start()
         self.send('pi','waiting','hello')
-        until(lambda:self.service.session('cr_pi').get('startup_error')=='startup_timeout','classified startup timeout',140)
+        until(lambda:self.service.session('cr_pi').get('startup_error')=='startup_timeout','classified startup timeout',30)
         self.assertEqual(self.service.session('cr_pi')['queue'],['waiting'])
         self.service.stop(); (self.repo/'startup-delay').unlink(); self.start()
         failed = self.service.session('cr_pi')
@@ -147,6 +150,7 @@ class MixedHarnessTests(unittest.TestCase):
         self.assertEqual(record['data']['request_id'], 'pi')
         record['data']['input']['reasoning'] = 'high'
         path.write_text(json.dumps(record))
+        (self.state / 'snapshot.json').unlink()  # Core trusts its snapshot over edited old records.
         self.start()
         until(lambda:self.service.session('cr_pi')['state']=='idle','Pi with selected thinking',10)
         self.assertEqual(self.service.session('cr_pi')['reasoning'], 'high')
@@ -264,6 +268,7 @@ class MixedHarnessTests(unittest.TestCase):
             record = json.loads(path.read_text())
             record['data']['input']['reasoning'] = 'high'
             path.write_text(json.dumps(record))
+        (self.state / 'snapshot.json').unlink()  # Core trusts its snapshot over edited old records.
         self.start()
         for kind in ['codex', 'pi']:
             until(lambda kind=kind: self.service.session('cr_'+kind)['state'] == 'idle' and self.service.session('cr_'+kind)['reasoning'] == 'high', 'launch '+kind, 10)

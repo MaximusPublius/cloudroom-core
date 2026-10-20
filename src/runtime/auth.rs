@@ -143,6 +143,8 @@ impl Adapter for Protocol {
 struct Rpc {
     process: Process,
     completed: watch::Receiver<Option<Value>>,
+    /// Ends once the app-server has exited.
+    exited: tokio::task::JoinHandle<()>,
 }
 impl Rpc {
     async fn open(config: &Config) -> io::Result<Self> {
@@ -153,7 +155,7 @@ impl Rpc {
         let (process, mut events) =
             Process::spawn(config, codex::command(config, profile), Box::new(Protocol))?;
         let (changed, completed) = watch::channel(None);
-        tokio::spawn(async move {
+        let exited = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
                     Event::Record {
@@ -168,14 +170,32 @@ impl Rpc {
                 }
             }
         });
-        let rpc = Self { process, completed };
-        rpc.call(
-            "initialize",
-            json!({"clientInfo":{"name":"cloudroom","version":env!("CARGO_PKG_VERSION")}}),
-        )
-        .await?;
-        rpc.process.notify("initialized").await?;
-        Ok(rpc)
+        let rpc = Self {
+            process,
+            completed,
+            exited,
+        };
+        let ready = async {
+            rpc.call(
+                "initialize",
+                json!({"clientInfo":{"name":"cloudroom","version":env!("CARGO_PKG_VERSION")}}),
+            )
+            .await?;
+            rpc.process.notify("initialized").await
+        }
+        .await;
+        match ready {
+            Ok(()) => Ok(rpc),
+            Err(error) => {
+                rpc.close().await;
+                Err(error)
+            }
+        }
+    }
+    /// Stops the app-server and waits for it to exit, so a quick service stop cannot leave it running.
+    async fn close(mut self) {
+        self.process.request_shutdown();
+        let _ = (&mut self.exited).await;
     }
     async fn call(&self, method: &str, params: Value) -> io::Result<Value> {
         self.process
@@ -304,7 +324,9 @@ impl CodexAuth {
             } else {
                 return state.status.clone();
             }
-            state.login = None;
+            if let Some(login) = state.login.take() {
+                login.rpc.close().await;
+            }
             state.checked = Some(Instant::now());
         } else if refresh
             || state
@@ -312,7 +334,11 @@ impl CodexAuth {
                 .is_none_or(|at| at.elapsed() > Duration::from_secs(15))
         {
             state.status = match Rpc::open(config).await {
-                Ok(rpc) => rpc.probe().await.unwrap_or_else(failure),
+                Ok(rpc) => {
+                    let status = rpc.probe().await.unwrap_or_else(failure);
+                    rpc.close().await;
+                    status
+                }
                 Err(error) => failure(error),
             };
             state.checked = Some(Instant::now());
@@ -430,7 +456,9 @@ impl CodexAuth {
                 .rpc
                 .call("account/login/cancel", json!({"loginId":login.native_id}))
                 .await;
-            state.login = None;
+            if let Some(login) = state.login.take() {
+                login.rpc.close().await;
+            }
             state.checked = None;
             state.status = Status::new(
                 "missing",
@@ -439,9 +467,17 @@ impl CodexAuth {
         }
         state.status.clone()
     }
-    pub fn shutdown(&self) {
+    /// Also waits for a pending sign-in's app-server to exit, so a quick service stop cannot leave it running.
+    pub async fn shutdown(&self) {
         if let Some(process) = self.process.lock().unwrap().take() {
             process.request_shutdown();
         }
+        let _ = tokio::time::timeout(super::SHUTDOWN_GRACE, async {
+            let login = self.state.lock().await.login.take();
+            if let Some(login) = login {
+                login.rpc.close().await;
+            }
+        })
+        .await;
     }
 }

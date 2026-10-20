@@ -5,7 +5,7 @@ export type Json =
   | string
   | Json[]
   | { [key: string]: Json };
-export type Harness = "codex" | "pi" | "cursor" | "claude-code" | "fx";
+export type Harness = "codex" | "pi" | "cursor" | "claude-code" | "fx" | "opencode";
 export type CodexAuthStatus = {
   state: "missing" | "waiting" | "connected" | "limited" | "unavailable" | "error" | "expired";
   email: string | null; plan: string | null; message: string | null;
@@ -15,8 +15,10 @@ export type TeleportFile = { path: string; size: number; sha256: string; kind: "
 export type TeleportManifest = {
   request_id: string; harness: Harness; native_id: string; model: string; provider: string | null; reasoning: string | null;
   workspace: string; workspace_name: string; files: TeleportFile[]; handoff: string;
-  service_tier?: string | null; command_guard_enabled?: boolean;
+  service_tier?: string | null; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string;
   queued: (string | { text: string; reasoning?: string; service_tier?: string })[];
+  /** A fork starts idle with no handoff; its first message is a `rewind` with `fork`. */
+  fork?: boolean;
 };
 export type TeleportStatus = {
   request_id: string; session_id: string | null; phase: "uploading" | "running" | "complete" | "cancelled";
@@ -207,6 +209,14 @@ function json(value: unknown): Json {
   return value as Json;
 }
 
+function attachAcceptance(value: Record<string, unknown>, sessionId: string, id: string): Acceptance {
+  const accepted = { session_id: text(value.session_id), receipt: receipt(value.receipt), saving: json(value.saving) };
+  if (accepted.session_id !== sessionId || accepted.receipt.request_id !== id || accepted.receipt.command !== "attach") {
+    throw new CloudroomError("Cloudroom acceptance does not match the command");
+  }
+  return accepted;
+}
+
 function receipt(value: unknown): Receipt {
   const item = object(value);
   return {
@@ -252,6 +262,9 @@ function sessionPath(id: string): string {
 }
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const STREAM_SILENCE_MS = 45_000;
+/** The most one upload request may carry: some sandbox proxies drop requests over about 8 MB. */
+export const UPLOAD_PART = 4 * 1024 * 1024;
 
 export class CloudroomClient {
   #base: string;
@@ -282,7 +295,7 @@ export class CloudroomClient {
       throw new CloudroomError("A core access token is required");
     }
     if (options.gateToken !== undefined && !/^[a-zA-Z0-9._~-]{1,4096}$/.test(options.gateToken)) {
-      throw new CloudroomError("Invalid Boat gate credential");
+      throw new CloudroomError("Invalid gate credential");
     }
     this.#base = url.href.replace(/\/$/, "");
     this.#token = options.token;
@@ -302,7 +315,7 @@ export class CloudroomClient {
   }
   async checkTeleport(check: TeleportCheck, signal?: AbortSignal): Promise<TeleportCheckResult> {
     // One real model request runs on the VM, so allow longer than ordinary commands.
-    return await this.#json("/v1/teleports/check", check, signal, undefined, 120_000) as unknown as TeleportCheckResult;
+    return await this.#json("/v1/teleports/check", check, signal, undefined, 202, 120_000) as unknown as TeleportCheckResult;
   }
   async teleportStatus(id: string): Promise<TeleportStatus> {
     return await this.#json(`/v1/teleports/${encodeURIComponent(id)}`) as unknown as TeleportStatus;
@@ -319,19 +332,23 @@ export class CloudroomClient {
     }) as unknown as TeleportStatus;
   }
 
-  /** Runs a shell command on the VM as its agent account (ADR 0113). No timeout: the caller decides. */
-  async runOnVm(input: VmRun, signal?: AbortSignal): Promise<VmRunResult> {
+  /** Runs a shell command on the VM as its agent account (ADR 0113). No timeout: the caller decides.
+   *  Raw `bytes` replace hex stdin, halving the upload; older cores answer 404. */
+  async runOnVm(input: VmRun, signal?: AbortSignal, bytes?: Uint8Array<ArrayBuffer>): Promise<VmRunResult> {
+    const raw = bytes ? `/raw?${new URLSearchParams({ command: input.command, ...(input.cwd ? { cwd: input.cwd } : {}) })}` : "";
     let response: Response;
     try {
-      response = await fetch(`${this.#base}/v1/vm/run`, {
+      response = await fetch(`${this.#base}/v1/vm/run${raw}`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.#token}`,
+          // Some sandbox proxies replace Authorization with their own login.
+          "X-Cloudroom-Token": this.#token,
           ...(this.#gateToken ? { Cookie: `_port_auth=${this.#gateToken}` } : {}),
           Accept: "application/json",
-          "Content-Type": "application/json",
+          "Content-Type": bytes ? "application/octet-stream" : "application/json",
         },
-        body: JSON.stringify(input),
+        body: bytes ?? JSON.stringify(input),
         redirect: "error",
         signal,
       });
@@ -357,6 +374,8 @@ export class CloudroomClient {
         method: body === undefined && !upload ? "GET" : "POST",
         headers: {
           Authorization: `Bearer ${this.#token}`,
+          // Some sandbox proxies replace Authorization with their own login.
+          "X-Cloudroom-Token": this.#token,
           ...(this.#gateToken ? { Cookie: `_port_auth=${this.#gateToken}` } : {}),
           Accept: path.includes("/stream?")
             ? "text/event-stream"
@@ -400,8 +419,8 @@ export class CloudroomClient {
     body?: Json,
     signal?: AbortSignal,
     upload?: Upload,
+    acceptedStatus = 202,
     timeoutMs = this.#timeoutMs,
-    successStatus?: number,
   ): Promise<Record<string, unknown>> {
     const timeout = AbortSignal.timeout(timeoutMs);
     const response = await this.#request(
@@ -410,7 +429,7 @@ export class CloudroomClient {
       signal ? AbortSignal.any([signal, timeout]) : timeout,
       upload,
     );
-    if (response.status !== (successStatus ?? 202) && (successStatus !== undefined || body !== undefined || upload)) {
+    if ((body !== undefined || upload) && response.status !== acceptedStatus) {
       await response.body?.cancel();
       throw new CloudroomError(
         "Cloudroom did not acknowledge command acceptance",
@@ -458,6 +477,7 @@ export class CloudroomClient {
     command: string,
     body: { request_id: string } & Record<string, Json>,
     sessionId?: string,
+    receiptId: string = body.request_id,
   ): Promise<Acceptance> {
     requestId(body.request_id);
     const value = await this.#json(path, body);
@@ -468,7 +488,7 @@ export class CloudroomClient {
     };
     if (
       (sessionId !== undefined && accepted.session_id !== sessionId) ||
-      accepted.receipt.request_id !== body.request_id ||
+      accepted.receipt.request_id !== receiptId ||
       accepted.receipt.command !== command
     ) {
       throw new CloudroomError(
@@ -503,7 +523,7 @@ export class CloudroomClient {
   }
 
   async claudeAuth(action?: "login" | "cancel" | "complete" | "token" | "key", id?: string, code?: string, state?: string, signal?: AbortSignal): Promise<CodexAuthStatus> {
-    const value = await this.#json(`/v1/accounts/claude${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "complete" ? { code, state } : {}), ...(action === "token" ? { token: code, ...(state ? { plan: state } : {}) } : {}), ...(action === "key" ? { api_key: code } : {}) } : undefined, signal, undefined, action === "key" ? 60_000 : undefined);
+    const value = await this.#json(`/v1/accounts/claude${action ? `/${action}` : ""}`, action ? { request_id: requestId(id ?? ""), ...(action === "complete" ? { code, state } : {}), ...(action === "token" ? { token: code, ...(state ? { plan: state } : {}) } : {}), ...(action === "key" ? { api_key: code } : {}) } : undefined, signal, undefined, 202, action === "key" ? 60_000 : undefined);
     if (!["missing", "waiting", "connected", "unavailable", "error", "expired"].includes(String(value.state))) throw new CloudroomError("Invalid Claude account status");
     const nullable = (key: string) => value[key] === null ? null : text(value[key]);
     const result = { state: value.state as CodexAuthStatus["state"], email: nullable("email"), plan: nullable("plan"), message: nullable("message"), login_id: nullable("login_id"), verification_url: nullable("verification_url"), user_code: nullable("user_code") };
@@ -516,7 +536,7 @@ export class CloudroomClient {
 
   /** Saves one Pi provider key on the VM. Returns provider names only, never secrets. */
   async piApiKey(provider: string, key: string, signal?: AbortSignal): Promise<{ providers: string[] }> {
-    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal, undefined, this.#timeoutMs, 200);
+    const value = await this.#json("/v1/accounts/pi/key", { provider, key }, signal, undefined, 200);
     if (!Array.isArray(value.providers) || !value.providers.every(name => typeof name === "string")) throw new CloudroomError("Invalid Pi account status");
     return { providers: value.providers };
   }
@@ -549,10 +569,12 @@ export class CloudroomClient {
     }
   }
 
-  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean } = {}) {
-    if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx")
+  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; prompt?: string; title?: string; fork?: { session: string; before?: string; last_turn_id?: string } } = {}) {
+    if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx" && harness !== "opencode")
       throw new CloudroomError("Unsupported Cloudroom harness");
-    return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
+    return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options },
+      options.parent_session !== undefined ? `cr_child_${id}` : undefined,
+      options.parent_session !== undefined ? `child_${id}` : id);
   }
 
   prompt(
@@ -636,7 +658,13 @@ export class CloudroomClient {
     return this.#command(`${sessionPath(sessionId)}/compact`, "compact", { request_id: id }, sessionId);
   }
 
-  rewind(sessionId: string, id: string, before?: string, lastTurnId?: string, replacement?: { request_id: string; text: string; content?: Json; attachments?: Json; reasoning?: string; service_tier?: string }) {
+  /** The user's goal control: pause or resume (`status`), replace the `objective`, or `clear`. */
+  goal(sessionId: string, id: string, goal: { status?: "active" | "paused"; objective?: string; clear?: boolean }) {
+    return this.#command(`${sessionPath(sessionId)}/goal`, "goal", { request_id: id, ...goal }, sessionId);
+  }
+
+  /** `fork` also gives a whole-conversation copy its own native identity, with no checkpoint. */
+  rewind(sessionId: string, id: string, before?: string, lastTurnId?: string, replacement?: { request_id: string; text: string; content?: Json; attachments?: Json; reasoning?: string; service_tier?: string }, fork = false) {
     return this.#command(
       `${sessionPath(sessionId)}/rewind`,
       "rewind",
@@ -645,6 +673,7 @@ export class CloudroomClient {
         ...(before ? { before } : {}),
         ...(lastTurnId ? { last_turn_id: lastTurnId } : {}),
         ...(replacement ? { replacement } : {}),
+        ...(fork ? { fork: true } : {}),
       },
       sessionId,
     );
@@ -669,15 +698,32 @@ export class CloudroomClient {
       signal,
       { ...upload, contentType: "application/octet-stream" },
     );
-    const accepted = {
-      session_id: text(value.session_id),
-      receipt: receipt(value.receipt),
-      saving: json(value.saving),
-    };
-    if (accepted.session_id !== sessionId || accepted.receipt.request_id !== id || accepted.receipt.command !== "attach") {
-      throw new CloudroomError("Cloudroom acceptance does not match the command");
-    }
-    return accepted;
+    return attachAcceptance(value, sessionId, id);
+  }
+
+  /** Sends an attachment in `UPLOAD_PART` pieces (core `upload_parts`); the last part returns the acceptance.
+   *  A retry resends every part: the core ignores parts it already has. */
+  async attachInParts(
+    sessionId: string,
+    id: string,
+    name: string,
+    kind: "image" | "file",
+    bytes: Uint8Array,
+    signal?: AbortSignal,
+  ): Promise<Acceptance> {
+    requestId(id);
+    if (bytes.length > 25 * 1024 * 1024) throw new CloudroomError("Attachment exceeds the size limit");
+    let offset = 0;
+    do {
+      const part = bytes.subarray(offset, offset + UPLOAD_PART);
+      const query = new URLSearchParams({ request_id: id, name, kind, offset: String(offset), total: String(bytes.length) });
+      const value = await this.#json(`${sessionPath(sessionId)}/attachments?${query}`, undefined, signal, {
+        body: new ReadableStream({ start(controller) { controller.enqueue(part); controller.close(); } }), length: part.length, contentType: "application/octet-stream",
+      });
+      if (value.receipt !== undefined) return attachAcceptance(value, sessionId, id);
+      offset += part.length;
+    } while (offset < bytes.length);
+    throw new CloudroomError("Cloudroom did not save the attachment");
   }
 
   interrupt(sessionId: string, id: string, targetRequestId: string) {
@@ -730,7 +776,7 @@ export class CloudroomClient {
     );
     if (
       value.session_id !== sessionId ||
-      (value.harness !== "codex" && value.harness !== "pi" && value.harness !== "cursor" && value.harness !== "claude-code" && value.harness !== "fx")
+      (value.harness !== "codex" && value.harness !== "pi" && value.harness !== "cursor" && value.harness !== "claude-code" && value.harness !== "fx" && value.harness !== "opencode")
     ) {
       throw new CloudroomError(
         "Cloudroom session mismatch or unsupported harness",
@@ -821,10 +867,14 @@ export class CloudroomClient {
       options.signal.throwIfAborted();
       await options.onConnected?.();
       while (true) {
-        const { done, value } = await reader.read().catch((error: unknown) => {
+        let silence: ReturnType<typeof setTimeout> | undefined;
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => { silence = setTimeout(() => reject(new Error("no data for 45 s")), STREAM_SILENCE_MS); }),
+        ]).catch((error: unknown) => {
           options.signal.throwIfAborted();
           throw new CloudroomConnectionError("Cloudroom event stream disconnected", error);
-        });
+        }).finally(() => clearTimeout(silence));
         if (done) return;
         buffer += decoder.decode(value, { stream: true });
         if (buffer.length + frameSize > MAX_RESPONSE_BYTES)

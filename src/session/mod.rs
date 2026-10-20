@@ -1,4 +1,5 @@
 mod children;
+pub use children::{ForkFrom, Spawn};
 mod outbox;
 pub mod teleport;
 pub use outbox::Journal;
@@ -7,6 +8,7 @@ mod catalog;
 mod guard;
 mod history;
 mod prompt;
+pub mod report;
 mod sleep;
 mod state;
 pub mod thread;
@@ -66,7 +68,7 @@ pub struct Receipt {
     pub error: Option<String>,
 }
 
-#[derive(Default, Clone, Serialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
     #[serde(default)]
@@ -84,6 +86,9 @@ pub struct Session {
     pub startup_error: Option<String>,
     /// The detailed reason recorded with `startup_error`, shown to users verbatim.
     pub startup_reason: Option<String>,
+    // Why the session failed or lost its process, with harness stderr, for `thread output`.
+    #[serde(skip)]
+    failure: Option<String>,
     #[serde(skip)]
     has_dispatched: bool,
     pub last_sequence: u64,
@@ -102,6 +107,9 @@ pub struct Session {
     pub checkpoint: Option<Value>,
     pub rewind_request: Option<String>,
     pub parent_session: Option<String>,
+    // Archived by `cloudroom thread archive`; `thread list` hides it unless asked.
+    #[serde(default)]
+    pub archived: bool,
     pub reasoning: Option<String>,
     pub workspace: Option<crate::workspace::Workspace>,
     #[serde(skip)]
@@ -131,6 +139,9 @@ pub struct Session {
     // The harness was asked to exit so this idle session can sleep.
     #[serde(skip)]
     releasing: bool,
+    // A child's latest completed replies by request, so a queued turn cannot hide them from its parent.
+    #[serde(skip)]
+    replies: Vec<(String, String)>,
 }
 
 impl Session {
@@ -159,6 +170,22 @@ impl Session {
             .find(|r| r.command == "start")
             .and_then(|r| r.input["command_guard_enabled"].as_bool())
             .unwrap_or(true)
+    }
+
+    fn strip_ai_co_authors(&self) -> bool {
+        self.receipts
+            .values()
+            .find(|r| r.command == "start")
+            .and_then(|r| r.input["strip_ai_co_authors"].as_bool())
+            .unwrap_or(true)
+    }
+
+    fn system_prompt(&self) -> Option<String> {
+        self.receipts
+            .values()
+            .find(|r| r.command == "start")
+            .and_then(|r| r.input["system_prompt"].as_str())
+            .map(str::to_owned)
     }
 
     fn resume(&self) -> Option<runtime::Resume> {
@@ -238,6 +265,8 @@ struct Local {
     database_available: bool,
     // Set by a drain before the sandbox stops; refuses new work until released.
     draining: bool,
+    // The journal position of the latest replay snapshot (or failed attempt).
+    snapshot_at: u64,
 }
 
 pub struct Manager {
@@ -249,6 +278,7 @@ pub struct Manager {
     pub(crate) workspaces: crate::workspace::Workspaces,
     pub(crate) sync: crate::sync::Sync,
     pub(crate) previews: Arc<crate::preview::Previews>,
+    pub(crate) terminals: runtime::terminal::Terminals,
     pub(crate) mac: crate::mac::Mac,
     pub(crate) secrets: crate::secrets::Secrets,
     codex_models: tokio::sync::Mutex<Option<(Instant, Vec<runtime::Model>)>>,
@@ -265,23 +295,7 @@ pub struct Manager {
 
 impl Manager {
     pub fn open(config: Config) -> io::Result<Arc<Self>> {
-        let journal = Journal::open(&config.state_dir)?;
-        let (changed, _) = watch::channel(journal.last());
-        let mut local = Local {
-            journal,
-            sessions: BTreeMap::new(),
-            sequences: BTreeMap::new(),
-            changed,
-            database_available: false,
-            draining: false,
-        };
-        for sequence in 1..=local.journal.last() {
-            let record: Record = serde_json::from_slice(&local.journal.read(sequence)?)?;
-            if record.sequence != sequence {
-                return Err(io::Error::other("journal sequence mismatch"));
-            }
-            local.apply(&record)?;
-        }
+        let mut local = Local::open(&config.state_dir)?;
         // Resume conversations, not uncertain actions. An interrupted resume attempt
         // is left failed instead of creating a service-restart recovery loop.
         for session in local.sessions.values().cloned().collect::<Vec<_>>() {
@@ -375,6 +389,7 @@ impl Manager {
                 }
             }
         }
+        local.save_snapshot();
         let workspaces = crate::workspace::Workspaces::open(&config)?;
         let sync = crate::sync::Sync::open(&config)?;
         let previews = crate::preview::Previews::open(&config)?;
@@ -394,6 +409,7 @@ impl Manager {
             sync,
             teleports: teleport::Transfers::default(),
             previews,
+            terminals: Default::default(),
             mac: crate::mac::Mac::default(),
             secrets: crate::secrets::Secrets::default(),
             codex_models: tokio::sync::Mutex::new(None),
@@ -616,15 +632,13 @@ impl Manager {
     ) -> Result<()> {
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
-                let models = self.model_catalog(kind).await?;
                 let selected = model.unwrap_or(&self.config.harnesses[&kind].model);
-                runtime::reasoning_levels(kind, &models, selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .contains(&reasoning)
+                self.reasoning_supported(kind, selected, reasoning).await?
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
                 runtime::PI_REASONING_LEVELS.contains(&reasoning)
             }
+            runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));
@@ -639,7 +653,12 @@ impl Manager {
         model: Option<String>,
         reasoning: Option<String>,
         (workspace, workspace_name): (Option<String>, Option<String>),
-        (provider, command_guard_enabled): (Option<String>, Option<bool>),
+        (provider, command_guard_enabled, strip_ai_co_authors, system_prompt): (
+            Option<String>,
+            Option<bool>,
+            Option<bool>,
+            Option<String>,
+        ),
     ) -> Result<(String, Receipt)> {
         let id = format!("cr_{request}");
         let kind = harness
@@ -659,6 +678,12 @@ impl Manager {
         };
         if command_guard_enabled == Some(false) {
             input["command_guard_enabled"] = json!(false);
+        }
+        if strip_ai_co_authors == Some(false) {
+            input["strip_ai_co_authors"] = json!(false);
+        }
+        if let Some(system_prompt) = &system_prompt {
+            input["system_prompt"] = json!(system_prompt);
         }
         if let Some(model) = &model {
             input["model"] = json!(model);
@@ -697,12 +722,30 @@ impl Manager {
         if self.config.harnesses.is_empty() {
             return Err(Error::Conflict("agent setup is incomplete"));
         }
+        // The history, login, and model checks run together; their results apply in this order.
+        let configured = self.config.harnesses.contains_key(&kind);
+        let (history, ready, supported) = tokio::join!(
+            self.history.summary(&id, Some(&request)),
+            async {
+                if configured {
+                    self.harness_ready(kind).await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                match &reasoning {
+                    Some(reasoning) if configured => {
+                        self.execution_supported(kind, model.as_ref(), reasoning)
+                            .await
+                    }
+                    _ => Ok(()),
+                }
+            },
+        );
         // Fresh-state retries must not recreate an externally saved session.
-        let (external, receipt) = self
-            .history
-            .summary(&id, Some(&request))
-            .await
-            .map_err(|e| Error::Storage(format!("history database: {e}")))?;
+        let (external, receipt) =
+            history.map_err(|e| Error::Storage(format!("history database: {e}")))?;
         if let Some(external) = external {
             if harness.is_some_and(|kind| kind != external.harness) {
                 return Err(Error::Conflict("request_id already has different content"));
@@ -714,14 +757,11 @@ impl Manager {
             }
             return Ok((id, receipt));
         }
-        if !self.config.harnesses.contains_key(&kind) {
+        if !configured {
             return Err(Error::Conflict("harness is not configured"));
         }
-        self.harness_ready(kind).await?;
-        if let Some(reasoning) = &reasoning {
-            self.execution_supported(kind, model.as_ref(), reasoning)
-                .await?;
-        }
+        ready?;
+        supported?;
         let workspace = match workspace {
             // Unregistered like legacy sessions, so no project folder is created.
             Some(id) if id == crate::workspace::ROOT => crate::workspace::Workspace {
@@ -807,6 +847,7 @@ impl Manager {
             let workspace = workspace.ok_or_else(|| io::Error::other("session workspace missing"))?;
             self.workspaces.ensure_directory(&workspace).await?;
             failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
+            let fork;
             let (handle, events) = {
                 let mut local = self.local.lock().unwrap();
                 if self.is_stopping() {
@@ -824,9 +865,17 @@ impl Manager {
                 config.repository = session.workspace.as_ref().ok_or_else(|| io::Error::other("session workspace missing"))?.path.canonicalize()?;
                 let (kind, reasoning) = (session.harness, session.reasoning.clone());
                 let command_guard_enabled = session.command_guard_enabled();
+                let strip_ai_co_authors = session.strip_ai_co_authors();
+                let system_prompt = session.system_prompt();
+                failure_reason = "The side chat's source conversation could not be copied";
+                fork = children::fork_history(&local, &id, &request)?;
+                failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
                 // Claim before spawning: a crash after this point must not repeat uncertain execution.
                 local.append(&id, "state", json!({"state":"starting"}), None)?;
-                let (handle, events) = runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled)?;
+                let (handle, events) = match &fork {
+                    Some(fork) => runtime::Handle::spawn_fork(&config, kind, fork, command_guard_enabled, strip_ai_co_authors, system_prompt)?,
+                    None => runtime::Handle::spawn_guarded(&config, kind, None, command_guard_enabled, strip_ai_co_authors, system_prompt)?,
+                };
                 let handle = handle.with_reasoning(reasoning);
                 let pid = handle.pid();
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
@@ -834,7 +883,10 @@ impl Manager {
                 (handle, events)
             };
             self.watch_events(id.clone(), handle.clone(), events);
-            let native = handle.start_session().await?;
+            let native = match &fork {
+                Some(fork) => handle.start_fork(fork).await?,
+                None => handle.start_session().await?,
+            };
             let mut local = self.local.lock().unwrap();
             self.remember_launch_reasoning(&mut local, &id, &handle)?;
             local.append(&id, "native_identity", handle.native_identity(&native)?, None)?;
@@ -918,6 +970,7 @@ impl Manager {
             Interrupt(runtime::Handle, String),
             Steer(runtime::Handle, String, String),
             Compact(runtime::Handle, String),
+            Goal(runtime::Handle, Value, String),
             Rewind(runtime::Handle, Value, String),
             Close(Option<runtime::Handle>),
             Resume,
@@ -940,8 +993,8 @@ impl Manager {
             if local.draining && !matches!(command, "interrupt" | "close" | "stop" | "cancel") {
                 return Err(Error::Conflict("service is draining"));
             }
-            if matches!(command, "compact" | "rewind") && session.state == "sleeping" {
-                self.schedule_resume(&mut local, id)?;
+            if matches!(command, "compact" | "rewind" | "goal") && session.state == "sleeping" {
+                self.schedule_resume(&mut local, id, false)?;
                 return Err(Error::Conflict(
                     "this thread was asleep and is waking up; try again in a few seconds",
                 ));
@@ -970,6 +1023,7 @@ impl Manager {
                     | "reorder"
                     | "steer"
                     | "compact"
+                    | "goal"
                     | "rewind"
                     | "attach"
             ) {
@@ -1038,9 +1092,6 @@ impl Manager {
                     }
                 }
             }
-            if command == "steer" && session.harness == runtime::Kind::Claude {
-                return Err(Error::Conflict("Claude live steering is not supported"));
-            }
             if command == "steer"
                 && (!session.ready
                     || handle.is_none()
@@ -1050,7 +1101,7 @@ impl Manager {
                     "steer target is no longer the active request",
                 ));
             }
-            if matches!(command, "compact" | "rewind" | "steer")
+            if matches!(command, "compact" | "rewind" | "steer" | "goal")
                 && session.capabilities[command] == false
             {
                 return Err(Error::Conflict("operation is unsupported by this harness"));
@@ -1070,6 +1121,11 @@ impl Manager {
                     return Err(Error::Conflict("harness is not ready for compaction"));
                 }
             }
+            if command == "goal" && (!session.ready || handle.is_none()) {
+                return Err(Error::Conflict(
+                    "the agent is starting; try again in a few seconds",
+                ));
+            }
             if command == "rewind" {
                 if local.sessions.values().any(|child| {
                     child.parent_session.as_deref() == Some(id)
@@ -1084,10 +1140,12 @@ impl Manager {
                         "wait for child agents before editing a message",
                     ));
                 }
-                if input["before"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-                    .is_none()
+                // A fork (a new Cloud thread from another's conversation) may copy the whole conversation.
+                if input["fork"] != true
+                    && input["before"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .is_none()
                     && input["last_turn_id"]
                         .as_str()
                         .filter(|id| !id.is_empty())
@@ -1168,7 +1226,7 @@ impl Manager {
                     Next::None
                 }
                 "resume" if retry_startup => {
-                    self.schedule_resume(&mut local, id)?;
+                    self.schedule_resume(&mut local, id, false)?;
                     Next::None
                 }
                 "resume" => {
@@ -1191,6 +1249,11 @@ impl Manager {
                     local.append(id, "state", json!({"state":"running"}), None)?;
                     Next::Compact(handle.expect("validated compact harness"), request.clone())
                 }
+                "goal" => Next::Goal(
+                    handle.expect("validated goal harness"),
+                    input,
+                    request.clone(),
+                ),
                 "rewind" => Next::Rewind(
                     handle.expect("validated rewind harness"),
                     input,
@@ -1227,6 +1290,28 @@ impl Manager {
                 self.clone().steer(id.to_owned(), request, target, handle)
             }
             Next::Compact(handle, request) => self.clone().compact(id.to_owned(), request, handle),
+            Next::Goal(handle, input, request) => {
+                let manager = self.clone();
+                let id = id.to_owned();
+                tokio::spawn(async move {
+                    let result = handle.goal(&input).await;
+                    let mut local = manager.local.lock().unwrap();
+                    if let Err(error) = &result
+                        && let Some(receipt) = local
+                            .sessions
+                            .get_mut(&id)
+                            .and_then(|session| session.receipts.get_mut(&request))
+                    {
+                        receipt.error = Some(error.to_string());
+                    }
+                    let state = if result.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
+                    let _ = local.finish_receipt(&id, &request, state);
+                });
+            }
             Next::Rewind(handle, input, request) => {
                 self.clone().rewind(id.to_owned(), request, input, handle)
             }
@@ -1320,6 +1405,11 @@ impl Manager {
                 .is_some_and(|current| current.same_process(&handle))
             {
                 return;
+            }
+            for warning in result.as_ref().map(Vec::as_slice).unwrap_or_default() {
+                let mut data = warning.clone();
+                data["request_id"] = json!(request);
+                let _ = local.append(&id, "prompt_warning", data, None);
             }
             if let Err(error) = &result
                 && let Some(receipt) = local
@@ -1640,7 +1730,7 @@ impl Manager {
             .collect();
         for id in ids {
             if local.sessions[&id].restores_awake(now) {
-                self.schedule_resume(&mut local, &id)
+                self.schedule_resume(&mut local, &id, false)
                     .map_err(|_| io::Error::other("cannot save recovery state"))?;
             } else if local.sessions[&id].state != "sleeping" {
                 local.append(&id, "state", json!({"state":"sleeping"}), None)?;
@@ -1654,13 +1744,25 @@ impl Manager {
                 });
             }
         }
+        self.watch_children(&local);
         Ok(())
     }
 
-    fn schedule_resume(self: &Arc<Self>, local: &mut Local, id: &str) -> Result<()> {
-        // Claim the attempt durably before spawning; a failed or interrupted attempt
+    fn schedule_resume(
+        self: &Arc<Self>,
+        local: &mut Local,
+        id: &str,
+        recovery: bool,
+    ) -> Result<()> {
+        // Claim a crash recovery durably before spawning; a failed or interrupted attempt
         // cannot trigger an endless restart loop. Completed turns rearm recovery.
-        local.append(id, "state", json!({"state":"resuming"}), None)?;
+        // Planned resumes (wake, restart, teleport) leave the one crash recovery unused.
+        local.append(
+            id,
+            "state",
+            json!({"state":"resuming","recovery":recovery}),
+            None,
+        )?;
         let (manager, id) = (self.clone(), id.to_owned());
         tokio::spawn(async move {
             manager.relaunch(id).await;
@@ -1740,6 +1842,8 @@ impl Manager {
                     kind,
                     Some(saved),
                     local.sessions[&id].command_guard_enabled(),
+                    local.sessions[&id].strip_ai_co_authors(),
+                    local.sessions[&id].system_prompt(),
                 )?;
                 local.sessions.get_mut(&id).unwrap().handle = Some(handle.clone());
                 local.append(&id, "harness", json!({"pid":handle.pid()}), None)?;
@@ -1926,7 +2030,31 @@ impl Manager {
             runtime::Event::Started {
                 request,
                 native_turn,
+                auto,
             } => {
+                let session = &local.sessions[id];
+                // A turn the harness began itself gets a receipt, so it can finish, stop and recover like a prompt.
+                if auto
+                    && session.ready
+                    && session.current_request.is_none()
+                    && session.close_request.is_none()
+                    && session.rewind_request.is_none()
+                    && !session.compacting
+                {
+                    let receipt = Receipt {
+                        request_id: request.clone(),
+                        command: "auto".into(),
+                        input: json!({}),
+                        state: "running".into(),
+                        model: None,
+                        provider: None,
+                        workspace: None,
+                        error: None,
+                    };
+                    let receipt = serde_json::to_value(receipt).map_err(io::Error::other)?;
+                    local.append(id, "receipt", receipt, None)?;
+                    self.begin_turn(&mut local, id, &request)?;
+                }
                 let session = &local.sessions[id];
                 if !session.ready || session.current_request.as_deref() != Some(&request) {
                     return Ok(());
@@ -1956,6 +2084,14 @@ impl Manager {
                     self.clone().snapshot_usage(id.to_owned(), handle.clone());
                     if let Some(request) = local.sessions[id].current_request.clone() {
                         local.finish_receipt_with(id, &request, &status, error)?;
+                        let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
+                        if status == "completed" && session.parent_session.is_some() {
+                            let text = handle.seen_text().chars().take(32768).collect();
+                            session.replies.push((request, text));
+                            session
+                                .replies
+                                .drain(..session.replies.len().saturating_sub(8));
+                        }
                     }
                     self.advance(&mut local, id, true);
                 }
@@ -2000,6 +2136,11 @@ impl Manager {
                     && ((session.ready && session.can_resume())
                         || (self.is_stopping() && restoring));
                 let recover = resumable && !self.is_stopping() && !session.recovery_attempted;
+                // Launch already recorded the real cause; stopping its harness must not hide it.
+                let failed = session
+                    .failure
+                    .clone()
+                    .filter(|_| session.state == "failed");
                 session.handle = None;
                 session.ready = false;
                 let request = session.current_request.clone();
@@ -2031,21 +2172,24 @@ impl Manager {
                 if cleaned_up {
                     local.append(id, "harness", json!({"pid":null}), None)?;
                 }
-                let lost = match &cause {
+                let lost = failed.clone().unwrap_or_else(|| match &cause {
                     Some(cause) => format!("{reason}: {cause} ({exit})"),
                     None => format!("{reason} ({exit})"),
-                };
+                });
                 let state = if expected && close.is_some() {
                     "closed"
                 } else if resumable && (self.is_stopping() || recover) {
                     "suspended"
+                } else if failed.is_some() {
+                    "failed"
                 } else {
                     "process_lost"
                 };
+                let lost_or_failed = matches!(state, "process_lost" | "failed");
                 local.append(
                     id,
                     "state",
-                    json!({"state":state,"reason":lost,"diagnostic_id":diagnostic_id,"stderr":(state == "process_lost" && !stderr.is_empty()).then_some(stderr)}),
+                    json!({"state":state,"reason":lost,"diagnostic_id":diagnostic_id,"stderr":(lost_or_failed && !stderr.is_empty()).then_some(stderr)}),
                     None,
                 )?;
                 if let Some(request) = close {
@@ -2059,7 +2203,7 @@ impl Manager {
                     local.fail_pending_because(id, Some(&lost))?;
                 }
                 if recover {
-                    self.schedule_resume(&mut local, id)?;
+                    self.schedule_resume(&mut local, id, true)?;
                 }
             }
         }
@@ -2067,7 +2211,7 @@ impl Manager {
     }
 
     pub async fn shutdown(&self) {
-        self.codex_auth.shutdown();
+        self.codex_auth.shutdown().await;
         self.claude_auth.shutdown().await;
         self.claude_login.shutdown().await;
         self.cursor_auth.shutdown().await;
@@ -2084,6 +2228,8 @@ impl Manager {
             for id in waiting {
                 let _ = local.append(&id, "state", json!({"state":"suspended"}), None);
             }
+            // Before the harness cleanup, which may outlast the deadline. Its few records replay next start.
+            local.save_snapshot();
             local.changed.send_replace(0);
             // Signal all harnesses together; their recorded Exited events confirm cleanup.
             for handle in local.sessions.values().filter_map(|s| s.handle.as_ref()) {

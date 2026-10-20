@@ -60,11 +60,11 @@ class ControlError(ValueError):
 OPENER = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
 
-def control(url, body, method, headers):
+def control(url, body, method, headers, timeout=5):
     request = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
                                      method=method, headers={**headers, 'Content-Type': 'application/json'})
     try:
-        with OPENER.open(request, timeout=5) as response:
+        with OPENER.open(request, timeout=timeout) as response:
             raw = response.read(256 * 1024 + 1)
             if len(raw) > 256 * 1024:
                 raise ValueError('Preview response is too large')
@@ -100,7 +100,8 @@ class Core:
             raise ValueError('Sign in to Cloudroom again')
         if gate is not None and (not gate or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~-' for c in gate)):
             raise ValueError('Invalid hosting credential')
-        self.headers = {'Authorization': 'Bearer ' + token, **({'Cookie': '_port_auth=' + gate} if gate else {})}
+        # Some sandbox proxies replace Authorization with their own login, so Core also reads X-Cloudroom-Token.
+        self.headers = {'Authorization': 'Bearer ' + token, 'X-Cloudroom-Token': token, **({'Cookie': '_port_auth=' + gate} if gate else {})}
         self.opener = OPENER
         # A sandbox gets a new token on every wake, so its tunnels and streams are rebuilt.
         self.key = (self.url, token)
@@ -116,11 +117,13 @@ class Core:
     def request(self, path, body=None, method=None):
         return self.fetch(self.url + '/v1/previews' + path, body, method, self.headers)
 
-    def fetch(self, url, body, method, headers):
-        return control(url, body, method, headers)
+    def fetch(self, url, body, method, headers, timeout=5):
+        return control(url, body, method, headers, timeout)
 
 
-AWAKE = {'at': 0.0, 'key': None, 'list': [], 'lock': threading.Lock()}
+AWAKE = {'at': 0.0, 'checked': 0.0, 'key': None, 'list': [], 'lock': threading.Lock()}
+# Every Mac asks the website once a minute; the app touches this file after a wake, so new sandboxes show up at once.
+AWAKE_SECONDS = 60
 
 
 def cores(config):
@@ -130,9 +133,13 @@ def cores(config):
     account, token = (connection.get('account') or {}).get('id'), connection.get('sandboxToken')
     if not account or not token:
         return found
+    woke = Path(config['connectionFile']).parent / 'cloudroom-preview' / 'woke'
     with AWAKE['lock']:
-        if AWAKE['key'] != (account, token) or time.monotonic() - AWAKE['at'] > 10:
-            AWAKE.update(at=time.monotonic(), key=(account, token))
+        nudged = False
+        with contextlib.suppress(OSError):
+            nudged = woke.stat().st_mtime > AWAKE['checked']
+        if AWAKE['key'] != (account, token) or nudged or time.monotonic() - AWAKE['at'] > AWAKE_SECONDS:
+            AWAKE.update(at=time.monotonic(), checked=time.time(), key=(account, token))
             try:
                 uuid.UUID(account)
                 credential = base64.b64encode((account + ':' + token).encode()).decode()
@@ -303,13 +310,20 @@ class Relay:
             threading.Thread(target=self.pipe, args=(client,), daemon=True).start()
 
     def open(self):
+        # Some sandbox proxies relay bytes only after a WebSocket handshake; cores before 0.1.35 know only cloudroom-tunnel.
+        try:
+            return self.connect('websocket')
+        except PermissionError:
+            return self.connect('cloudroom-tunnel')
+
+    def connect(self, protocol):
         url = urllib.parse.urlsplit(self.core.url)
         remote = socket.create_connection((url.hostname, url.port or (443 if url.scheme == 'https' else 80)), timeout=10)
         if url.scheme == 'https':
             remote = ssl.create_default_context().wrap_socket(remote, server_hostname=url.hostname)
         headers = ''.join(f'{key}: {value}\r\n' for key, value in self.core.headers.items())
         remote.sendall(f'GET /v1/previews/{self.port}/tunnel?device={self.device} HTTP/1.1\r\nHost: {url.netloc}\r\n'
-                       f'Connection: Upgrade\r\nUpgrade: cloudroom-tunnel\r\n{headers}\r\n'.encode())
+                       f'Connection: Upgrade\r\nUpgrade: {protocol}\r\n{headers}\r\n'.encode())
         head = b''
         while b'\r\n\r\n' not in head:
             chunk = remote.recv(4096)
@@ -317,6 +331,9 @@ class Relay:
                 raise OSError('Preview tunnel closed')
             head += chunk
         status, rest = head.split(b'\r\n', 1)[0].split(), head.split(b'\r\n\r\n', 1)[1]
+        if len(status) >= 2 and status[1] == b'400':
+            remote.close()
+            raise PermissionError('Preview tunnel protocol refused')
         if len(status) < 2 or status[1] != b'101':
             raise OSError('Preview tunnel refused')
         remote.settimeout(None)
@@ -452,16 +469,89 @@ def identity(folder):
 
 
 MAC_LIMIT = 16 * 1024 * 1024
+MAC_LEVELS = ('off', 'read-only', 'ask', 'full')
+# Read-only commands (ADR 0186): no file writes outside temp folders, no signals to other processes, and no tools that
+# drive apps or system settings. macOS also refuses setuid tools like ps and top here; pgrep and lsof still work.
+READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
+             '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null") (literal "/dev/zero")'
+             ' (literal "/dev/dtracehelper") (regex #"^/dev/tty") (regex #"^/dev/fd/"))'
+             '(deny signal (target others))'
+             '(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/usr/bin/shortcuts")'
+             ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))')
+ASK = '''on run argv
+activate
+display dialog (item 1 of argv) with title "Cloudroom" buttons {"Deny", "Allow for this thread", "Allow"} default button "Allow" cancel button "Deny" with icon caution giving up after 300
+return button returned of result
+end run'''
+# Hex characters per result request: some sandbox proxies drop requests over about 8 MB,
+# and each part must upload within MAC_POST_SECONDS on a slow home connection.
+MAC_PART = 1024 * 1024
+MAC_POST_SECONDS = 60
+
+
+def mac_level(config):
+    """Older setups stored on/off; on meant full access."""
+    value = config.get('macAccess')
+    return 'full' if value is True else value if value in MAC_LEVELS else 'off'
+
+
+def deliver(post, result):
+    """Large output travels in parts, then `done` carries the rest. A core without parts (HTTP 422) gets it whole."""
+    if len(result['stdout']) + len(result['stderr']) > MAC_PART:
+        try:
+            for name in ('stdout', 'stderr'):
+                for offset in range(0, len(result[name]), MAC_PART):
+                    post({'state': 'part', 'offset': offset, name: result[name][offset:offset + MAC_PART]})
+            result = {**result, 'stdout': '', 'stderr': ''}
+        except ControlError as error:
+            if error.code != 422:
+                raise
+    post(result)
 
 
 class MacJobs:
-    """Mac access (ADR 0113): run commands from the user's cloud agents as this user, only while enabled."""
+    """Mac access (ADR 0113, levels in ADR 0186): run commands from the user's cloud agents as this user, only while enabled."""
     def __init__(self, folder):
         self.folder, self.running, self.lock = folder, {}, threading.Lock()
+        # Ask first: one dialog at a time; thread grants are scoped to Core's authenticated session identity.
+        self.asking, self.trusted = threading.Lock(), set()
 
     def enabled(self):
         config = private_json(self.folder / 'config.json')
-        return config if config.get('macAccess') and not config.get('revoked') else None
+        return config if mac_level(config) != 'off' and not config.get('revoked') else None
+
+    def approve(self, core, job):
+        with self.asking:
+            session = job.get('session')
+            trust = (core.key, session) if session is not None else None
+            if trust is not None and trust in self.trusted:
+                return True
+            text = f"A cloud agent wants to change your Mac.\n\nFolder: {job.get('cwd') or '~'}\n\n{job['command'][:600]}"
+            process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                       start_new_session=True)
+            with self.lock:
+                self.running[job['id']] = process
+            answer = process.communicate()[0].strip()
+            with self.lock:
+                self.running.pop(job['id'], None)
+            if answer == 'Allow for this thread' and trust is not None:
+                self.trusted.add(trust)
+            return answer in ('Allow', 'Allow for this thread')
+
+    def refusal(self, core, job):
+        """Why this job may not run as asked, or None. Everything else that is not full access runs read-only."""
+        level = mac_level(self.enabled() or {})
+        if level == 'off':
+            return 'Mac access is off.'
+        if level == 'full' or not job.get('write') and sys.platform == 'darwin' and level in ('read-only', 'ask'):
+            return None
+        if sys.platform != 'darwin':
+            return 'Read-only and Ask first Mac access need macOS. The user can switch Mac access to Full in the Cloudroom sidebar.'
+        if level == 'read-only':
+            return 'Mac access is Read-only, so this command cannot change the Mac. The user can switch it to Ask first or Full in the Cloudroom sidebar.'
+        if level == 'ask' and self.approve(core, job):
+            return None
+        return 'The user did not approve this command on their Mac. Do not retry it unless they ask you to.'
 
     def serve(self):
         """One job stream per reachable core: the VM's, and each awake sandbox's while it stays awake."""
@@ -495,21 +585,33 @@ class MacJobs:
                             self.cancel(json.loads(line[5:])['id'])
                         elif line.startswith(':') and (not self.enabled() or core.key not in self.wanted):
                             break
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError) as error:
                 delay = min(delay * 2, 30)
+                # A new sandbox refuses this Mac until it pairs; pair here instead of backing off until the preview loop does.
+                if getattr(error, 'code', None) == 403:
+                    with contextlib.suppress(OSError, ValueError):
+                        core.request('/device', {'device': device, 'public_key': identity(self.folder)})
+                        delay = 1
             time.sleep(delay)
 
     def execute(self, core, device, job):
         def post(body):
-            core.fetch(core.url + '/v1/mac/results/' + urllib.parse.quote(job['id']), {'device': device, **body}, None, core.headers)
+            core.fetch(core.url + '/v1/mac/results/' + urllib.parse.quote(job['id']), {'device': device, **body}, None, core.headers,
+                       MAC_POST_SECONDS)
         with contextlib.suppress(OSError, ValueError):
             post({'state': 'running'})
         result = {'state': 'done', 'code': 127, 'stdout': '', 'stderr': '', 'truncated': False}
+        refused = self.refusal(core, job)
+        sandboxed = not refused and not job.get('write') and mac_level(self.enabled() or {}) != 'full'
+        shell = [pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh', '-lc', job['command']]
         try:
+            if refused:
+                raise PermissionError(refused)
             folder = Path.home() / os.path.expanduser(job.get('cwd') or '~')
-            process = subprocess.Popen([pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh', '-lc', job['command']], cwd=folder,
+            process = subprocess.Popen(['/usr/bin/sandbox-exec', '-p', READ_ONLY, *shell] if sandboxed else shell, cwd=folder,
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         except OSError as error:
+            result['code'] = 126 if refused else 127
             result['stderr'] = str(error).encode().hex()
         else:
             with self.lock:
@@ -531,13 +633,16 @@ class MacJobs:
                 thread.join(2)  # A background process may keep the pipe open.
             with self.lock:
                 self.running.pop(job['id'], None)
+            if sandboxed and result['code'] and b'not permitted' in output['stderr'].lower():
+                output['stderr'] += (b'\nCloudroom: Mac access is Read-only, so commands cannot change the Mac.\n' if mac_level(self.enabled() or {}) == 'read-only'
+                                     else b'\nCloudroom: this ran read-only. To change the Mac, rerun with `cloudroom mac run --write ...`; the user approves it first.\n')
             result['truncated'] = any(len(value) > MAC_LIMIT for value in output.values())
             result.update({name: bytes(value[:MAC_LIMIT]).hex() for name, value in output.items()})
         # The result survives disconnects: retry until the VM accepts it, forgets the job, or an hour passes.
         deadline = time.monotonic() + 3600
         while time.monotonic() < deadline:
             try:
-                post(result)
+                deliver(post, result)
                 return
             except ControlError as error:
                 if error.code in (403, 404, 409, 413):
@@ -590,7 +695,8 @@ def run(folder):
                     if denied:
                         raise denied
                     desired = {}
-                    for core in listed:
+                    # Sandboxes first, so a VM that turns this Mac away can't block their Mac access.
+                    for core in sorted(listed, key=lambda core: not core.sandbox):
                         try:
                             metadata = core.request('/device', {'device': config['device'], 'public_key': identity(folder)})
                             for entry in core.request('')['previews']:
@@ -688,6 +794,12 @@ def systemd(folder, label, stop):
     systemctl('enable', '--now', unit)
 
 
+# Runs the helper under the signed Cloudroom app, so macOS applies Cloudroom's Desktop/Documents/Downloads permission, not python3's.
+LAUNCHER = ("const e={...process.env};delete e.ELECTRON_RUN_AS_NODE;"
+            "const c=require('child_process').spawn(process.argv[1],process.argv.slice(2),{stdio:'inherit',env:e});"
+            "for(const s of['SIGTERM','SIGINT','SIGHUP'])process.on(s,()=>c.kill(s));c.on('exit',code=>process.exit(code??1))")
+
+
 def launch(folder, stop=False):
     if sys.platform.startswith('linux'):
         return systemd(folder, label(folder), stop)
@@ -713,28 +825,36 @@ def launch(folder, stop=False):
                         raise OSError('Previous preview helper is still shutting down')
                     time.sleep(.1)
         path.unlink(missing_ok=True); return
+    command = [sys.executable, '-B', '-E', '-s', str(folder / 'client.py'), 'run', str(folder)]
+    job = {'Label': name, 'ProgramArguments': command, 'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 5, 'ProcessType': 'Background'}
+    launcher = private_json(folder / 'config.json').get('launcher')
+    if launcher:
+        job.update(ProgramArguments=[launcher, '-e', LAUNCHER, *command], EnvironmentVariables={'ELECTRON_RUN_AS_NODE': '1'})
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('wb') as file:
-        plistlib.dump({'Label': name, 'ProgramArguments': [sys.executable, '-B', '-E', '-s', str(folder / 'client.py'), 'run', str(folder)],
-                      'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 5, 'ProcessType': 'Background'}, file)
+        plistlib.dump(job, file)
     subprocess.run(['launchctl', 'bootstrap', domain, str(path)], check=True, capture_output=True)
 
 
-def configure(folder, connection_file, activate, allow_private, mac_access=None):
+def configure(folder, connection_file, activate, allow_private, mac_access=None, launcher=None, restart=False):
     folder.mkdir(mode=0o700, parents=True, exist_ok=True); folder.chmod(0o700)
     connection = private_json(connection_file)
     # Sandbox-only accounts have no VM address; their cores come from the website while awake.
     binding = [(connection.get('url') or 'sandboxes').rstrip('/'), (connection.get('account') or {}).get('id')]
     old = private_json(folder / 'config.json') if (folder / 'config.json').exists() else None
-    if old and old['binding'] != binding:
-        raise ValueError('Preview setup belongs to another account/core; use a separate directory')
+    # The same account may move from its VM to sandboxes; another account never reuses this setup.
+    if old and old['binding'][1] != binding[1]:
+        raise ValueError('Preview setup belongs to another account; use a separate directory')
     source = Path(__file__).resolve()
     target = folder / 'client.py'
     allow_private = bool(allow_private if allow_private is not None else (old or {}).get('allowPrivateSsh', False))
-    mac_access = bool(mac_access if mac_access is not None else (old or {}).get('macAccess', False))
-    if (activate and old and old.get('connectionFile') == str(connection_file)
-            and old.get('allowPrivateSsh', False) == allow_private and old.get('macAccess', False) == mac_access
-            and target.is_file() and target.read_bytes() == source.read_bytes()):
+    mac_access = mac_access if mac_access is not None else mac_level(old or {})
+    # App updates replace these files; restart so macOS can still name the helper for Desktop/Documents/Downloads access.
+    # restart: each app launch also restarts the helper so newly granted Full Disk Access applies.
+    binary = [os.stat(path).st_ino for path in (launcher, sys.executable) if path]
+    if (activate and not restart and old and old['binding'] == binding and old.get('connectionFile') == str(connection_file)
+            and old.get('allowPrivateSsh', False) == allow_private and old.get('macAccess') == mac_access
+            and old.get('launcher') == launcher and old.get('binary') == binary and target.is_file() and target.read_bytes() == source.read_bytes()):
         check = ['systemctl', '--user', 'is-active', '--quiet', label(folder) + '.service'] if sys.platform.startswith('linux') else ['launchctl', 'print', f'gui/{os.getuid()}/' + label(folder)]
         active = subprocess.run(check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if active.returncode == 0:
@@ -745,7 +865,7 @@ def configure(folder, connection_file, activate, allow_private, mac_access=None)
         temporary = folder / 'client.pending'
         temporary.write_bytes(source.read_bytes()); temporary.chmod(0o600); temporary.replace(target)
     config = {'device': old['device'] if old else uuid.uuid4().hex, 'binding': binding, 'connectionFile': str(connection_file),
-              'allowPrivateSsh': allow_private, 'macAccess': mac_access}
+              'allowPrivateSsh': allow_private, 'macAccess': mac_access, 'launcher': launcher, 'binary': binary}
     save(folder / 'config.json', config)
     identity(folder)
     if activate:
@@ -760,14 +880,17 @@ def main():
     parser.add_argument('--connection', type=Path)
     parser.add_argument('--no-start', action='store_true')
     parser.add_argument('--allow-private-ssh', action='store_true', default=None, help='Explicitly allow a self-hosted private/loopback SSH address')
-    parser.add_argument('--mac-access', choices=['on', 'off'], help='Let cloud agents run commands on this Mac (ADR 0113)')
+    parser.add_argument('--mac-access', choices=['on', *MAC_LEVELS], help='How much cloud agents may do on this Mac (ADR 0113, 0186); on means full')
+    parser.add_argument('--launcher', type=Path, help='Signed Cloudroom executable that starts the macOS helper in Node mode')
+    parser.add_argument('--restart', action='store_true', help='Restart a running helper even if its setup is unchanged')
     args = parser.parse_args()
     folder = args.directory.expanduser().resolve()
     if args.command == 'configure':
         if args.connection is None:
             raise ValueError('--connection is required')
         print(json.dumps(configure(folder, args.connection.expanduser().resolve(strict=True), not args.no_start, args.allow_private_ssh,
-                                   None if args.mac_access is None else args.mac_access == 'on')))
+                                   'full' if args.mac_access == 'on' else args.mac_access,
+                                   str(args.launcher.resolve(strict=True)) if args.launcher else None, args.restart)))
     elif args.command == 'run':
         run(folder)
     elif args.command in {'stop', 'pause'}:
@@ -778,11 +901,9 @@ def main():
             return
         config = private_json(folder / 'config.json')
         if not config.get('revoked', False):
+            # Best effort: a sleeping sandbox or an archived VM must never block sign-out.
             for core in cores(config):
-                if core.sandbox:
-                    with contextlib.suppress(OSError, ValueError):
-                        core.request('/device/' + config['device'], method='DELETE')
-                else:
+                with contextlib.suppress(OSError, ValueError):
                     core.request('/device/' + config['device'], method='DELETE')
             config['revoked'] = True
             save(folder / 'config.json', config)

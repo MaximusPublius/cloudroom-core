@@ -7,7 +7,7 @@ description: 'Show a web app running in a Cloudroom cloud thread through the use
 
 1. Start the HTTP development server on IPv4 loopback (`127.0.0.1`) as the normal agent user. Keep its process running. Do not install packages just to expose it.
 2. Run `cloudroom preview PORT` with its actual port.
-3. Only when the JSON says `state: ready`, post the returned `url` as a Markdown link. Do not guess a localhost port, open the browser automatically, or use BB Connect/Boat public hosting.
+3. Only when the JSON says `state: ready`, post the returned `url` as a Markdown link. Do not guess a localhost port, open the browser automatically, or use BB Connect or other public hosting.
 4. If pending, explain that the paired Mac must be connected; use `cloudroom preview status PORT` to check again. A failed or pending preview does not stop cloud work.
 5. `cloudroom preview close PORT` closes forwarding, not the app. Stop the app separately only when requested.
 

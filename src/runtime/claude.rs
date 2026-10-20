@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::process::Command;
 
-const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Delegate work with mcp__cloudroom__delegate; each child has its own Cloudroom session and saved history. Do not use native subagents, workflows, or agent teams. Messages are queued; live steering and Fast mode are unavailable. Rewinding changes conversation history only, never files.";
+const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Start child threads with `cloudroom thread spawn` (any harness and model; see `cloudroom thread --help`); each runs in this sandbox, shows under this thread, and Cloudroom messages you when it finishes. Do not use native subagents, workflows, or agent teams. Fast mode is unavailable. Rewinding changes conversation history only, never files.";
 
 fn uuid() -> io::Result<String> {
     let mut bytes = [0u8; 16];
@@ -34,6 +34,8 @@ pub(super) fn command(
     saved: Option<&Resume>,
     fork: Option<&str>,
     guarded: bool,
+    strip_ai_co_authors: bool,
+    system_prompt: Option<&str>,
 ) -> io::Result<(Command, String)> {
     let id = match saved.filter(|_| fork.is_none()) {
         Some(saved) => saved.id.clone(),
@@ -69,7 +71,9 @@ pub(super) fn command(
             "--model",
             &profile.model,
             "--append-system-prompt",
-            INSTRUCTIONS,
+            &system_prompt.map_or(INSTRUCTIONS.to_owned(), |p| {
+                format!("{INSTRUCTIONS}\n\n{p}")
+            }),
         ])
         .args([
             "--disallowedTools",
@@ -79,16 +83,17 @@ pub(super) fn command(
             "--mcp-config",
             r#"{"mcpServers":{"cloudroom":{"type":"sdk","name":"cloudroom"}}}"#,
         ]);
+    if strip_ai_co_authors {
+        command.args(["--settings", r#"{"attribution":{"commit":"","pr":""}}"#]);
+    }
     if let Some(saved) = saved {
         command.arg("--resume").arg(&saved.id);
         if let Some(before) = fork {
-            command.args([
-                "--fork-session",
-                "--session-id",
-                &id,
-                "--resume-session-at",
-                before,
-            ]);
+            command.args(["--fork-session", "--session-id", &id]);
+            // An empty checkpoint forks the whole conversation (a Cloud fork from its last message).
+            if !before.is_empty() {
+                command.args(["--resume-session-at", before]);
+            }
         }
     } else {
         command.args(["--session-id", &id]);
@@ -142,6 +147,16 @@ pub(super) async fn auth_ready(config: &Config) -> io::Result<bool> {
 /// One tiny real request with the exact model and effort. `auth status` can report
 /// "logged in" for a token Anthropic rejects, so Teleport verifies with inference.
 pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>) -> io::Result<()> {
+    probe_with_key(config, model, reasoning, None).await
+}
+
+/// Candidate credentials are passed only to this probe, never published to the saved profile.
+pub(super) async fn probe_with_key(
+    config: &Config,
+    model: &str,
+    reasoning: Option<&str>,
+    key: Option<&str>,
+) -> io::Result<()> {
     // The prompt goes first: `--tools` takes a list and would swallow a trailing prompt.
     let mut args = vec![
         "-p",
@@ -157,7 +172,9 @@ pub(super) async fn probe(config: &Config, model: &str, reasoning: Option<&str>)
     if let Some(effort) = reasoning.filter(|effort| *effort != "none") {
         args.extend(["--effort", effort]);
     }
-    let (_, value) = run_json(config, &args, 40).await?;
+    let (_, bytes) = run_output_with_key(config, &args, 40, key).await?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::other("Claude returned an unreadable response"))?;
     if value["is_error"] == false {
         return Ok(());
     }
@@ -185,6 +202,15 @@ pub(super) async fn run_output(
     args: &[&str],
     seconds: u64,
 ) -> io::Result<(Option<i32>, Vec<u8>)> {
+    run_output_with_key(config, args, seconds, None).await
+}
+
+async fn run_output_with_key(
+    config: &Config,
+    args: &[&str],
+    seconds: u64,
+    key: Option<&str>,
+) -> io::Result<(Option<i32>, Vec<u8>)> {
     use tokio::io::AsyncReadExt;
     let profile = config
         .harnesses
@@ -192,12 +218,17 @@ pub(super) async fn run_output(
         .ok_or_else(|| io::Error::other("Claude is not configured"))?;
     let mut command = super::command(&profile.binary, config);
     profile_env(&mut command, config, profile);
+    if let Some(key) = key {
+        command.env("ANTHROPIC_API_KEY", key);
+        command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+        command.env_remove("CLAUDE_CODE_SUBSCRIPTION_TYPE");
+    }
     command.args(args).stderr(std::process::Stdio::null());
     let group = config
         .storage
         .as_ref()
         .map(|policy| {
-            let group = super::linux::Workload::create(&policy.cgroup_root)?;
+            let group = super::linux::Workload::create(policy)?;
             group.attach(&mut command, policy)?;
             Ok::<_, io::Error>(group)
         })
@@ -287,7 +318,7 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     handle
         .call(
             "bootstrap",
-            json!({"text":"Cloudroom session initialized. No user task has been submitted yet."}),
+            json!({"text":"Automatic Cloudroom note: this session has started or resumed. Messages after this note come from the user."}),
         )
         .await?;
     let id = handle.native()?;
@@ -303,7 +334,8 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     Ok(id)
 }
 
-pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<()> {
+/// Returns a warning for each selected skill that could not load.
+pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<Vec<Value>> {
     let text = input["text"].as_str().unwrap_or_default();
     if text.split_whitespace().next() == Some("/fast") {
         return Err(io::Error::new(
@@ -313,9 +345,10 @@ pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::R
     }
     let reader = handle.clone();
     let payload = input.clone();
-    let text = tokio::task::spawn_blocking(move || super::claude_skills::expand(&reader, &payload))
-        .await
-        .map_err(io::Error::other)??;
+    let (text, warnings) =
+        tokio::task::spawn_blocking(move || super::claude_skills::expand(&reader, &payload))
+            .await
+            .map_err(io::Error::other)??;
     let mut settings = json!({"fastMode":false,"effortLevel":null});
     if let Some(reasoning) = input["reasoning"].as_str().or(handle.reasoning.as_deref()) {
         settings["effortLevel"] = if reasoning == "none" {
@@ -372,7 +405,7 @@ pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::R
         .process
         .call("prompt", json!({"content":content}), Some(request))
         .await?;
-    Ok(())
+    Ok(warnings)
 }
 
 pub(super) async fn compact(handle: &Handle) -> io::Result<()> {
@@ -382,6 +415,19 @@ pub(super) async fn compact(handle: &Handle) -> io::Result<()> {
 
 pub(super) async fn notice(handle: &Handle, text: &str) -> io::Result<()> {
     handle.call("notice", json!({"text":text})).await?;
+    Ok(())
+}
+
+/// A message sent mid-turn, which Claude reads at its next step, as Local's Claude steering does.
+pub(super) async fn steer(handle: &Handle, request: &str, text: &str) -> io::Result<()> {
+    handle
+        .process
+        .control(
+            "steer",
+            json!({"content":[{"type":"text","text":text}]}),
+            request,
+        )
+        .await?;
     Ok(())
 }
 
@@ -459,11 +505,42 @@ pub(super) fn validate(
     Err(io::Error::other("Claude transcript identity is missing"))
 }
 
+/// Fork the whole conversation, through the native fork flag.
+pub(super) fn fork_tip(handle: &Handle) -> io::Result<(Resume, String)> {
+    let id = handle.native()?;
+    let path = transcript(&handle.profile, &id)?;
+    validate(&handle.profile, &path, &id, handle.file_identity)?;
+    Ok((resume(handle, id, path), String::new()))
+}
+
+fn resume(handle: &Handle, id: String, path: PathBuf) -> Resume {
+    Resume {
+        id,
+        path,
+        cursor: Value::Null,
+        model: Some(handle.profile.model.clone()),
+        provider: handle.profile.provider.clone(),
+        reasoning: handle.reasoning.clone(),
+    }
+}
+
 /// Fork just before a user checkpoint, through the native resume/fork flags.
 pub(super) fn fork_source(handle: &Handle, before: &str) -> io::Result<(Resume, String)> {
     let id = handle.native()?;
     let path = transcript(&handle.profile, &id)?;
-    let file = validate(&handle.profile, &path, &id, handle.file_identity)?;
+    let saved = resume(handle, id, path);
+    let parent = checkpoint_parent(&handle.profile, &saved, before, handle.file_identity)?;
+    Ok((saved, parent))
+}
+
+/// The message a fork of `saved` resumes at: the saved parent of user message `before`.
+pub(super) fn checkpoint_parent(
+    profile: &HarnessConfig,
+    saved: &Resume,
+    before: &str,
+    identity: files::Identity,
+) -> io::Result<String> {
+    let file = validate(profile, &saved.path, &saved.id, identity)?;
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(0))?;
     loop {
@@ -485,17 +562,7 @@ pub(super) fn fork_source(handle: &Handle, before: &str) -> io::Result<(Resume, 
                     "Claude checkpoint has no saved parent",
                 )
             })?;
-            return Ok((
-                Resume {
-                    id,
-                    path,
-                    cursor: Value::Null,
-                    model: Some(handle.profile.model.clone()),
-                    provider: handle.profile.provider.clone(),
-                    reasoning: handle.reasoning.clone(),
-                },
-                parent.into(),
-            ));
+            return Ok(parent.into());
         }
     }
     Err(io::Error::new(
@@ -635,7 +702,7 @@ impl Protocol {
 
 impl Adapter for Protocol {
     fn validate(&self, method: &str, params: &Value) -> io::Result<()> {
-        if method == "prompt" {
+        if matches!(method, "prompt" | "steer") {
             let frame = json!({"type":"user","uuid":self.input_namespace,"session_id":self.native,"parent_tool_use_id":null,"message":{"role":"user","content":params["content"]},"isSynthetic":false,"shouldQuery":true});
             if serde_json::to_vec(&frame)?.len() + 1 > MAX_LINE {
                 return Err(io::Error::new(
@@ -647,7 +714,10 @@ impl Adapter for Protocol {
         Ok(())
     }
     fn encode(&mut self, id: u64, method: &str, params: Value, request: Option<&str>) -> Value {
-        if matches!(method, "prompt" | "bootstrap" | "notice" | "compact") {
+        if matches!(
+            method,
+            "prompt" | "steer" | "bootstrap" | "notice" | "compact"
+        ) {
             let wire = format!("{}{:012x}", &self.input_namespace[..24], id);
             self.users.insert(
                 wire.clone(),
@@ -714,7 +784,7 @@ impl Adapter for Protocol {
                 .as_str()
                 .ok_or_else(|| io::Error::other("missing Claude control identity"))?;
             let response = if value["request"]["subtype"] == "hook_callback" {
-                json!({"continue":false,"stopReason":"Native Claude subagents are disabled. Use mcp__cloudroom__delegate for a managed child session."})
+                json!({"continue":false,"stopReason":"Native Claude subagents are disabled. Start a managed child thread with `cloudroom thread spawn`."})
             } else {
                 json!({"behavior":"deny","message":"Interactive requests are unsupported. Ask the user in ordinary chat."})
             };
@@ -808,8 +878,29 @@ impl Adapter for Protocol {
             self.compacted = true;
             self.context = value["compact_metadata"]["post_tokens"].as_u64();
         }
+        // Claude starts its own turn when a background task or wakeup fires. Track it like a prompt.
+        if self.active.is_none()
+            && kind == "stream_event"
+            && value["event"]["type"] == "message_start"
+            && !self.users.values().any(|call| call.kind == "compact")
+        {
+            let request = format!("auto_{}", uuid()?);
+            self.active = Some((String::new(), request.clone()));
+            self.interrupting = false;
+            self.streamed.clear();
+            self.tools.clear();
+            *state = Progress {
+                native: state.native.clone(),
+                model: state.model.clone(),
+                request: Some(request),
+                auto: true,
+                ..Progress::default()
+            };
+            events.extend(state.started());
+        }
         let request = self.active.as_ref().map(|(_, id)| id.clone());
         let mut data = json!({"harness":"claude-code","type":kind,"request_id":request});
+        let mut keep = true;
         let event_kind = if kind == "stream_event" {
             let event = &value["event"];
             let index = event["index"].as_u64().unwrap_or(0);
@@ -865,7 +956,12 @@ impl Adapter for Protocol {
                     match event["delta"]["type"].as_str() {
                         Some("text_delta") => "text_delta",
                         Some("thinking_delta") => "thinking_delta",
-                        _ => "native_event",
+                        // Tool input arrives a few characters per frame, and `item_started` saves it whole.
+                        // Saving each piece made most of a busy sandbox's history.
+                        _ => {
+                            keep = false;
+                            "native_event"
+                        }
                     }
                 }
                 Some("content_block_stop") => {
@@ -963,6 +1059,11 @@ impl Adapter for Protocol {
                 .filter_map(Value::as_str)
                 .chain(value["user_message_uuid"].as_str())
                 .collect();
+            // A steer that missed its turn runs as Claude's own turn, so it does not claim it.
+            let auto = self.active.as_ref().is_some_and(|(id, _)| id.is_empty())
+                && !ids
+                    .iter()
+                    .any(|id| self.users.get(*id).is_some_and(|call| call.kind != "steer"));
             for id in &ids {
                 if let Some(call) = self.users.remove(*id) {
                     if call.kind == "bootstrap" {
@@ -986,10 +1087,11 @@ impl Adapter for Protocol {
                     }
                 }
             }
-            if self
-                .active
-                .as_ref()
-                .is_some_and(|(id, _)| ids.contains(id.as_str()))
+            if auto
+                || self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(id, _)| ids.contains(id.as_str()))
             {
                 state.last_usage = usage(value, self.context);
                 data["usage"] = state.last_usage.clone();
@@ -1014,14 +1116,16 @@ impl Adapter for Protocol {
                 self.children.clear();
             }
         }
-        events.insert(
-            0,
-            Event::Record {
-                kind: event_kind,
-                data,
-                native: Some(raw),
-            },
-        );
+        if keep {
+            events.insert(
+                0,
+                Event::Record {
+                    kind: event_kind,
+                    data,
+                    native: Some(raw),
+                },
+            );
+        }
         Ok(events)
     }
     fn response(&self, _: &Value) -> Option<(u64, io::Result<Value>)> {

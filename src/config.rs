@@ -1,6 +1,6 @@
 use crate::runtime::Kind;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, io, net::SocketAddr, path::PathBuf};
+use std::{collections::BTreeMap, env, io, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HarnessConfig {
@@ -25,6 +25,10 @@ pub struct Config {
     pub default_harness: Kind,
     pub harnesses: BTreeMap<Kind, HarnessConfig>,
     pub storage: Option<crate::workspace::storage::Policy>,
+    /// Harness RPC deadline; startup allows four times as long.
+    pub rpc_timeout: Duration,
+    /// How often diagnostics reach PostgreSQL. Long, so idle cores don't hold a shared database connection.
+    pub diagnostic_upload: Duration,
 }
 
 impl Config {
@@ -62,12 +66,21 @@ impl Config {
                 required("CLOUDROOM_STORAGE_POLICY")?,
             ))?)
         };
+        // Unprotected tests shorten harness deadlines instead of waiting out the real ones.
+        let rpc_timeout = match env::var("CLOUDROOM_TEST_RPC_TIMEOUT_MS") {
+            Ok(ms) if unprotected_test_mode => Duration::from_millis(
+                ms.parse()
+                    .map_err(|_| io::Error::other("invalid CLOUDROOM_TEST_RPC_TIMEOUT_MS"))?,
+            ),
+            _ => Duration::from_secs(30),
+        };
         let default_harness = match env::var("CLOUDROOM_HARNESS").as_deref().unwrap_or("codex") {
             "codex" => Kind::Codex,
             "pi" => Kind::Pi,
             "cursor" => Kind::Cursor,
             "claude-code" => Kind::Claude,
             "fx" => Kind::Fx,
+            "opencode" => Kind::OpenCode,
             _ => return Err(io::Error::other("unsupported CLOUDROOM_HARNESS")),
         };
         let account_home: PathBuf = required("CLOUDROOM_ACCOUNT_HOME")?.into();
@@ -147,8 +160,29 @@ impl Config {
                 },
             );
         }
+        let opencode = [
+            account_home.join(".local/bin/opencode"),
+            PathBuf::from("/usr/local/bin/opencode"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        let opencode_home = account_home.join(".local/share/opencode");
+        if let Some(binary) = opencode.filter(|_| opencode_home.is_dir()) {
+            harnesses.insert(
+                Kind::OpenCode,
+                HarnessConfig {
+                    binary,
+                    home: opencode_home,
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
+        }
         Ok(Self {
             storage,
+            rpc_timeout,
+            // Unprotected tests check the database within seconds.
+            diagnostic_upload: Duration::from_secs(if unprotected_test_mode { 1 } else { 300 }),
             default_harness,
             harnesses,
             listen,
@@ -188,4 +222,11 @@ fn required(name: &str) -> io::Result<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| io::Error::other(format!("{name} is required")))
+}
+
+/// Validate the launcher now, but retain its final symlink so native version switches
+/// are observed by every subsequent invocation. Anchor relative paths before cwd changes.
+pub(crate) fn launcher_path(path: &std::path::Path) -> io::Result<PathBuf> {
+    path.canonicalize()?;
+    std::path::absolute(path)
 }

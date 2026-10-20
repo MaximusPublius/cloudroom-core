@@ -9,6 +9,7 @@ import signal
 import stat
 import sys
 import tempfile
+import time
 import uuid
 
 CHUNK = 64 * 1024
@@ -44,7 +45,16 @@ def capture(root, session_id):
     signal.alarm(30)
     directory = session_directory(root, session_id)
     regular('meta.json')
-    metadata = json.loads(Path('meta.json').read_bytes())
+    # Cursor rewrites meta.json in place (truncate, then write). Retry a torn read.
+    for attempt in range(20):
+        meta = Path('meta.json').read_bytes()
+        try:
+            metadata = json.loads(meta)
+            break
+        except ValueError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
     if metadata.get('schemaVersion') != 1 or not isinstance(metadata.get('cwd'), str):
         raise ValueError('unsupported Cursor metadata')
     snapshot = str(uuid.uuid4())
@@ -59,7 +69,9 @@ def capture(root, session_id):
         index += 1
 
     with tempfile.TemporaryDirectory(prefix='.cloudroom-snapshot-', dir=directory) as temporary:
-        files = [('meta.json', directory / 'meta.json')]
+        # Emit the bytes validated above, not a second read that can be torn.
+        (Path(temporary) / 'meta.json').write_bytes(meta)
+        files = [('meta.json', Path(temporary) / 'meta.json')]
         if Path('store.db').exists():
             regular('store.db')
             for name in ['store.db-wal', 'store.db-shm']:

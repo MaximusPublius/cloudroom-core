@@ -4,6 +4,7 @@ import contextlib
 from http.server import BaseHTTPRequestHandler
 import http.client
 import importlib.util
+import json
 from pathlib import Path
 import socketserver
 import tempfile
@@ -11,6 +12,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('preview', Path(__file__).parents[1] / 'src/preview/client.py')
 preview = importlib.util.module_from_spec(spec)
@@ -109,6 +111,59 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(self.request()[2], b'ok')
             self.assertLess(time.monotonic() - started, 2)
             self.assertEqual(slow.result()[0], 405)
+
+    def test_mac_thread_approval_is_scoped_to_authenticated_session(self):
+        jobs = preview.MacJobs(Path(self.directory.name))
+        core = SimpleNamespace(key='core')
+        answers = [b'Allow for this thread\n', b'Deny\n']
+
+        def process(*_args, **_kwargs):
+            answer = answers.pop(0).decode()
+            return SimpleNamespace(communicate=lambda: (answer, ''))
+
+        with mock.patch.object(preview.subprocess, 'Popen', side_effect=process) as popen:
+            first = {'id': 'one', 'session': 'thread-a', 'command': 'touch one'}
+            same = {'id': 'two', 'session': 'thread-a', 'command': 'touch two'}
+            other = {'id': 'three', 'session': 'thread-b', 'command': 'touch three'}
+            self.assertTrue(jobs.approve(core, first))
+            self.assertTrue(jobs.approve(core, same))
+            self.assertFalse(jobs.approve(core, other))
+            self.assertEqual(popen.call_count, 2)
+
+    def test_mac_approval_without_session_is_not_cached(self):
+        jobs = preview.MacJobs(Path(self.directory.name))
+        core = SimpleNamespace(key='core')
+        answers = [b'Allow for this thread\n', b'Deny\n']
+
+        def process(*_args, **_kwargs):
+            answer = answers.pop(0).decode()
+            return SimpleNamespace(communicate=lambda: (answer, ''))
+
+        with mock.patch.object(preview.subprocess, 'Popen', side_effect=process) as popen:
+            job = {'id': 'legacy', 'command': 'touch legacy'}
+            self.assertTrue(jobs.approve(core, job))
+            self.assertFalse(jobs.approve(core, job))
+            self.assertEqual(jobs.trusted, set())
+            self.assertEqual(popen.call_count, 2)
+
+    def test_mac_job_without_session_posts_terminal_result(self):
+        folder = Path(self.directory.name)
+        (folder / 'config.json').write_text(json.dumps({'macAccess': 'ask'}))
+        (folder / 'config.json').chmod(0o600)
+        jobs = preview.MacJobs(folder)
+        posted = []
+        core = SimpleNamespace(
+            key='core', url='https://core.example', headers={},
+            fetch=lambda _url, body, *_args: posted.append(body),
+        )
+        dialog = SimpleNamespace(communicate=lambda: ('Deny\n', ''))
+
+        with mock.patch.object(preview.sys, 'platform', 'darwin'), \
+             mock.patch.object(preview.subprocess, 'Popen', return_value=dialog):
+            jobs.execute(core, 'device', {'id': 'legacy', 'command': 'touch legacy', 'write': True})
+
+        self.assertEqual([result['state'] for result in posted], ['running', 'done'])
+        self.assertEqual(posted[-1]['code'], 126)
 
 
 if __name__ == '__main__':

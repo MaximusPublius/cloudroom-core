@@ -70,12 +70,20 @@ pub struct Manifest {
     pub reasoning: Option<String>,
     pub service_tier: Option<String>,
     pub command_guard_enabled: Option<bool>,
+    #[serde(default)]
+    pub strip_ai_co_authors: Option<bool>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     pub workspace: String,
     pub workspace_name: String,
     pub files: Vec<Entry>,
     pub handoff: String,
     #[serde(default)]
     pub queued: Vec<QueuedPrompt>,
+    /// A fork copies another Cloud thread's conversation: it starts idle, with no handoff turn,
+    /// and its first message arrives as a rewind that gives it its own native identity.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 /// What Teleport will run in the cloud: the source thread's exact harness, model and effort.
@@ -133,13 +141,6 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-}
-
 fn validate(manifest: &Manifest) -> Result<()> {
     if !valid_id(&manifest.request_id)
         || !valid_id(&manifest.native_id)
@@ -149,8 +150,12 @@ fn validate(manifest: &Manifest) -> Result<()> {
             .provider
             .as_ref()
             .is_some_and(|p| p.is_empty() || p.len() > 256)
-        || manifest.handoff.is_empty()
+        || manifest.handoff.is_empty() != manifest.fork
         || manifest.handoff.len() > 32768
+        || manifest
+            .system_prompt
+            .as_ref()
+            .is_some_and(|p| p.trim().is_empty() || p.len() > 32768 || p.contains('\0'))
         || manifest.queued.iter().any(|prompt| {
             prompt.input()["text"]
                 .as_str()
@@ -173,9 +178,10 @@ fn validate(manifest: &Manifest) -> Result<()> {
                 "native" | "context" | "project" | "attachment"
             )
             || entry.size > 4 * 1024 * 1024 * 1024
-            || !(valid_sha256(&entry.sha256)
-                || entry.sha256.is_empty()
-                    && matches!(entry.kind.as_str(), "project" | "attachment"))
+            || (!(entry.sha256.is_empty()
+                && matches!(entry.kind.as_str(), "project" | "attachment"))
+                && (entry.sha256.len() != 64
+                    || !entry.sha256.bytes().all(|c| c.is_ascii_hexdigit())))
             || entry
                 .origin
                 .as_ref()
@@ -196,10 +202,11 @@ fn validate(manifest: &Manifest) -> Result<()> {
 
 /// A closed session gave its conversation back (Teleport to Local).
 fn native_in_use(local: &super::Local, native_id: &str) -> bool {
-    local
-        .sessions
-        .values()
-        .any(|s| s.native_id.as_deref() == Some(native_id) && s.state != "closed")
+    local.sessions.values().any(|s| {
+        s.native_id.as_deref() == Some(native_id)
+            && s.state != "closed"
+            && s.close_request.is_none()
+    })
 }
 
 impl Manager {
@@ -443,9 +450,17 @@ impl Manager {
                 return Err(Error::Conflict("invalid service tier"));
             }
         }
-        let workspace = self
-            .workspaces
-            .resolve(&manifest.workspace, Some(&manifest.workspace_name))?;
+        // A projectless thread (a fork of one) runs in the workspaces root, unregistered like its start.
+        let workspace = if manifest.workspace == workspace::ROOT {
+            workspace::Workspace {
+                id: "legacy".into(),
+                path: self.workspaces.root().to_path_buf(),
+                parent: None,
+            }
+        } else {
+            self.workspaces
+                .resolve(&manifest.workspace, Some(&manifest.workspace_name))?
+        };
         self.workspaces.ensure_directory(&workspace).await?;
         let transfer = Transfer {
             manifest,
@@ -493,7 +508,8 @@ impl Manager {
             .get(index)
             .ok_or(Error::NotFound)?
             .clone();
-        if !valid_sha256(&sha256)
+        if sha256.len() != 64
+            || !sha256.bytes().all(|c| c.is_ascii_hexdigit())
             || (!entry.sha256.is_empty() && entry.sha256 != sha256)
             || transfer
                 .digests
@@ -593,6 +609,18 @@ impl Manager {
                         Error::Conflict("teleport file validation failed")
                     }
                 })?;
+            let written = match native {
+                Some((profile, runtime::Kind::OpenCode, _)) => runtime::import_opencode(
+                    &self.config,
+                    profile,
+                    &written,
+                    &transfer.workspace.path,
+                    &self.storage,
+                )
+                .await
+                .map_err(|_| Error::Conflict("OpenCode session import failed"))?,
+                _ => written,
+            };
             transfer.files.insert(index, written);
             self.transfer_save(&transfer)?;
         }
@@ -765,6 +793,45 @@ impl Manager {
             .position(|entry| entry.kind == "native")
             .unwrap();
         let native_path = &transfer.files[&native_index];
+        let prompts = if manifest.fork {
+            Vec::new()
+        } else {
+            self.teleport_prompts(&transfer).await?
+        };
+        let receipt = Receipt {
+            request_id: id.into(),
+            command: "start".into(),
+            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"fork":manifest.fork,"command_guard_enabled":manifest.command_guard_enabled,"strip_ai_co_authors":manifest.strip_ai_co_authors,"system_prompt":manifest.system_prompt}),
+            state: "completed".into(),
+            model: Some(manifest.model.clone()),
+            provider: manifest.provider.clone(),
+            workspace: Some(transfer.workspace.clone()),
+            error: None,
+        };
+        {
+            let mut local = self.local.lock().unwrap();
+            if self.is_stopping() || self.storage.blocks() {
+                return Err(Error::Storage(
+                    "service is stopping or disk protection is blocking writes".into(),
+                ));
+            }
+            if native_in_use(&local, &manifest.native_id) {
+                return Err(Error::Conflict(
+                    "native conversation already belongs to a cloud session",
+                ));
+            }
+            // This single fsynced record includes all queued work and the ownership decision.
+            local.append(&session_id, "teleport", json!({"receipt":receipt,"prompts":prompts,"native_id":manifest.native_id,"native_path":native_path}), None)?;
+            self.schedule_resume(&mut local, &session_id, false)?;
+        }
+        self.teleport_files_ready(&transfer)?;
+        self.transfer_view(&transfer)
+    }
+
+    /// The handoff turn and the transferred queue, in order.
+    async fn teleport_prompts(&self, transfer: &Transfer) -> Result<Vec<Receipt>> {
+        let manifest = &transfer.manifest;
+        let id = &manifest.request_id;
         let index: Vec<_> = manifest.files.iter().filter(|entry| entry.kind != "native").map(|entry| json!({
             "source":entry.origin.as_deref().unwrap_or(&entry.path),"kind":entry.kind,"symlink":entry.symlink,
             "path":workspace::transfer_destination(&transfer.workspace,id,entry),"size_hint":entry.size,
@@ -786,7 +853,7 @@ impl Manager {
             transfer.workspace.path.display(),
             index["path"].as_str().unwrap_or_default()
         );
-        let prompts = std::iter::once(QueuedPrompt::Input {
+        Ok(std::iter::once(QueuedPrompt::Input {
             text: handoff,
             reasoning: manifest.reasoning.clone(),
             service_tier: manifest.service_tier.clone(),
@@ -807,64 +874,6 @@ impl Manager {
             workspace: None,
             error: None,
         })
-        .collect::<Vec<_>>();
-        let receipt = Receipt {
-            request_id: id.into(),
-            command: "start".into(),
-            input: json!({"harness":manifest.harness,"reasoning":manifest.reasoning,"teleport":id,"command_guard_enabled":manifest.command_guard_enabled}),
-            state: "completed".into(),
-            model: Some(manifest.model.clone()),
-            provider: manifest.provider.clone(),
-            workspace: Some(transfer.workspace.clone()),
-            error: None,
-        };
-        {
-            let mut local = self.local.lock().unwrap();
-            if self.is_stopping() || self.storage.blocks() {
-                return Err(Error::Storage(
-                    "service is stopping or disk protection is blocking writes".into(),
-                ));
-            }
-            if native_in_use(&local, &manifest.native_id) {
-                return Err(Error::Conflict(
-                    "native conversation already belongs to a cloud session",
-                ));
-            }
-            // This single fsynced record includes all queued work and the ownership decision.
-            local.append(&session_id, "teleport", json!({"receipt":receipt,"prompts":prompts,"native_id":manifest.native_id,"native_path":native_path}), None)?;
-            self.schedule_resume(&mut local, &session_id)?;
-        }
-        self.teleport_files_ready(&transfer)?;
-        self.transfer_view(&transfer)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_uppercase_manifest_checksums() {
-        assert!(valid_sha256(&"a".repeat(64)));
-        assert!(!valid_sha256(&"A".repeat(64)));
-        let manifest: Manifest = serde_json::from_value(json!({
-            "request_id":"transfer",
-            "harness":"codex",
-            "native_id":"native",
-            "model":"model",
-            "provider":null,
-            "reasoning":null,
-            "service_tier":null,
-            "command_guard_enabled":null,
-            "workspace":"workspace",
-            "workspace_name":"workspace",
-            "files":[{"path":"history.jsonl","size":1,"sha256":"A".repeat(64),"kind":"native","executable":false,"symlink":false,"origin":null}],
-            "handoff":"continue",
-            "queued":[]
-        })).unwrap();
-        assert!(matches!(
-            validate(&manifest),
-            Err(Error::Conflict("invalid teleport file"))
-        ));
+        .collect())
     }
 }

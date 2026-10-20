@@ -5,9 +5,10 @@ Workspace Management measures actual available disk space. Session Management re
 ## Behavior
 
 - At **5 GB available or less**, warn once per low-space episode. Agents, new work, and sync continue.
-- **Below 2 GB**, block new work and uploads, then freeze managed agents, sync transfers, and attachment writers. Saved history, health, and recovery reads remain available.
+- **Below 2 GB**, block new work and uploads, then freeze managed agents, sync transfers, and attachment writers. Saved history, health, and recovery reads remain available. `room-cli vm run` still works and is never frozen, so a person can read work back and free space; bulk `vm run/raw` project copies stay blocked.
 - **Above 2.5 GB**, resume paused work, even if the low-space warning remains. Never replay a prompt or reset an in-flight native RPC deadline because of a pause.
-- Failed measurements, or measurements older than five seconds, block work until disk access can be verified.
+- **Still paused after 30 seconds** (frozen work never frees space): in each session, kill the process group that wrote the most to disk, never the harness's own group (tool commands run in their own groups). Then thaw work and tell the agent what was stopped. Work pauses again only when half of the space left is used; above 2.5 GB the normal thresholds return.
+- Failed measurements block work until disk access can be verified. If the guard loop falls more than five seconds behind, each check re-measures the disk itself instead of blocking.
 - Validate `/code` and registered workspace paths against the configured filesystem; unsupported mounts block work. Measure the actual workspace root and history location. Linux filesystem-reserved blocks are already excluded from available space; do not subtract another reserve.
 
 Warnings and pause/resume events are saved in session history and replayed to clients. Harness notification acknowledgement is not proof that the model read it. Account isolation, capability dropping, cgroups, and history ownership remain unchanged.
@@ -35,6 +36,16 @@ New installations bind plain HTTP to `127.0.0.1:9840`. Keep this default for an 
 The policy retains `agent_uid`, `agent_gid`, `cache_dir`, and `cgroup_root`. Optional `warning_bytes`, `pause_bytes`, and `resume_bytes` default to the rules above. The core requires Linux, a protected service account, and delegated cgroups. Agent paths must share the monitored filesystem. The service recreates its disposable cache directory on boot; no quota restoration or filesystem remount is needed.
 
 `CLOUDROOM_STORAGE_POLICY` remains required. Never use `CLOUDROOM_UNPROTECTED_TEST_MODE` to bypass a broken live installation.
+
+## Containers
+
+Some machines are containers without cgroup delegation or the capabilities above. If their agents may have sudo, the container is the security boundary anyway, so write `"cgroup_root": null` with `"agent_sudo": true`. Core then:
+
+- runs as the agent account, so it needs no capabilities. The image makes `cloudroom` an alias of that account.
+- tags each workload's processes with `CLOUDROOM_WORKLOAD`, and stops, freezes and counts them with signals. Processes that clear their environment or switch user through sudo escape.
+- skips npm cache cleanup, which needs frozen cgroups, and allows a memory-backed `/var/tmp`.
+
+A policy without cgroups and without `agent_sudo` is rejected.
 
 ## Upgrade an existing quota-based VM
 

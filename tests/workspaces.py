@@ -88,9 +88,9 @@ class WorkspaceTests(unittest.TestCase):
         paths = {kind:self.state.resolve()/'code'/kind for kind in ['codex','pi']}
         for kind,path in paths.items(): self.seed(kind,path,kind)
         self.start()
-        def upload(kind, key, name, content, media='file', expected=202):
+        def upload(kind, key, name, content, media='file', expected=202, parts=''):
             connection = http.client.HTTPConnection(self.service.address, timeout=10)
-            connection.request('POST',f'/v1/sessions/cr_{kind}/attachments?request_id={key}&name={name}&kind={media}',content,
+            connection.request('POST',f'/v1/sessions/cr_{kind}/attachments?request_id={key}&name={name}&kind={media}{parts}',content,
                 {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
             response = connection.getresponse()
             data = json.loads(response.read()); connection.close()
@@ -122,6 +122,22 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(upload(kind,'note','note.txt',payload,'image',409)['code'],'request_conflict')
             self.assertEqual(upload(kind,'note','note.txt',payload+b'changed',expected=409)['code'],'request_conflict')
             self.assertEqual(dest.read_bytes(),payload)
+            # Large files arrive in 4 MiB parts: a repeated part is ignored, a gap is refused, the last part saves.
+            big, size = secrets.token_bytes(9*1024**2), 4*1024**2
+            def part(offset, expected=202):
+                return upload(kind,'parts','big.bin',big[offset:offset+size],expected=expected,parts=f'&offset={offset}&total={len(big)}')
+            self.assertEqual(part(0),{'received':size})
+            self.assertEqual(part(0),{'received':size})
+            self.assertIn('out of order',part(2*size,409)['error'])
+            self.assertEqual(part(size),{'received':2*size})
+            saved = part(2*size)['receipt']['input']
+            self.assertEqual(Path(saved['path']).read_bytes(),big)
+            self.assertEqual(part(2*size)['receipt']['input'],saved)
+            self.assertEqual(upload(kind,'parts','other.bin',big[2*size:],expected=409,parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
+            self.assertEqual(upload(kind,'parts','big.bin',b'changed',expected=409,parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
+            self.assertEqual(upload(kind,'parts','big.bin',big[2*size:],expected=409,parts=f'&offset={2*size}&total={len(big)+1}')['code'],'request_conflict')
+            self.assertEqual(Path(saved['path']).read_bytes(),big)
+            self.assertEqual(upload(kind,'parts-large','big.bin',b'x',expected=409,parts=f'&offset=0&total={25*1024**2+1}')['code'],'attachment_too_large')
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
@@ -212,6 +228,7 @@ class WorkspaceTests(unittest.TestCase):
         pending.write_text(json.dumps({'id':'escape','path':str(root/'escape')}))
         record = self.state/'00000000000000000001.record'
         value=json.loads(record.read_text()); value['data']['workspace']['path']=str(root/'escape');record.write_text(json.dumps(value))
+        (self.state/'snapshot.json').unlink(missing_ok=True)  # Core trusts its snapshot over edited old records.
         self.start()
         until(lambda:self.service.session('cr_escape')['state']=='failed','invalid mapping',10)
         self.assertFalse((outside/'child').exists())

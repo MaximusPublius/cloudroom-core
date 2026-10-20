@@ -40,12 +40,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("feedback" | "report")
+    ) {
+        match cloudroom::session::report::cli(&args[1..]).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().map(String::as_str) == Some("computer-use") {
+        match cloudroom::computer_use::cli(&args[1..]).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().map(String::as_str) == Some("--computer-use-skill") {
+        print!("{}", cloudroom::computer_use::SKILL);
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("--secrets-skill") {
         print!("{}", cloudroom::secrets::SKILL);
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--mac-skill") {
         print!("{}", cloudroom::mac::SKILL);
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("--room-cli-skill") {
+        print!("{}", cloudroom::mac::ROOM_CLI_SKILL);
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--preview-skill") {
@@ -77,9 +106,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The service starts without arguments; anything else is a mistyped agent command.
     if let Some(command) = args.first() {
-        eprintln!(
-            "Unknown command {command}. Use cloudroom preview, cloudroom mac, cloudroom secret, or cloudroom thread."
-        );
+        let commands = "Commands: cloudroom thread, mac, secret, preview, computer-use, feedback. Add --help to any of them.";
+        if matches!(command.as_str(), "--help" | "-h" | "help") {
+            println!("{commands}");
+            return Ok(());
+        }
+        eprintln!("Unknown command {command}. {commands}");
         std::process::exit(2);
     }
     cloudroom::serve(cloudroom::config::Config::from_env()?).await

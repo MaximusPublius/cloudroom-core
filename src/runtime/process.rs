@@ -103,7 +103,7 @@ impl Process {
             .storage
             .as_ref()
             .map(|policy| {
-                let group = Arc::new(linux::Workload::create(&policy.cgroup_root)?);
+                let group = Arc::new(linux::Workload::create(policy)?);
                 group.attach(&mut command, policy)?;
                 command.env("npm_config_cache", policy.cache_dir.join("npm"));
                 Ok::<_, io::Error>(group)
@@ -171,7 +171,7 @@ impl Process {
                             continue;
                         }
                         if let Some(request) = &call.request {
-                            if state.request.is_some() && !state.finished { let _ = call.reply.map(|r| r.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "harness is busy")))); continue; }
+                            if state.request.is_some() && !state.finished && !state.auto { let _ = call.reply.map(|r| r.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "harness is busy")))); continue; }
                             state = Progress { native: state.native.clone(), model: state.model.clone(), request: Some(request.clone()), ..Progress::default() };
                             progress.send_replace(state.clone());
                         }
@@ -398,6 +398,12 @@ impl Process {
             .ok_or_else(|| io::Error::other("workload containment unavailable"))?
             .freeze(paused)
             .await
+    }
+    pub fn kill_top_writer(&self) -> io::Result<Option<String>> {
+        self.group
+            .as_ref()
+            .ok_or_else(|| io::Error::other("workload containment unavailable"))?
+            .kill_top_writer(self.pid)
     }
     pub fn request_shutdown(&self) {
         if let Some(group) = &self.group

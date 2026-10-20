@@ -1,4 +1,5 @@
 pub mod api;
+pub mod computer_use;
 pub mod config;
 pub mod mac;
 mod observability;
@@ -27,6 +28,9 @@ pub const FEATURES: &[&str] = &[
     "root_workspace",
     "teleport",
     "command_guard",
+    "strip_ai_co_authors",
+    "system_prompt",
+    "computer_use",
     "codex_auth",
     "codex_auth_import",
     "cursor_auth",
@@ -39,21 +43,31 @@ pub const FEATURES: &[&str] = &[
     "queue_reorder",
     "steer",
     "rewind",
+    "fork",
+    "side_chat",
     "attachments",
+    "upload_parts",
     "compact",
+    "goal",
     "usage",
     "subagents",
+    "child_threads",
     "session_list",
     "drain",
+    "terminals",
 ];
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {
     use std::{future::IntoFuture, time::Duration};
     config.account_home = config.account_home.canonicalize()?;
     config.repository = config.repository.canonicalize()?;
-    for profile in config.harnesses.values_mut() {
+    for (kind, profile) in &mut config.harnesses {
         profile.home = profile.home.canonicalize()?;
-        profile.binary = profile.binary.canonicalize()?;
+        profile.binary = if *kind == runtime::Kind::Claude {
+            config::launcher_path(&profile.binary)?
+        } else {
+            profile.binary.canonicalize()?
+        };
     }
     // A bind failure must not mutate saved sessions or claim their recovery.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

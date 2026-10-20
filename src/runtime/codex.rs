@@ -67,17 +67,28 @@ pub(super) async fn models(handle: &Handle) -> io::Result<Vec<super::Model>> {
     }
 }
 
-pub(super) async fn start(handle: &Handle) -> io::Result<String> {
+/// Starts, resumes, or (for a side chat) forks the session's thread. A fork only reads its source.
+pub(super) async fn start(handle: &Handle, fork: Option<&super::Fork>) -> io::Result<String> {
     initialize(handle).await?;
     let mut params = json!({"cwd":handle.repository,"model":handle.profile.model,"approvalPolicy":"never","sandbox":"danger-full-access","ephemeral":false});
     if let Some(reasoning) = &handle.reasoning {
         params["config"] = json!({"model_reasoning_effort":reasoning});
     }
-    let method = if let Some(saved) = &handle.resume {
+    if let Some(system_prompt) = &handle.system_prompt {
+        params["developerInstructions"] = json!(system_prompt);
+    }
+    if let Some(turn) = fork.and_then(|f| f.last_turn_id.as_ref()) {
+        params["lastTurnId"] = json!(turn);
+    }
+    let method = if let Some(saved) = fork.map(|f| &f.source).or(handle.resume.as_ref()) {
         params["threadId"] = json!(saved.id);
         params["path"] = json!(saved.path);
         params["excludeTurns"] = json!(true);
-        "thread/resume"
+        if fork.is_some() {
+            "thread/fork"
+        } else {
+            "thread/resume"
+        }
     } else {
         "thread/start"
     };
@@ -91,6 +102,9 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
         .ok_or_else(|| io::Error::other("missing native identity"))?;
     if handle.resume.as_ref().is_some_and(|s| s.id != id) {
         return Err(io::Error::other("harness resumed a different session"));
+    }
+    if fork.is_some_and(|f| f.source.id == id) {
+        return Err(io::Error::other("harness did not fork the session"));
     }
     Ok(id.into())
 }
@@ -209,6 +223,9 @@ pub(super) async fn compact(handle: &Handle) -> io::Result<()> {
 
 pub(super) async fn rewind(handle: &Handle, input: &Value) -> io::Result<Value> {
     let mut params = json!({"threadId":handle.native()?});
+    if let Some(system_prompt) = &handle.system_prompt {
+        params["developerInstructions"] = json!(system_prompt);
+    }
     if let Some(id) = input["last_turn_id"]
         .as_str()
         .or_else(|| input["lastTurnId"].as_str())
@@ -233,6 +250,36 @@ pub(super) async fn rewind(handle: &Handle, input: &Value) -> io::Result<Value> 
         "cursor":{"offset":0}
     }))
 }
+/// User goal changes carry `origin: "user"`, so Codex treats them as the user's own instruction.
+pub(super) async fn goal(handle: &Handle, input: &Value) -> io::Result<()> {
+    let mut params = json!({"threadId":handle.native()?,"origin":"user"});
+    if input["clear"] == true {
+        handle.call("thread/goal/clear", params).await?;
+        return Ok(());
+    }
+    for key in ["status", "objective"] {
+        if let Some(value) = input[key].as_str() {
+            params[key] = json!(value);
+        }
+    }
+    handle.call("thread/goal/set", params).await?;
+    Ok(())
+}
+
+/// Codex's own UI pauses an active goal before Stop; otherwise the goal starts its next turn at once.
+async fn pause_goal(handle: &Handle, thread: &str) {
+    let Ok(result) = handle
+        .call("thread/goal/get", json!({"threadId":thread}))
+        .await
+    else {
+        return;
+    };
+    if result.pointer("/goal/status") == Some(&json!("active")) {
+        let params = json!({"threadId":thread,"status":"paused","origin":"user"});
+        let _ = handle.call("thread/goal/set", params).await;
+    }
+}
+
 pub(super) async fn notice(handle: &Handle, text: &str) -> io::Result<()> {
     handle.call("thread/inject_items", json!({"threadId":handle.native()?,"items":[{"type":"message","role":"developer","content":[{"type":"input_text","text":text}]}]})).await?;
     Ok(())
@@ -243,6 +290,7 @@ pub(super) async fn interrupt(handle: &Handle, state: Progress) -> io::Result<()
         .native_turn
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "turn has not started"))?;
     let native = handle.native()?;
+    pause_goal(handle, &native).await;
     handle
         .process
         .control(
@@ -308,7 +356,8 @@ impl Adapter for Protocol {
         if request.is_some() {
             self.prompt_id = Some(id);
         }
-        if method == "thread/fork" {
+        // A side chat's first fork is its start; only a rewind replaces a known thread.
+        if method == "thread/fork" && self.root.is_some() {
             self.forking = Some(id);
         }
         if method == "thread/compact/start" {
@@ -359,6 +408,13 @@ impl Adapter for Protocol {
             .or_else(|| params.get("usage"))
             .cloned()
             .filter(|value| !value.is_null());
+        if root
+            && method == "item/completed"
+            && params["item"]["type"] == "agentMessage"
+            && let Some(text) = params["item"]["text"].as_str()
+        {
+            state.last_text = text.to_owned();
+        }
         let mut events = vec![Event::Record {
             kind: if root { kind } else { "native_event" },
             data: json!({"method":method,"item_id":params["itemId"].as_str().or_else(||params.pointer("/item/id").and_then(Value::as_str)),"request_id":params["item"]["clientId"],"delta":params["delta"],"text":params["item"]["text"],"tool_name":params["item"]["command"],"output":params["item"]["aggregatedOutput"],"status":params["item"]["status"],"usage":usage}),
@@ -433,6 +489,15 @@ impl Adapter for Protocol {
         if value["id"].as_u64() == self.prompt_id && value.get("error").is_some() {
             state.finished = true;
         }
+        // Codex steers a turn/start into a turn that is already running (a goal continuation),
+        // so the response, not a turn/started notification, names the prompt's turn.
+        if value["id"].as_u64() == self.prompt_id
+            && state.native_turn.is_none()
+            && let Some(turn) = value.pointer("/result/turn/id").and_then(Value::as_str)
+        {
+            state.native_turn = Some(turn.into());
+            events.extend(state.started());
+        }
         let limited = Some(&json!("usageLimitExceeded"));
         if root
             && (params.pointer("/turn/error/codexErrorInfo") == limited
@@ -447,8 +512,22 @@ impl Adapter for Protocol {
         match if root { method } else { "" } {
             "turn/started" => {
                 if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) {
-                    state.native_turn = Some(id.into());
-                    events.extend(state.started());
+                    if (state.request.is_none() || state.finished) && self.compaction.is_none() {
+                        // Codex started this turn itself (a goal continuation): track it like a requested one,
+                        // before its records, so they belong to it.
+                        *state = Progress {
+                            native: state.native.clone(),
+                            model: state.model.clone(),
+                            request: Some(format!("auto_{id}")),
+                            native_turn: Some(id.into()),
+                            auto: true,
+                            ..Progress::default()
+                        };
+                        events.splice(0..0, state.started());
+                    } else {
+                        state.native_turn = Some(id.into());
+                        events.extend(state.started());
+                    }
                 }
             }
             "item/started" => {

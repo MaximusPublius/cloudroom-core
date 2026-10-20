@@ -2,6 +2,7 @@
 use crate::{preview::Peer, session::Manager};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Path as RoutePath, Query, State},
     http::StatusCode,
     response::{
@@ -39,8 +40,12 @@ const BODY: usize = 5 * LIMIT;
 /// A connected helper must confirm each job quickly; a sleeping Mac must not hang agents.
 const ACK: Duration = Duration::from_secs(10);
 const KEEP: Duration = Duration::from_secs(3600);
+/// A new sandbox's helper needs a few seconds to find and pair with it, so early calls wait for it.
+const FRESH: Duration = Duration::from_secs(60);
+const ATTACH: Duration = Duration::from_secs(30);
 const UNAVAILABLE: &str = "Mac unavailable: the paired Mac is offline, asleep, or has Mac access turned off. Continue cloud work and try again later.";
 pub const SKILL: &str = include_str!("cloud-mac/SKILL.md");
+pub const ROOM_CLI_SKILL: &str = include_str!("room-cli/SKILL.md");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +54,9 @@ pub struct Run {
     #[serde(default)]
     stdin: String,
     cwd: Option<String>,
+    /// The command changes the Mac. Below Full access the helper refuses it or asks the user first (ADR 0186).
+    #[serde(default)]
+    write: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +70,9 @@ pub struct Report {
     stderr: String,
     #[serde(default)]
     truncated: bool,
+    /// A `part` report's position in its stream's hex text. Some sandbox proxies drop requests over about 8 MB,
+    /// so the helper sends large output in parts before a final `done` report (`upload_parts`).
+    offset: Option<usize>,
 }
 #[derive(Deserialize)]
 pub struct Device {
@@ -69,15 +80,21 @@ pub struct Device {
 }
 
 struct Job {
+    /// Cloudroom session that started the job. Retained results stay private to this thread.
+    session: String,
     device: String,
     acked: bool,
     result: Option<Value>,
     at: Instant,
+    /// Hex output received in parts so far: stdout, stderr.
+    parts: [Vec<u8>; 2],
 }
 struct Helper {
     generation: u64,
     device: String,
     events: mpsc::Sender<std::result::Result<Event, Infallible>>,
+    /// A job went unanswered: the Mac likely slept while a proxy kept its stream open.
+    stale: bool,
 }
 
 pub struct Mac {
@@ -85,6 +102,7 @@ pub struct Mac {
     helper: Mutex<Option<Helper>>,
     changed: watch::Sender<u64>,
     next: AtomicU64,
+    started: Instant,
 }
 impl Default for Mac {
     fn default() -> Self {
@@ -93,6 +111,7 @@ impl Default for Mac {
             helper: Mutex::default(),
             changed: watch::channel(0).0,
             next: AtomicU64::new(0),
+            started: Instant::now(),
         }
     }
 }
@@ -184,6 +203,10 @@ pub fn routes() -> Router<Arc<Manager>> {
             "/v1/vm/run",
             post(vm_run).layer(DefaultBodyLimit::max(BODY)),
         )
+        .route(
+            "/v1/vm/run/raw",
+            post(vm_run_raw).layer(DefaultBodyLimit::max(LIMIT)),
+        )
 }
 
 /// The paired Mac's helper receives jobs here. The newest connection replaces older ones.
@@ -203,6 +226,7 @@ async fn stream(
         generation,
         device: input.device,
         events: events.clone(),
+        stale: false,
     });
     m.mac.touch();
     let mac = m.clone();
@@ -231,24 +255,50 @@ async fn report(
             StatusCode::NOT_FOUND,
             "Unknown or expired Mac job".into(),
         ))?;
-    match input.state.as_str() {
-        "running" => job.acked = true,
-        "done"
-            if input.stdout.len() <= 2 * LIMIT
-                && input.stderr.len() <= 2 * LIMIT
-                && unhex(&input.stdout).is_some()
-                && unhex(&input.stderr).is_some() =>
-        {
+    let output = [input.stdout, input.stderr];
+    if output.iter().any(|hex| unhex(hex).is_none()) {
+        return Err(conflict("Invalid Mac job report"));
+    }
+    match (input.state.as_str(), input.offset) {
+        ("running", None) => job.acked = true,
+        ("part", Some(offset)) => {
+            for (parts, hex) in job.parts.iter_mut().zip(&output) {
+                if !hex.is_empty() {
+                    crate::api::append_part(parts, offset, hex.as_bytes(), 2 * LIMIT)
+                        .map_err(conflict)?;
+                }
+            }
             job.acked = true;
             job.at = Instant::now();
-            job.result = Some(
-                json!({"state":"done","code":input.code,"stdout":input.stdout,
-                "stderr":input.stderr,"truncated":input.truncated}),
-            );
+        }
+        ("done", None) => {
+            let [stdout, stderr] = std::mem::take(&mut job.parts);
+            let [stdout, stderr] =
+                [(stdout, &output[0]), (stderr, &output[1])].map(|(mut parts, rest)| {
+                    parts.extend_from_slice(rest.as_bytes());
+                    String::from_utf8(parts).unwrap_or_default()
+                });
+            if stdout.len() > 2 * LIMIT || stderr.len() > 2 * LIMIT {
+                return Err(conflict("Invalid Mac job report"));
+            }
+            job.acked = true;
+            job.at = Instant::now();
+            job.result = Some(json!({"state":"done","code":input.code,"stdout":stdout,
+                "stderr":stderr,"truncated":input.truncated}));
         }
         _ => return Err(conflict("Invalid Mac job report")),
     }
     drop(jobs);
+    if let Some(h) = m
+        .mac
+        .helper
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|h| h.device == input.device)
+    {
+        h.stale = false;
+    }
     m.mac.touch();
     Ok(Json(json!({"accepted":true})))
 }
@@ -263,22 +313,39 @@ fn local_auth(m: &Manager, peer: Peer) -> Result<()> {
     }
 }
 
+fn local_session(m: &Manager, peer: Peer) -> Result<String> {
+    local_auth(m, peer)?;
+    peer.1
+        .and_then(|pid| m.harness_session(&crate::secrets::ancestors(pid)))
+        .ok_or_else(|| conflict("Run cloudroom mac from a Cloudroom cloud thread"))
+}
+
+fn visible_job<'a>(jobs: &'a BTreeMap<String, Job>, id: &str, session: &str) -> Option<&'a Job> {
+    jobs.get(id).filter(|job| job.session == session)
+}
+
 async fn local_run(
     State(m): State<Arc<Manager>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     Json(run): Json<Run>,
 ) -> Result<Json<Value>> {
-    local_auth(&m, peer)?;
+    let session = local_session(&m, peer)?;
     validate(&run)?;
     let mac = &m.mac;
-    let Some((generation, device, events)) = mac
-        .helper
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|h| (h.generation, h.device.clone(), h.events.clone()))
-    else {
-        return Err(conflict(UNAVAILABLE));
+    let mut changed = mac.changed.subscribe();
+    let fresh = mac.started.elapsed() < FRESH;
+    let wait = Instant::now() + if fresh { ATTACH } else { Duration::ZERO };
+    let (generation, device, events) = loop {
+        if let Some(h) = mac.helper.lock().unwrap().as_ref() {
+            break (h.generation, h.device.clone(), h.events.clone());
+        }
+        if Instant::now() >= wait {
+            return Err(conflict(UNAVAILABLE));
+        }
+        tokio::select! {
+            _ = changed.changed() => {},
+            _ = tokio::time::sleep_until(wait.into()) => {},
+        }
     };
     let id = format!(
         "{}-{}",
@@ -291,14 +358,18 @@ async fn local_run(
         jobs.insert(
             id.clone(),
             Job {
+                session: session.clone(),
                 device,
                 acked: false,
                 result: None,
                 at: Instant::now(),
+                parts: Default::default(),
             },
         );
     }
-    let data = json!({"id":id,"command":run.command,"stdin":run.stdin,"cwd":run.cwd}).to_string();
+    let data = json!({"id":id,"session":session,"command":run.command,"stdin":run.stdin,
+        "cwd":run.cwd,"write":run.write})
+    .to_string();
     if events
         .send(Ok(Event::default().event("job").data(data)))
         .await
@@ -312,7 +383,6 @@ async fn local_run(
         events,
         armed: true,
     };
-    let mut changed = mac.changed.subscribe();
     let started = Instant::now();
     loop {
         let connected = mac.connected(generation);
@@ -327,6 +397,15 @@ async fn local_run(
             }
             if !job.acked && (!connected || started.elapsed() >= ACK) {
                 jobs.remove(&id);
+                if let Some(h) = mac
+                    .helper
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|h| h.generation == generation)
+                {
+                    h.stale = true;
+                }
                 return Err(conflict(UNAVAILABLE));
             }
             // In-flight work keeps running on the Mac; its helper reports the result after reconnecting.
@@ -348,9 +427,9 @@ async fn local_result(
     ConnectInfo(peer): ConnectInfo<Peer>,
     RoutePath(id): RoutePath<String>,
 ) -> Result<Json<Value>> {
-    local_auth(&m, peer)?;
+    let session = local_session(&m, peer)?;
     let jobs = m.mac.jobs.lock().unwrap();
-    let job = jobs.get(&id).ok_or(Failure(
+    let job = visible_job(&jobs, &id, &session).ok_or(Failure(
         StatusCode::NOT_FOUND,
         "Unknown or expired Mac job".into(),
     ))?;
@@ -365,7 +444,7 @@ async fn local_status(
 ) -> Result<Json<Value>> {
     local_auth(&m, peer)?;
     Ok(Json(
-        json!({"connected":m.mac.helper.lock().unwrap().is_some()}),
+        json!({"connected":m.mac.helper.lock().unwrap().as_ref().is_some_and(|h| !h.stale)}),
     ))
 }
 
@@ -387,6 +466,8 @@ pub async fn listen(manager: &Arc<Manager>) -> io::Result<()> {
         .route("/status", get(local_status))
         .merge(crate::secrets::agent_routes())
         .merge(crate::session::thread::agent_routes())
+        .merge(crate::session::report::agent_routes())
+        .merge(crate::computer_use::agent_routes())
         .layer(DefaultBodyLimit::max(BODY))
         .with_state(manager.clone());
     tokio::spawn(async move {
@@ -417,6 +498,21 @@ async fn capped(mut reader: impl AsyncRead + Unpin, kept: Arc<Mutex<(Vec<u8>, bo
 /// The paired Mac runs a shell command as the VM agent account.
 async fn vm_run(State(m): State<Arc<Manager>>, Json(run): Json<Run>) -> Result<Json<Value>> {
     let stdin = validate(&run)?;
+    execute(&m, run, stdin, false).await
+}
+
+/// Like `vm_run`, with the command in the query and stdin as the raw body: half the bytes of hex.
+/// Bulk project copies use it, so it stays blocked while disk space is critically low.
+async fn vm_run_raw(
+    State(m): State<Arc<Manager>>,
+    Query(run): Query<Run>,
+    stdin: Bytes,
+) -> Result<Json<Value>> {
+    validate(&run)?;
+    execute(&m, run, stdin.into(), true).await
+}
+
+async fn execute(m: &Manager, run: Run, stdin: Vec<u8>, gated: bool) -> Result<Json<Value>> {
     let home = &m.config.account_home;
     let folder = run.cwd.as_ref().map_or(home.clone(), |d| home.join(d));
     if !folder.is_dir() {
@@ -434,7 +530,13 @@ async fn vm_run(State(m): State<Arc<Manager>>, Json(run): Json<Run>) -> Result<J
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let (mut child, _workload) = m.storage.spawn_writer(&mut command).map_err(|error| {
+    // Plain commands are the emergency way in: they still run while storage is blocked.
+    let spawned = if gated {
+        m.storage.spawn_writer(&mut command)
+    } else {
+        m.storage.spawn_operator(&mut command)
+    };
+    let (mut child, _workload) = spawned.map_err(|error| {
         Failure(
             StatusCode::CONFLICT,
             format!("VM command could not start: {error}"),
@@ -532,8 +634,8 @@ fn finished(value: Value) -> io::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
     ))
 }
 
-async fn copy(socket: &str, command: String, stdin: Vec<u8>) -> io::Result<Vec<u8>> {
-    let body = json!({"command":command,"stdin":hex(&stdin)});
+async fn copy(socket: &str, command: String, stdin: Vec<u8>, write: bool) -> io::Result<Vec<u8>> {
+    let body = json!({"command":command,"stdin":hex(&stdin),"write":write});
     let (code, stdout, stderr) = finished(request(socket, "POST", "/jobs", Some(body)).await?)?;
     if code != Some(0) {
         return Err(io::Error::other(
@@ -551,21 +653,24 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         socket = args.remove(1);
         args.remove(0);
     }
-    let usage = "cloudroom mac run [--cwd DIR] [--stdin] COMMAND
+    let usage = "cloudroom mac run [--cwd DIR] [--stdin] [--write] COMMAND
 cloudroom mac pull MAC_PATH [VM_FOLDER]
 cloudroom mac push VM_PATH [MAC_FOLDER]
 cloudroom mac result JOB
 cloudroom mac status
-Runs on the user's paired Mac as the user, in their home folder by default.";
+Runs on the user's paired Mac as the user, in their home folder by default.
+Add --write when a command changes the Mac. Unless the user gives Full access,
+other commands run read-only, and --write needs their approval.";
     let name = args.first().cloned().unwrap_or_default();
     match (name.as_str(), &args[1.min(args.len())..]) {
         ("run", rest) => {
-            let (mut cwd, mut stdin, mut words) = (None, false, Vec::new());
+            let (mut cwd, mut stdin, mut write, mut words) = (None, false, false, Vec::new());
             let mut rest = rest.iter();
             while let Some(word) = rest.next() {
                 match word.as_str() {
                     "--cwd" if words.is_empty() => cwd = rest.next().cloned(),
                     "--stdin" if words.is_empty() => stdin = true,
+                    "--write" if words.is_empty() => write = true,
                     _ => words.push(word.clone()),
                 }
             }
@@ -576,7 +681,8 @@ Runs on the user's paired Mac as the user, in their home folder by default.";
             if stdin {
                 std::io::Read::read_to_end(&mut std::io::stdin(), &mut input)?;
             }
-            let body = json!({"command":words.join(" "),"stdin":hex(&input),"cwd":cwd});
+            let body =
+                json!({"command":words.join(" "),"stdin":hex(&input),"cwd":cwd,"write":write});
             let value = request(&socket, "POST", "/jobs", Some(body)).await?;
             print_result(value).await
         }
@@ -591,7 +697,7 @@ Runs on the user's paired Mac as the user, in their home folder by default.";
             let target = PathBuf::from(rest.first().map_or(".", String::as_str));
             let archive = copy(&socket, format!(
                 "p={}; cd -- \"$(dirname -- \"$p\")\" && COPYFILE_DISABLE=1 tar --no-xattrs -czf - -- \"$(basename -- \"$p\")\"",
-                quote(source)), Vec::new()).await?;
+                quote(source)), Vec::new(), false).await?;
             fs::create_dir_all(&target)?;
             let mut tar = tokio::process::Command::new("tar")
                 .arg("-xzf")
@@ -639,6 +745,7 @@ Runs on the user's paired Mac as the user, in their home folder by default.";
                     quote(target)
                 ),
                 archive.stdout,
+                true,
             )
             .await?;
             println!("{}", json!({"copied":source,"to":target}));
@@ -662,4 +769,28 @@ async fn print_result(value: Value) -> io::Result<i32> {
     std::io::stdout().flush()?;
     std::io::stderr().write_all(&stderr)?;
     Ok(code.unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(session: &str) -> Job {
+        Job {
+            session: session.into(),
+            device: "synthetic-device".into(),
+            acked: true,
+            result: Some(json!({"state":"done"})),
+            at: Instant::now(),
+            parts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn retained_results_are_visible_only_to_the_originating_session() {
+        let jobs = BTreeMap::from([("123-0".into(), job("session-a"))]);
+        assert!(visible_job(&jobs, "123-0", "session-a").is_some());
+        assert!(visible_job(&jobs, "123-0", "session-b").is_none());
+        assert!(visible_job(&jobs, "missing", "session-a").is_none());
+    }
 }
