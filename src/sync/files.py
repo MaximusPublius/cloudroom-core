@@ -163,13 +163,17 @@ class Tree:
             finally:
                 os.close(fd)
 
-    def attach(self, relative, stream, limit, size):
+    def attach(self, relative, stream, limit, size, expected_sha256):
         with self.parent(relative, create=True) as (fd, name):
             try:
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError('attachment must be a regular file')
-                return {'size': info.st_size}
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as existing:
+                    digest = hashlib.file_digest(existing, 'sha256').hexdigest()
+                if info.st_size != size or digest != expected_sha256:
+                    raise ValueError('attachment content changed')
+                return {'size': info.st_size, 'sha256': digest}
             except FileNotFoundError:
                 pass
             temporary = '.attachment-' + uuid.uuid4().hex
@@ -187,9 +191,19 @@ class Tree:
                     info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                     if not stat.S_ISREG(info.st_mode):
                         raise ValueError('attachment must be a regular file')
-                    return {'size': info.st_size}
+                    with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as existing:
+                        digest = hashlib.file_digest(existing, 'sha256').hexdigest()
+                    if info.st_size != size or digest != expected_sha256:
+                        raise ValueError('attachment content changed')
+                    return {'size': info.st_size, 'sha256': digest}
                 os.fsync(fd)
-                return {'size': entry['size']}
+                digest = hashlib.sha256()
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as published:
+                    for chunk in iter(lambda: published.read(CHUNK), b''):
+                        digest.update(chunk)
+                if digest.hexdigest() != expected_sha256:
+                    raise ValueError('attachment content changed')
+                return {'size': entry['size'], 'sha256': digest.hexdigest()}
             finally:
                 try:
                     os.unlink(temporary, dir_fd=fd)
@@ -617,7 +631,7 @@ def worker():
         return
     elif op == 'attach':
         try:
-            result = tree.attach(request['path'], sys.stdin.buffer, request['limit'], request['size'])
+            result = tree.attach(request['path'], sys.stdin.buffer, request['limit'], request['size'], request['sha256'])
         except Conflict:
             print(json.dumps({'ok': False, 'error': 'attachment_too_large'}), flush=True)
             return

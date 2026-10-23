@@ -521,7 +521,7 @@ impl IntoResponse for session::Error {
             | "saved session has no matching receipt" => "request_conflict",
             "agent setup is incomplete" | "harness is not configured" => "harness_not_configured",
             "invalid workspace" | "workspace mapping unavailable" => "invalid_workspace",
-            "storage unsafe; new execution is blocked" => "storage_blocked",
+            "storage unsafe; new execution is blocked" | "storage unsafe; uploads are blocked" => "storage_blocked",
             "service is stopping" => "service_stopping",
             "service is draining" => "service_draining",
             "model catalog unavailable" => "model_catalog_unavailable",
@@ -1055,10 +1055,18 @@ async fn attach(
             "storage unsafe; uploads are blocked",
         ));
     }
+    let input = json!({"id":&query.request_id,"name":&query.name,"kind":&query.kind,
+        "path":workspace.path.join(format!(".cloudroom/attachments/{id}/{}/{}", query.request_id, query.name)),
+        "size":bytes.len(),"sha256":&sha256});
+    let receipt = manager.command(&id, query.request_id.clone(), "attach", input.clone())?;
+    if receipt.state != "accepted" {
+        return Ok(accepted(&manager, &id, receipt));
+    }
     let written = manager
         .workspaces
         .attach(
             &workspace,
+            &id,
             &query.request_id,
             &query.name,
             &query.kind,
@@ -1073,6 +1081,7 @@ async fn attach(
                 error.kind(),
                 error.raw_os_error()
             );
+            let _ = manager.finish_attachment(&id, &query.request_id, "failed");
             session::Error::Conflict(match error.kind() {
                 std::io::ErrorKind::WouldBlock => "storage unsafe; uploads are blocked",
                 std::io::ErrorKind::PermissionDenied => "Cloud folder permission denied",
@@ -1083,9 +1092,11 @@ async fn attach(
                 _ => "attachment upload failed",
             })
         })?;
-    let mut written = written;
-    written["sha256"] = json!(sha256);
-    let receipt = manager.command(&id, query.request_id, "attach", written)?;
+    if written != input {
+        let _ = manager.finish_attachment(&id, &query.request_id, "failed");
+        return Err(session::Error::Conflict("attachment upload failed"));
+    }
+    let receipt = manager.finish_attachment(&id, &query.request_id, "completed")?;
     Ok(accepted(&manager, &id, receipt))
 }
 async fn interrupt(

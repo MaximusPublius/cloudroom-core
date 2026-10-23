@@ -80,6 +80,26 @@ class WorkspaceTests(unittest.TestCase):
         for item in results:
             until(lambda:self.service.session(item['session_id'])['state']=='idle','peer',10)
             self.assertEqual(self.service.session(item['session_id'])['workspace']['path'],str(path))
+        def shared_upload(session_id, content):
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST',f'/v1/sessions/{session_id}/attachments?request_id=same&name=note.txt&kind=file',content,
+                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            data = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status,202,data)
+            return Path(data['receipt']['input']['path'])
+        first, second = [shared_upload(item['session_id'], content) for item, content in zip(results, [b'abcd', b'wxyz'])]
+        self.assertNotEqual(first, second)
+        self.assertEqual((first.read_bytes(), second.read_bytes()), (b'abcd', b'wxyz'))
+        closed = results[0]['session_id']
+        self.service.request('POST', f'/v1/sessions/{closed}/close', {'request_id':'close'}, 202)
+        until(lambda:self.service.session(closed)['state']=='closed','closed attachment target',10)
+        connection = http.client.HTTPConnection(self.service.address, timeout=10)
+        connection.request('POST',f'/v1/sessions/{closed}/attachments?request_id=after-close&name=note.txt&kind=file',b'nope',
+            {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+        response = connection.getresponse()
+        self.assertEqual(response.status,409); response.read(); connection.close()
+        self.assertFalse((path/'.cloudroom/attachments'/closed/'after-close'/'note.txt').exists())
         self.assertEqual((path/'keep').read_text(),'cloud work')
         print('Direct empty-folder start + attachment + first prompt (protocol fixtures), seconds:',samples)
 

@@ -2,6 +2,7 @@ pub mod storage;
 
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     os::unix::fs::MetadataExt,
@@ -370,6 +371,7 @@ impl Workspaces {
     pub async fn attach(
         &self,
         workspace: &Workspace,
+        session_id: &str,
         request_id: &str,
         name: &str,
         kind: &str,
@@ -397,7 +399,8 @@ impl Workspaces {
         {
             return Err(io::Error::other("invalid attachment name"));
         }
-        let relative = format!(".cloudroom/attachments/{request_id}/{name}");
+        valid_id(session_id)?;
+        let relative = format!(".cloudroom/attachments/{session_id}/{request_id}/{name}");
         let limit = if kind == "image" {
             10 * 1024 * 1024
         } else {
@@ -423,8 +426,9 @@ impl Workspaces {
             .kill_on_drop(true);
         let (mut child, _workload) = guard.spawn_writer(&mut command)?;
         let mut input = child.stdin.take().unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let request = serde_json::json!({"op":"attach", "tree":{"root":workspace.path},
-            "path":relative, "limit":limit, "size":bytes.len()});
+            "path":relative, "limit":limit, "size":bytes.len(), "sha256":sha256});
         let transfer = async {
             input.write_all(&serde_json::to_vec(&request)?).await?;
             input.write_all(b"\n").await?;
@@ -442,8 +446,11 @@ impl Workspaces {
                 Err(error)
             }
         })?;
+        if result["sha256"] != sha256 {
+            return Err(io::Error::other("attachment content changed during publication"));
+        }
         Ok(serde_json::json!({"id":request_id,"name":name,"kind":kind,
-            "path":workspace.path.join(relative),"size":result["size"]}))
+            "path":workspace.path.join(relative),"size":result["size"],"sha256":sha256}))
     }
 }
 

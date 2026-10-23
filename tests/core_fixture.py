@@ -174,6 +174,9 @@ def codex():
                     event('turn/completed', turn={'id': turn, 'status': mode})
                     continue
             elif method == "thread/fork":
+                if Path("reject-fork").exists():
+                    send({"id": message["id"], "error": {"code": -1, "message": "fork transport failed"}})
+                    continue
                 if Path("hold-fork").exists():
                     Path("fork-ready").touch()
                     while not Path("release-fork").exists():
@@ -900,6 +903,29 @@ class RecoveryTests(unittest.TestCase):
         self.wait(lambda: self.status()["state"] == "idle", "resumed fork")
         self.assertEqual(self.status()["native_id"], forked)
         self.assertEqual((self.repo / (forked + ".requests")).read_text().splitlines(), ["corrected"])
+
+    def test_uncertain_rewind_error_releases_the_command_guard(self):
+        self.seed(); self.start(); self.ready()
+        self.prompt("original", "hello")
+        self.wait(lambda: self.status()["receipts"]["original"]["state"] == "completed", "original")
+        (self.repo / "reject-fork").touch()
+        body = {"request_id": "rewind", "before": "original-turn", "replacement": {"request_id": "corrected", "text": "corrected"}}
+        self.service.request("POST", "/v1/sessions/cr_seed/rewind", body, 202)
+        self.wait(lambda: self.status()["receipts"]["rewind"]["state"] == "unknown", "uncertain rewind")
+        rejected = self.service.request("POST", "/v1/sessions/cr_seed/prompts", {"request_id": "after", "text": "hello"}, 409)
+        self.assertNotEqual(rejected["error"], "wait for the pending rewind")
+
+    def test_restart_marks_uncertain_rewind_terminal_and_releases_the_guard(self):
+        self.seed([("receipt", {"request_id": "rewind", "command": "rewind", "input": {"before": "original-turn"}, "state": "accepted"})])
+        self.start(); self.ready()
+        self.assertEqual(self.status()["receipts"]["rewind"]["state"], "unknown_after_restart")
+        self.prompt("after", "hello")
+        self.wait(lambda: self.status()["receipts"]["after"]["state"] == "completed", "post-restart prompt")
+
+    def test_explicit_model_is_checked_without_reasoning(self):
+        self.seed(); self.start(); self.ready()
+        rejected = self.service.request("POST", "/v1/sessions", {"request_id": "invalid-model", "model": "missing"}, 409)
+        self.assertEqual(rejected["code"], "invalid_model")
 
     def test_reused_pid_never_kills_unrelated_process(self):
         sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", self.env["CLOUDROOM_CODEX_BINARY"]],

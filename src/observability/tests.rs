@@ -8,7 +8,7 @@ impl Directory {
             "cloudroom-diagnostics-{:x}",
             RandomState::new().hash_one(SystemTime::now())
         ));
-        fs::create_dir(&path).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         Self(path)
     }
 }
@@ -16,6 +16,17 @@ impl Drop for Directory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn private_fixture_directory_is_not_relaxed_by_the_runner_umask() {
+    // The suite is run under both 0002 and 0022 in CI. Directory::new requests
+    // owner-only permissions so either ambient umask leaves this fixture private.
+    let directory = Directory::new();
+    assert_eq!(
+        fs::metadata(&directory.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 #[test]

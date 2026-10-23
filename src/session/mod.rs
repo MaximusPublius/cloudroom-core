@@ -612,18 +612,18 @@ impl Manager {
         &self,
         kind: runtime::Kind,
         model: Option<&String>,
-        reasoning: &str,
+        reasoning: Option<&str>,
     ) -> Result<()> {
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
                 let models = self.model_catalog(kind).await?;
                 let selected = model.unwrap_or(&self.config.harnesses[&kind].model);
-                runtime::reasoning_levels(kind, &models, selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .contains(&reasoning)
+                let levels = runtime::reasoning_levels(kind, &models, selected)
+                    .ok_or(Error::Conflict("invalid model"))?;
+                reasoning.is_none_or(|reasoning| levels.contains(&reasoning))
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
-                runtime::PI_REASONING_LEVELS.contains(&reasoning)
+                reasoning.is_none_or(|reasoning| runtime::PI_REASONING_LEVELS.contains(&reasoning))
             }
         };
         if !supported {
@@ -718,8 +718,8 @@ impl Manager {
             return Err(Error::Conflict("harness is not configured"));
         }
         self.harness_ready(kind).await?;
-        if let Some(reasoning) = &reasoning {
-            self.execution_supported(kind, model.as_ref(), reasoning)
+        if model.is_some() || reasoning.is_some() {
+            self.execution_supported(kind, model.as_ref(), reasoning.as_deref())
                 .await?;
         }
         let workspace = match workspace {
@@ -1163,10 +1163,11 @@ impl Manager {
                     self.wake(&mut local, id)?;
                     Next::None
                 }
-                "edit" | "cancel" | "reorder" | "attach" => {
+                "edit" | "cancel" | "reorder" => {
                     local.finish_receipt(id, &request, "completed")?;
                     Next::None
                 }
+                "attach" => Next::None,
                 "resume" if retry_startup => {
                     self.schedule_resume(&mut local, id)?;
                     Next::None
@@ -1257,6 +1258,16 @@ impl Manager {
             }
         }
         Ok(receipt)
+    }
+
+    pub fn finish_attachment(&self, id: &str, request: &str, state: &str) -> Result<Receipt> {
+        let mut local = self.local.lock().unwrap();
+        local.finish_receipt(id, request, state)?;
+        local.sessions[id]
+            .receipts
+            .get(request)
+            .cloned()
+            .ok_or(Error::NotFound)
     }
 
     /// Pi's process keeps the last thinking level. Remember the level it started with
