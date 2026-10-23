@@ -773,6 +773,7 @@ impl Manager {
             .workspaces
             .attach(
                 &transfer.workspace,
+                &session_id,
                 &format!("teleport_index_{id}"),
                 "files.json",
                 "file",

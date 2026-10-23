@@ -28,7 +28,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
@@ -261,6 +261,27 @@ pub struct Manager {
     stopping: AtomicBool,
     startups: Semaphore,
     teleports: teleport::Transfers,
+    // Attachment publication happens outside Local's synchronous mutex. Keep one
+    // owner per durable session/request receipt while that publication is in flight.
+    attachments: AttachmentAttempts,
+}
+
+#[derive(Default)]
+struct AttachmentAttempts {
+    locks: Mutex<AttachmentLocks>,
+}
+
+type AttachmentLocks = BTreeMap<(String, String), Arc<AsyncMutex<()>>>;
+
+impl AttachmentAttempts {
+    fn lock(&self, session: &str, request: &str) -> Arc<AsyncMutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry((session.into(), request.into()))
+            .or_default()
+            .clone()
+    }
 }
 
 impl Manager {
@@ -393,6 +414,7 @@ impl Manager {
             workspaces,
             sync,
             teleports: teleport::Transfers::default(),
+            attachments: AttachmentAttempts::default(),
             previews,
             mac: crate::mac::Mac::default(),
             secrets: crate::secrets::Secrets::default(),
@@ -612,18 +634,18 @@ impl Manager {
         &self,
         kind: runtime::Kind,
         model: Option<&String>,
-        reasoning: &str,
+        reasoning: Option<&str>,
     ) -> Result<()> {
         let supported = match kind {
             runtime::Kind::Codex | runtime::Kind::Claude | runtime::Kind::Cursor => {
                 let models = self.model_catalog(kind).await?;
                 let selected = model.unwrap_or(&self.config.harnesses[&kind].model);
-                runtime::reasoning_levels(kind, &models, selected)
-                    .ok_or(Error::Conflict("invalid model"))?
-                    .contains(&reasoning)
+                let levels = runtime::reasoning_levels(kind, &models, selected)
+                    .ok_or(Error::Conflict("invalid model"))?;
+                reasoning.is_none_or(|reasoning| levels.contains(&reasoning))
             }
             runtime::Kind::Pi | runtime::Kind::Fx => {
-                runtime::PI_REASONING_LEVELS.contains(&reasoning)
+                reasoning.is_none_or(|reasoning| runtime::PI_REASONING_LEVELS.contains(&reasoning))
             }
         };
         if !supported {
@@ -718,8 +740,8 @@ impl Manager {
             return Err(Error::Conflict("harness is not configured"));
         }
         self.harness_ready(kind).await?;
-        if let Some(reasoning) = &reasoning {
-            self.execution_supported(kind, model.as_ref(), reasoning)
+        if model.is_some() || reasoning.is_some() {
+            self.execution_supported(kind, model.as_ref(), reasoning.as_deref())
                 .await?;
         }
         let workspace = match workspace {
@@ -903,6 +925,65 @@ impl Manager {
             .get(id)
             .and_then(|session| session.receipts.get(request))
             .cloned()
+    }
+
+    pub fn attachment_lock(&self, id: &str, request: &str) -> Arc<AsyncMutex<()>> {
+        self.attachments.lock(id, request)
+    }
+
+    /// Admit one attachment attempt. A failed attachment is the one exception to
+    /// normal receipt replay: its immutable input is retained, then a caller may
+    /// explicitly re-accept that same attempt after the usual lifecycle guards.
+    pub fn accept_attachment(
+        self: &Arc<Self>,
+        id: &str,
+        request: String,
+        input: Value,
+    ) -> Result<Receipt> {
+        let mut local = self.local.lock().unwrap();
+        let session = local.sessions.get(id).ok_or(Error::NotFound)?;
+        let Some(previous) = session.receipts.get(&request).cloned() else {
+            drop(local);
+            return self.command(id, request, "attach", input);
+        };
+        if previous.command != "attach" || previous.input != input {
+            return Err(Error::Conflict("request_id already has different content"));
+        }
+        if previous.state != "failed" {
+            return Ok(previous);
+        }
+        if !local.journal.writable() {
+            return Err(Error::Storage(JOURNAL_UNWRITABLE.into()));
+        }
+        if self.is_stopping() {
+            return Err(Error::Conflict("service is stopping"));
+        }
+        if self.storage.blocks() {
+            return Err(Error::Conflict("storage unsafe; uploads are blocked"));
+        }
+        if local.draining {
+            return Err(Error::Conflict("service is draining"));
+        }
+        let session = &local.sessions[id];
+        if matches!(
+            session.state.as_str(),
+            "closed" | "closing" | "process_lost" | "failed"
+        ) || session.close_request.is_some()
+            || session.rewind_request.is_some()
+            || session.interrupt_pending()
+        {
+            return Err(Error::Conflict("wait for the pending close or interrupt"));
+        }
+        let mut receipt = previous;
+        receipt.state = "accepted".into();
+        receipt.error = None;
+        local.append(
+            id,
+            "receipt",
+            serde_json::to_value(&receipt).map_err(io::Error::other)?,
+            None,
+        )?;
+        Ok(receipt)
     }
 
     pub fn command(
@@ -1163,10 +1244,11 @@ impl Manager {
                     self.wake(&mut local, id)?;
                     Next::None
                 }
-                "edit" | "cancel" | "reorder" | "attach" => {
+                "edit" | "cancel" | "reorder" => {
                     local.finish_receipt(id, &request, "completed")?;
                     Next::None
                 }
+                "attach" => Next::None,
                 "resume" if retry_startup => {
                     self.schedule_resume(&mut local, id)?;
                     Next::None
@@ -1257,6 +1339,16 @@ impl Manager {
             }
         }
         Ok(receipt)
+    }
+
+    pub fn finish_attachment(&self, id: &str, request: &str, state: &str) -> Result<Receipt> {
+        let mut local = self.local.lock().unwrap();
+        local.finish_receipt(id, request, state)?;
+        local.sessions[id]
+            .receipts
+            .get(request)
+            .cloned()
+            .ok_or(Error::NotFound)
     }
 
     /// Pi's process keeps the last thinking level. Remember the level it started with

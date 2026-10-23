@@ -96,6 +96,13 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
 }
 fn prompt_items(input: &Value) -> Vec<Value> {
     let mut items = Vec::new();
+    if let Some(text) = input["text"].as_str() {
+        items.push(json!({
+            "type":"text",
+            "text":text,
+            "text_elements":[]
+        }));
+    }
     if let Some(content) = input["content"].as_array() {
         for part in content {
             match part["type"].as_str() {
@@ -125,7 +132,7 @@ fn prompt_items(input: &Value) -> Vec<Value> {
     if items.is_empty() {
         items.push(json!({
             "type":"text",
-            "text":input["text"].as_str().unwrap_or(""),
+            "text":"",
             "text_elements":[]
         }));
     }
@@ -626,5 +633,31 @@ pub(super) fn recover(
         if before == tail.read_offset {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_items;
+    use serde_json::json;
+
+    #[test]
+    fn prompt_items_preserve_top_level_instruction_with_structured_content() {
+        let items = prompt_items(&json!({
+            "text":"Follow the repository instructions before inspecting the image.",
+            "content":[{"type":"image","path":"/tmp/screenshot.png"}]
+        }));
+
+        assert_eq!(
+            items,
+            vec![
+                json!({
+                    "type":"text",
+                    "text":"Follow the repository instructions before inspecting the image.",
+                    "text_elements":[]
+                }),
+                json!({"type":"localImage","path":"/tmp/screenshot.png"})
+            ]
+        );
     }
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real HTTP sync checks for skills/settings/login, including safe repository-sync retirement."""
 import io
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -48,6 +49,60 @@ class SyncTests(unittest.TestCase):
         self.assertFalse((self.cloud / 'linked/secret').exists())
         self.assertTrue((self.local / 'linked').is_symlink())
         self.assertEqual(self.sync()['roots']['skills-shared']['conflicts'], 1)
+
+    def test_attachment_existing_files_and_link_races_preserve_the_winner(self):
+        """MOCK/SYNTHETIC scheduling around the real attachment helper."""
+        import files
+        root = self.root.resolve() / 'attachment-helper'; root.mkdir()
+        tree = Tree(root)
+        relative, body = 'attachments/note.txt', b'expected attachment'
+        digest = hashlib.sha256(body).hexdigest()
+        target = root / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(body)
+        before = target.stat()
+        self.assertEqual(tree.attach(relative, io.BytesIO(body), 1024, len(body), digest),
+                         {'size': len(body), 'sha256': digest})
+        after = target.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        changed = b'changed attachment'
+        with self.assertRaises(ValueError):
+            tree.attach(relative, io.BytesIO(changed), 1024, len(changed), hashlib.sha256(changed).hexdigest())
+        self.assertEqual(target.read_bytes(), body)
+
+        def race(name, winner, symlink=False):
+            relative = 'attachments/' + name
+            target = root / relative
+            outside = root / ('outside-' + winner.decode()); outside.write_bytes(winner)
+            original_link = files.os.link
+            winner_stat = None
+            def competing(*args, **kwargs):
+                nonlocal winner_stat
+                if symlink:
+                    target.symlink_to(outside)
+                else:
+                    target.write_bytes(winner)
+                winner_stat = target.lstat()
+                return original_link(*args, **kwargs)
+            with patch('files.os.link', side_effect=competing) as link:
+                if symlink or winner != body:
+                    with self.assertRaises(ValueError):
+                        tree.attach(relative, io.BytesIO(body), 1024, len(body), digest)
+                else:
+                    self.assertEqual(tree.attach(relative, io.BytesIO(body), 1024, len(body), digest),
+                                     {'size': len(body), 'sha256': digest})
+                link.assert_called_once()
+            self.assertEqual(target.lstat().st_ino, winner_stat.st_ino)
+            self.assertFalse(list(target.parent.glob('.attachment-*')))
+            if symlink:
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(outside.read_bytes(), winner)
+            else:
+                self.assertEqual(target.read_bytes(), winner)
+
+        race('matching.txt', body)
+        race('different.txt', b'wrong winner'.ljust(len(body), b'!'))
+        race('symlink.txt', b'outside sentinel', symlink=True)
 
     def test_old_repository_roots_never_copy_or_delete_files_and_migrate_without_losing_baselines(self):
         self.prepare()

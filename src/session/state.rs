@@ -263,6 +263,18 @@ impl Local {
                     session.rewind_request = Some(receipt.request_id.clone());
                     session.state = "rewinding".into();
                 }
+                if receipt.command == "rewind"
+                    && matches!(
+                        receipt.state.as_str(),
+                        "completed"
+                            | "failed"
+                            | "interrupted"
+                            | "unknown"
+                            | "unknown_after_restart"
+                    )
+                {
+                    session.rewind_request = None;
+                }
                 prompt::apply(&mut session.prompts, &receipt);
                 session.receipts.insert(receipt.request_id.clone(), receipt);
             }

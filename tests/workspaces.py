@@ -1,6 +1,7 @@
 """Direct HTTP starts and durable workspace recovery; archive imports are retired."""
 import concurrent.futures
 import http.client
+import hashlib
 import json
 from pathlib import Path
 import secrets
@@ -80,8 +81,61 @@ class WorkspaceTests(unittest.TestCase):
         for item in results:
             until(lambda:self.service.session(item['session_id'])['state']=='idle','peer',10)
             self.assertEqual(self.service.session(item['session_id'])['workspace']['path'],str(path))
+        def shared_upload(session_id, content):
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST',f'/v1/sessions/{session_id}/attachments?request_id=same&name=note.txt&kind=file',content,
+                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            data = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status,202,data)
+            return Path(data['receipt']['input']['path'])
+        first, second = [shared_upload(item['session_id'], content) for item, content in zip(results, [b'abcd', b'wxyz'])]
+        self.assertNotEqual(first, second)
+        self.assertEqual((first.read_bytes(), second.read_bytes()), (b'abcd', b'wxyz'))
+        closed = results[0]['session_id']
+        self.service.request('POST', f'/v1/sessions/{closed}/close', {'request_id':'close'}, 202)
+        until(lambda:self.service.session(closed)['state']=='closed','closed attachment target',10)
+        connection = http.client.HTTPConnection(self.service.address, timeout=10)
+        connection.request('POST',f'/v1/sessions/{closed}/attachments?request_id=after-close&name=note.txt&kind=file',b'nope',
+            {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'],'Content-Type':'application/octet-stream'})
+        response = connection.getresponse()
+        self.assertEqual(response.status,409); response.read(); connection.close()
+        self.assertFalse((path/'.cloudroom/attachments'/closed/'after-close'/'note.txt').exists())
         self.assertEqual((path/'keep').read_text(),'cloud work')
         print('Direct empty-folder start + attachment + first prompt (protocol fixtures), seconds:',samples)
+
+    def test_failed_session_rejects_failed_attachment_retry_without_publication(self):
+        # Seed the durable state left by an upload failure followed by startup failure.
+        key = 'failed-attachment'
+        sid = 'cr_' + key
+        path = self.state.resolve() / 'code' / key
+        self.seed(key, path, legacy_state='failed')
+        body = b'retry me'
+        target = path / '.cloudroom/attachments' / sid / 'retry' / 'note.txt'
+        receipt = {'request_id':'retry', 'command':'attach', 'state':'failed',
+            'input':{'id':'retry', 'name':'note.txt', 'kind':'file',
+                'size':len(body), 'sha256':hashlib.sha256(body).hexdigest(), 'path':str(target)}}
+        sequence = len(list(self.state.glob('*.record'))) + 1
+        (self.state / f'{sequence:020}.record').write_text(json.dumps(
+            {'sequence':sequence, 'session_id':sid, 'kind':'receipt', 'data':receipt}))
+        self.start()
+        self.assertEqual(self.service.session(sid)['state'], 'failed')
+        before = self.service.session(sid)['receipts']['retry']
+        # Both a retry and a fresh attachment must fail before publication.
+        for request in ['retry', 'fresh']:
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST', f'/v1/sessions/{sid}/attachments?request_id={request}&name=note.txt&kind=file', body,
+                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'], 'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            data = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status, 409, data)
+            self.assertEqual(data['error'], 'wait for the pending close or interrupt' if request == 'retry'
+                else 'process unavailable; history does not restore execution')
+            self.assertFalse((target.parent.parent / request / 'note.txt').exists())
+        after = self.service.session(sid)
+        self.assertEqual(after['receipts']['retry'], before)
+        self.assertNotIn('fresh', after['receipts'])
+        self.assertFalse((path / '.cloudroom/attachments' / sid).exists())
 
     def test_attachment_bytes_limits_retry_and_no_symlink_escape(self):
         self.pi()
@@ -99,18 +153,29 @@ class WorkspaceTests(unittest.TestCase):
         for kind,path in paths.items():
             until(lambda:self.service.session('cr_'+kind)['state']=='idle','attachment target',10)
             path.chmod(0o700)
+            attachments = path/'.cloudroom/attachments'/('cr_'+kind)
             for index, (blocked, mode) in enumerate([(path, 0o000), (path/'.cloudroom', 0o000),
-                    (path/'.cloudroom/attachments', 0o500), (path/'.cloudroom/attachments/denied-3', 0o500)]):
+                    (path/'.cloudroom/attachments', 0o500), (attachments/'denied-3', 0o500)]):
                 blocked.mkdir(mode=0o700, exist_ok=True)
                 blocked.chmod(mode)
                 try:
                     denied = upload(kind,'denied-'+str(index),'note.txt',b'retry me',expected=409)
                     self.assertEqual(denied, {'code':'attachment_permission_denied','error':'Cloud folder permission denied'})
-                    self.assertNotIn('denied-'+str(index),self.service.session('cr_'+kind)['receipts'])
+                    receipt = self.service.session('cr_'+kind)['receipts']['denied-'+str(index)]
+                    self.assertEqual(receipt['state'], 'failed')
+                    self.assertEqual(receipt['input']['name'], 'note.txt')
+                    self.assertEqual(receipt['input']['kind'], 'file')
+                    self.assertEqual(receipt['input']['size'], len(b'retry me'))
+                    self.assertFalse((attachments/('denied-'+str(index))/'note.txt').exists())
+                    # A repeated denial is a new guarded attempt, not an erased receipt.
+                    self.assertEqual(upload(kind,'denied-'+str(index),'note.txt',b'retry me',expected=409), denied)
+                    self.assertEqual(self.service.session('cr_'+kind)['receipts']['denied-'+str(index)]['state'], 'failed')
+                    self.assertEqual(upload(kind,'denied-'+str(index),'note.txt',b'changed',expected=409)['code'],'request_conflict')
                 finally:
                     blocked.chmod(0o700)
                 retried = upload(kind,'denied-'+str(index),'note.txt',b'retry me')['receipt']['input']
                 self.assertEqual(Path(retried['path']).read_bytes(),b'retry me')
+                self.assertEqual(self.service.session('cr_'+kind)['receipts']['denied-'+str(index)]['state'], 'completed')
             payload = ('ATTACHMENT_'+kind+'\\n').encode()*10000
             uploaded = upload(kind,'note','note.txt',payload)['receipt']['input']
             dest = Path(uploaded['path'])
@@ -125,15 +190,15 @@ class WorkspaceTests(unittest.TestCase):
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
-                self.assertFalse((path/'.cloudroom/attachments'/('large-'+media)/'large').exists())
+                self.assertFalse((attachments/('large-'+media)/'large').exists())
             outside = self.root.resolve()/('outside-'+kind); outside.mkdir()
             (outside/'keep').write_text('untouched')
-            (path/'.cloudroom/attachments/escape').symlink_to(outside)
+            (attachments/'escape').symlink_to(outside)
             upload(kind,'escape','keep',b'changed',expected=409)
-            linked = path/'.cloudroom/attachments/linked'; linked.mkdir()
+            linked = attachments/'linked'; linked.mkdir()
             (linked/'keep').symlink_to(outside/'keep')
             upload(kind,'linked','keep',b'changed',expected=409)
-            temporary = path/'.cloudroom/attachments/temporary'; temporary.mkdir()
+            temporary = attachments/'temporary'; temporary.mkdir()
             (temporary/'.note.txt.tmp').symlink_to(outside/'keep')
             temporary_upload = upload(kind,'temporary','note.txt',b'normal upload')['receipt']['input']
             self.assertEqual(Path(temporary_upload['path']).read_bytes(),b'normal upload')

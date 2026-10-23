@@ -2,6 +2,7 @@ pub mod storage;
 
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     os::unix::fs::MetadataExt,
@@ -367,9 +368,12 @@ impl Workspaces {
         }
     }
 
+    // Scope decision: this seven-argument attachment API preserves destination-session isolation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         &self,
         workspace: &Workspace,
+        session_id: &str,
         request_id: &str,
         name: &str,
         kind: &str,
@@ -397,7 +401,8 @@ impl Workspaces {
         {
             return Err(io::Error::other("invalid attachment name"));
         }
-        let relative = format!(".cloudroom/attachments/{request_id}/{name}");
+        valid_session_id(session_id)?;
+        let relative = format!(".cloudroom/attachments/{session_id}/{request_id}/{name}");
         let limit = if kind == "image" {
             10 * 1024 * 1024
         } else {
@@ -423,8 +428,9 @@ impl Workspaces {
             .kill_on_drop(true);
         let (mut child, _workload) = guard.spawn_writer(&mut command)?;
         let mut input = child.stdin.take().unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let request = serde_json::json!({"op":"attach", "tree":{"root":workspace.path},
-            "path":relative, "limit":limit, "size":bytes.len()});
+            "path":relative, "limit":limit, "size":bytes.len(), "sha256":sha256});
         let transfer = async {
             input.write_all(&serde_json::to_vec(&request)?).await?;
             input.write_all(b"\n").await?;
@@ -442,8 +448,13 @@ impl Workspaces {
                 Err(error)
             }
         })?;
+        if result["sha256"] != sha256 {
+            return Err(io::Error::other(
+                "attachment content changed during publication",
+            ));
+        }
         Ok(serde_json::json!({"id":request_id,"name":name,"kind":kind,
-            "path":workspace.path.join(relative),"size":result["size"]}))
+            "path":workspace.path.join(relative),"size":result["size"],"sha256":sha256}))
     }
 }
 
@@ -535,4 +546,35 @@ pub fn valid_id(id: &str) -> io::Result<()> {
         return Err(io::Error::other("Invalid workspace ID"));
     }
     Ok(())
+}
+
+// Generated session IDs add `cr_` to a request ID of up to 64 characters.
+// Keep accepting existing unprefixed IDs without relaxing their length limit.
+fn valid_session_id(id: &str) -> io::Result<()> {
+    valid_id(id.strip_prefix("cr_").unwrap_or(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_id, valid_session_id};
+
+    #[test]
+    fn attachment_session_id_boundaries_and_traversal() {
+        for length in [1, 61, 62, 63, 64] {
+            let request = "a".repeat(length);
+            assert!(valid_id(&request).is_ok());
+            assert!(valid_session_id(&format!("cr_{request}")).is_ok());
+        }
+        assert!(valid_session_id(&format!("cr_{}", "a".repeat(65))).is_err());
+        assert!(valid_session_id(&"a".repeat(64)).is_ok());
+        assert!(valid_session_id(&"a".repeat(65)).is_err());
+        assert!(valid_id(&format!("cr_{}", "a".repeat(62))).is_err());
+        assert!(valid_session_id("cr_Az09_-").is_ok());
+        for invalid in [
+            "", "cr_", ".", "..", "cr_..", "cr_a/b", "cr_a\\b", "cr_a.b", "cr_a:b", "cr_a\0",
+            "cr_é",
+        ] {
+            assert!(valid_session_id(invalid).is_err(), "{invalid:?}");
+        }
+    }
 }
