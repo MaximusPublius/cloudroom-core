@@ -521,7 +521,9 @@ impl IntoResponse for session::Error {
             | "saved session has no matching receipt" => "request_conflict",
             "agent setup is incomplete" | "harness is not configured" => "harness_not_configured",
             "invalid workspace" | "workspace mapping unavailable" => "invalid_workspace",
-            "storage unsafe; new execution is blocked" | "storage unsafe; uploads are blocked" => "storage_blocked",
+            "storage unsafe; new execution is blocked" | "storage unsafe; uploads are blocked" => {
+                "storage_blocked"
+            }
             "service is stopping" => "service_stopping",
             "service is draining" => "service_draining",
             "model catalog unavailable" => "model_catalog_unavailable",
@@ -1025,6 +1027,8 @@ async fn attach(
         .await
         .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let lock = manager.attachment_lock(&id, &query.request_id);
+    let _attempt = lock.lock().await;
     if let Some(receipt) = manager.receipt(&id, &query.request_id) {
         if receipt.command != "attach"
             || receipt.input["name"] != query.name
@@ -1036,7 +1040,12 @@ async fn attach(
                 "request_id already has different content",
             ));
         }
-        return Ok(accepted(&manager, &id, receipt));
+        // A completed receipt is immutable replay; an accepted attempt already has
+        // an owner under this per-request lock. Only failed receipts re-enter
+        // admission below, where their bound destination is rechecked as well.
+        if receipt.state != "failed" {
+            return Ok(accepted(&manager, &id, receipt));
+        }
     }
     let session = manager.session(&id).await?;
     let workspace = session
@@ -1058,7 +1067,7 @@ async fn attach(
     let input = json!({"id":&query.request_id,"name":&query.name,"kind":&query.kind,
         "path":workspace.path.join(format!(".cloudroom/attachments/{id}/{}/{}", query.request_id, query.name)),
         "size":bytes.len(),"sha256":&sha256});
-    let receipt = manager.command(&id, query.request_id.clone(), "attach", input.clone())?;
+    let receipt = manager.accept_attachment(&id, query.request_id.clone(), input.clone())?;
     if receipt.state != "accepted" {
         return Ok(accepted(&manager, &id, receipt));
     }

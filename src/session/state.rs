@@ -264,7 +264,14 @@ impl Local {
                     session.state = "rewinding".into();
                 }
                 if receipt.command == "rewind"
-                    && matches!(receipt.state.as_str(), "completed" | "failed" | "interrupted" | "unknown" | "unknown_after_restart")
+                    && matches!(
+                        receipt.state.as_str(),
+                        "completed"
+                            | "failed"
+                            | "interrupted"
+                            | "unknown"
+                            | "unknown_after_restart"
+                    )
                 {
                     session.rewind_request = None;
                 }

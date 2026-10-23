@@ -368,6 +368,8 @@ impl Workspaces {
         }
     }
 
+    // Scope decision: this seven-argument attachment API preserves destination-session isolation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         &self,
         workspace: &Workspace,
@@ -447,7 +449,9 @@ impl Workspaces {
             }
         })?;
         if result["sha256"] != sha256 {
-            return Err(io::Error::other("attachment content changed during publication"));
+            return Err(io::Error::other(
+                "attachment content changed during publication",
+            ));
         }
         Ok(serde_json::json!({"id":request_id,"name":name,"kind":kind,
             "path":workspace.path.join(relative),"size":result["size"],"sha256":sha256}))

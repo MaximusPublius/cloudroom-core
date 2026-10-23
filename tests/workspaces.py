@@ -127,11 +127,21 @@ class WorkspaceTests(unittest.TestCase):
                 try:
                     denied = upload(kind,'denied-'+str(index),'note.txt',b'retry me',expected=409)
                     self.assertEqual(denied, {'code':'attachment_permission_denied','error':'Cloud folder permission denied'})
-                    self.assertNotIn('denied-'+str(index),self.service.session('cr_'+kind)['receipts'])
+                    receipt = self.service.session('cr_'+kind)['receipts']['denied-'+str(index)]
+                    self.assertEqual(receipt['state'], 'failed')
+                    self.assertEqual(receipt['input']['name'], 'note.txt')
+                    self.assertEqual(receipt['input']['kind'], 'file')
+                    self.assertEqual(receipt['input']['size'], len(b'retry me'))
+                    self.assertFalse((attachments/('denied-'+str(index))/'note.txt').exists())
+                    # A repeated denial is a new guarded attempt, not an erased receipt.
+                    self.assertEqual(upload(kind,'denied-'+str(index),'note.txt',b'retry me',expected=409), denied)
+                    self.assertEqual(self.service.session('cr_'+kind)['receipts']['denied-'+str(index)]['state'], 'failed')
+                    self.assertEqual(upload(kind,'denied-'+str(index),'note.txt',b'changed',expected=409)['code'],'request_conflict')
                 finally:
                     blocked.chmod(0o700)
                 retried = upload(kind,'denied-'+str(index),'note.txt',b'retry me')['receipt']['input']
                 self.assertEqual(Path(retried['path']).read_bytes(),b'retry me')
+                self.assertEqual(self.service.session('cr_'+kind)['receipts']['denied-'+str(index)]['state'], 'completed')
             payload = ('ATTACHMENT_'+kind+'\\n').encode()*10000
             uploaded = upload(kind,'note','note.txt',payload)['receipt']['input']
             dest = Path(uploaded['path'])

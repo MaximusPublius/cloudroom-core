@@ -28,7 +28,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
@@ -261,6 +261,27 @@ pub struct Manager {
     stopping: AtomicBool,
     startups: Semaphore,
     teleports: teleport::Transfers,
+    // Attachment publication happens outside Local's synchronous mutex. Keep one
+    // owner per durable session/request receipt while that publication is in flight.
+    attachments: AttachmentAttempts,
+}
+
+#[derive(Default)]
+struct AttachmentAttempts {
+    locks: Mutex<AttachmentLocks>,
+}
+
+type AttachmentLocks = BTreeMap<(String, String), Arc<AsyncMutex<()>>>;
+
+impl AttachmentAttempts {
+    fn lock(&self, session: &str, request: &str) -> Arc<AsyncMutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry((session.into(), request.into()))
+            .or_default()
+            .clone()
+    }
 }
 
 impl Manager {
@@ -393,6 +414,7 @@ impl Manager {
             workspaces,
             sync,
             teleports: teleport::Transfers::default(),
+            attachments: AttachmentAttempts::default(),
             previews,
             mac: crate::mac::Mac::default(),
             secrets: crate::secrets::Secrets::default(),
@@ -903,6 +925,65 @@ impl Manager {
             .get(id)
             .and_then(|session| session.receipts.get(request))
             .cloned()
+    }
+
+    pub fn attachment_lock(&self, id: &str, request: &str) -> Arc<AsyncMutex<()>> {
+        self.attachments.lock(id, request)
+    }
+
+    /// Admit one attachment attempt. A failed attachment is the one exception to
+    /// normal receipt replay: its immutable input is retained, then a caller may
+    /// explicitly re-accept that same attempt after the usual lifecycle guards.
+    pub fn accept_attachment(
+        self: &Arc<Self>,
+        id: &str,
+        request: String,
+        input: Value,
+    ) -> Result<Receipt> {
+        let mut local = self.local.lock().unwrap();
+        let session = local.sessions.get(id).ok_or(Error::NotFound)?;
+        let Some(previous) = session.receipts.get(&request).cloned() else {
+            drop(local);
+            return self.command(id, request, "attach", input);
+        };
+        if previous.command != "attach" || previous.input != input {
+            return Err(Error::Conflict("request_id already has different content"));
+        }
+        if previous.state != "failed" {
+            return Ok(previous);
+        }
+        if !local.journal.writable() {
+            return Err(Error::Storage(JOURNAL_UNWRITABLE.into()));
+        }
+        if self.is_stopping() {
+            return Err(Error::Conflict("service is stopping"));
+        }
+        if self.storage.blocks() {
+            return Err(Error::Conflict("storage unsafe; uploads are blocked"));
+        }
+        if local.draining {
+            return Err(Error::Conflict("service is draining"));
+        }
+        let session = &local.sessions[id];
+        if matches!(
+            session.state.as_str(),
+            "closed" | "closing" | "process_lost"
+        ) || session.close_request.is_some()
+            || session.rewind_request.is_some()
+            || session.interrupt_pending()
+        {
+            return Err(Error::Conflict("wait for the pending close or interrupt"));
+        }
+        let mut receipt = previous;
+        receipt.state = "accepted".into();
+        receipt.error = None;
+        local.append(
+            id,
+            "receipt",
+            serde_json::to_value(&receipt).map_err(io::Error::other)?,
+            None,
+        )?;
+        Ok(receipt)
     }
 
     pub fn command(
