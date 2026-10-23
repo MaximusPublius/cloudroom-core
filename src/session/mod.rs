@@ -967,7 +967,7 @@ impl Manager {
         let session = &local.sessions[id];
         if matches!(
             session.state.as_str(),
-            "closed" | "closing" | "process_lost"
+            "closed" | "closing" | "process_lost" | "failed"
         ) || session.close_request.is_some()
             || session.rewind_request.is_some()
             || session.interrupt_pending()

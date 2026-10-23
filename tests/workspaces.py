@@ -1,6 +1,7 @@
 """Direct HTTP starts and durable workspace recovery; archive imports are retired."""
 import concurrent.futures
 import http.client
+import hashlib
 import json
 from pathlib import Path
 import secrets
@@ -102,6 +103,39 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse((path/'.cloudroom/attachments'/closed/'after-close'/'note.txt').exists())
         self.assertEqual((path/'keep').read_text(),'cloud work')
         print('Direct empty-folder start + attachment + first prompt (protocol fixtures), seconds:',samples)
+
+    def test_failed_session_rejects_failed_attachment_retry_without_publication(self):
+        # Seed the durable state left by an upload failure followed by startup failure.
+        key = 'failed-attachment'
+        sid = 'cr_' + key
+        path = self.state.resolve() / 'code' / key
+        self.seed(key, path, legacy_state='failed')
+        body = b'retry me'
+        target = path / '.cloudroom/attachments' / sid / 'retry' / 'note.txt'
+        receipt = {'request_id':'retry', 'command':'attach', 'state':'failed',
+            'input':{'id':'retry', 'name':'note.txt', 'kind':'file',
+                'size':len(body), 'sha256':hashlib.sha256(body).hexdigest(), 'path':str(target)}}
+        sequence = len(list(self.state.glob('*.record'))) + 1
+        (self.state / f'{sequence:020}.record').write_text(json.dumps(
+            {'sequence':sequence, 'session_id':sid, 'kind':'receipt', 'data':receipt}))
+        self.start()
+        self.assertEqual(self.service.session(sid)['state'], 'failed')
+        before = self.service.session(sid)['receipts']['retry']
+        # Both a retry and a fresh attachment must fail before publication.
+        for request in ['retry', 'fresh']:
+            connection = http.client.HTTPConnection(self.service.address, timeout=10)
+            connection.request('POST', f'/v1/sessions/{sid}/attachments?request_id={request}&name=note.txt&kind=file', body,
+                {'Authorization':'Bearer '+self.env['CLOUDROOM_TOKEN'], 'Content-Type':'application/octet-stream'})
+            response = connection.getresponse()
+            data = json.loads(response.read()); connection.close()
+            self.assertEqual(response.status, 409, data)
+            self.assertEqual(data['error'], 'wait for the pending close or interrupt' if request == 'retry'
+                else 'process unavailable; history does not restore execution')
+            self.assertFalse((target.parent.parent / request / 'note.txt').exists())
+        after = self.service.session(sid)
+        self.assertEqual(after['receipts']['retry'], before)
+        self.assertNotIn('fresh', after['receipts'])
+        self.assertFalse((path / '.cloudroom/attachments' / sid).exists())
 
     def test_attachment_bytes_limits_retry_and_no_symlink_escape(self):
         self.pi()

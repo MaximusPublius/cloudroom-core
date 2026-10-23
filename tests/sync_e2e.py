@@ -65,27 +65,34 @@ class SyncTests(unittest.TestCase):
                          {'size': len(body), 'sha256': digest})
         after = target.stat()
         self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        changed = b'changed attachment'
         with self.assertRaises(ValueError):
-            tree.attach(relative, io.BytesIO(b'changed attachment'), 1024, len(body), digest)
+            tree.attach(relative, io.BytesIO(changed), 1024, len(changed), hashlib.sha256(changed).hexdigest())
         self.assertEqual(target.read_bytes(), body)
 
         def race(name, winner, symlink=False):
-            target = root / ('attachments/' + name)
+            relative = 'attachments/' + name
+            target = root / relative
             outside = root / ('outside-' + winner.decode()); outside.write_bytes(winner)
             original_link = files.os.link
+            winner_stat = None
             def competing(*args, **kwargs):
+                nonlocal winner_stat
                 if symlink:
                     target.symlink_to(outside)
                 else:
                     target.write_bytes(winner)
+                winner_stat = target.lstat()
                 return original_link(*args, **kwargs)
-            with patch('files.os.link', side_effect=competing):
+            with patch('files.os.link', side_effect=competing) as link:
                 if symlink or winner != body:
                     with self.assertRaises(ValueError):
                         tree.attach(relative, io.BytesIO(body), 1024, len(body), digest)
                 else:
                     self.assertEqual(tree.attach(relative, io.BytesIO(body), 1024, len(body), digest),
                                      {'size': len(body), 'sha256': digest})
+                link.assert_called_once()
+            self.assertEqual(target.lstat().st_ino, winner_stat.st_ino)
             self.assertFalse(list(target.parent.glob('.attachment-*')))
             if symlink:
                 self.assertTrue(target.is_symlink())
