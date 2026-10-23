@@ -119,8 +119,9 @@ class WorkspaceTests(unittest.TestCase):
         for kind,path in paths.items():
             until(lambda:self.service.session('cr_'+kind)['state']=='idle','attachment target',10)
             path.chmod(0o700)
+            attachments = path/'.cloudroom/attachments'/('cr_'+kind)
             for index, (blocked, mode) in enumerate([(path, 0o000), (path/'.cloudroom', 0o000),
-                    (path/'.cloudroom/attachments', 0o500), (path/'.cloudroom/attachments/denied-3', 0o500)]):
+                    (path/'.cloudroom/attachments', 0o500), (attachments/'denied-3', 0o500)]):
                 blocked.mkdir(mode=0o700, exist_ok=True)
                 blocked.chmod(mode)
                 try:
@@ -145,15 +146,15 @@ class WorkspaceTests(unittest.TestCase):
             for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
-                self.assertFalse((path/'.cloudroom/attachments'/('large-'+media)/'large').exists())
+                self.assertFalse((attachments/('large-'+media)/'large').exists())
             outside = self.root.resolve()/('outside-'+kind); outside.mkdir()
             (outside/'keep').write_text('untouched')
-            (path/'.cloudroom/attachments/escape').symlink_to(outside)
+            (attachments/'escape').symlink_to(outside)
             upload(kind,'escape','keep',b'changed',expected=409)
-            linked = path/'.cloudroom/attachments/linked'; linked.mkdir()
+            linked = attachments/'linked'; linked.mkdir()
             (linked/'keep').symlink_to(outside/'keep')
             upload(kind,'linked','keep',b'changed',expected=409)
-            temporary = path/'.cloudroom/attachments/temporary'; temporary.mkdir()
+            temporary = attachments/'temporary'; temporary.mkdir()
             (temporary/'.note.txt.tmp').symlink_to(outside/'keep')
             temporary_upload = upload(kind,'temporary','note.txt',b'normal upload')['receipt']['input']
             self.assertEqual(Path(temporary_upload['path']).read_bytes(),b'normal upload')

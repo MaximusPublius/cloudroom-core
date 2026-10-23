@@ -187,7 +187,8 @@ def main():
                     assert request('POST',url,content,202)['receipt']['input']==uploaded
                     # A new session has no upload receipt: retry also exercises the file helper's existing-file path.
                     retry_url=url.replace('/'+sid+'/', '/'+peer+'/')
-                    assert request('POST',retry_url,content,202)['receipt']['input']==uploaded
+                    peer_uploaded=request('POST',retry_url,content,202)['receipt']['input']
+                    assert peer_uploaded=={**uploaded,'path':str(dest.parents[2]/peer/key/name)}
                     after=dest.stat()
                     assert (before.st_ino,before.st_mtime_ns)==(after.st_ino,after.st_mtime_ns)
                     assert dest.read_bytes()==content and not list(dest.parent.glob('.attachment-*'))
