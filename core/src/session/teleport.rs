@@ -141,6 +141,13 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 fn validate(manifest: &Manifest) -> Result<()> {
     if !valid_id(&manifest.request_id)
         || !valid_id(&manifest.native_id)
@@ -184,10 +191,8 @@ fn validate(manifest: &Manifest) -> Result<()> {
                     || !entry.path.starts_with("rollout-")
                     || !entry.path.ends_with(".jsonl")))
             || entry.size > 4 * 1024 * 1024 * 1024
-            || (!(entry.sha256.is_empty()
-                && matches!(entry.kind.as_str(), "project" | "attachment"))
-                && (entry.sha256.len() != 64
-                    || !entry.sha256.bytes().all(|c| c.is_ascii_hexdigit())))
+            || !(valid_sha256(&entry.sha256)
+                || entry.sha256.is_empty() && matches!(entry.kind.as_str(), "project" | "attachment"))
             || entry
                 .origin
                 .as_ref()
@@ -208,11 +213,10 @@ fn validate(manifest: &Manifest) -> Result<()> {
 
 /// A closed session gave its conversation back (Teleport to Local).
 fn native_in_use(local: &super::Local, native_id: &str) -> bool {
-    local.sessions.values().any(|s| {
-        s.native_id.as_deref() == Some(native_id)
-            && s.state != "closed"
-            && s.close_request.is_none()
-    })
+    local
+        .sessions
+        .values()
+        .any(|s| s.native_id.as_deref() == Some(native_id) && s.state != "closed")
 }
 
 impl Manager {
@@ -517,8 +521,7 @@ impl Manager {
             .get(index)
             .ok_or(Error::NotFound)?
             .clone();
-        if sha256.len() != 64
-            || !sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        if !valid_sha256(&sha256)
             || (!entry.sha256.is_empty() && entry.sha256 != sha256)
             || transfer
                 .digests

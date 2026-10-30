@@ -6,6 +6,8 @@ on:
     paths: ['core/**', '.github/workflows/core.yml']
   pull_request:
     paths: ['core/**', '.github/workflows/core.yml']
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:

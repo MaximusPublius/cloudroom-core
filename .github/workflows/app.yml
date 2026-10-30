@@ -6,6 +6,8 @@ on:
     paths: ['gui/**', 'skills/**', '.github/workflows/app.yml']
   pull_request:
     paths: ['gui/**', 'skills/**', '.github/workflows/app.yml']
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
