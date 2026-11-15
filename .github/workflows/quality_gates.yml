@@ -23,6 +23,9 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: "2"
+    defaults:
+      run:
+        working-directory: core
     steps:
       - name: Checkout exact candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -53,6 +56,7 @@ jobs:
           python-version: "3.14"
 
       - name: Repository boundary policy
+        working-directory: .
         run: |
           test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
           test -z "$(git ls-files | awk '/^\.\.\// || /^\// { print }')"
@@ -93,6 +97,7 @@ jobs:
           python3 tests/preview_client.py
           node --test integrations/bb/client.test.ts
           python3 tests/install.py
+          python3 tests/update.py
           python3 tests/core_fixture.py
           python3 tests/pi_http.py
           python3 tests/workspaces.py
