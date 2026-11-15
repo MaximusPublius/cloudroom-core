@@ -1481,10 +1481,10 @@ impl Manager {
     fn settle_continue(self: &Arc<Self>, from: &str, id: &str, taken: bool) {
         {
             let mut local = self.local.lock().unwrap();
-            if !local
+            if local
                 .sessions
                 .get(from)
-                .is_some_and(|s| s.continuing.as_deref() == Some(id))
+                .is_none_or(|s| s.continuing.as_deref() != Some(id))
             {
                 return;
             }

@@ -356,6 +356,16 @@ class ReplayTests(unittest.TestCase):
             refused = self.service.request('POST', '/v1/sessions', {'request_id': cause.replace(' ', '-'), 'harness': 'claude-code'}, 409)
             self.assertEqual(refused, {'code': 'claude_auth_unavailable', 'error': f'Claude account could not be verified: the Claude CLI {cause}'})
 
+    def test_legacy_database_settings_require_explicit_history_destination(self):
+        # A 0.1.24 install had only DATABASE_URL. Never silently stop backing up its history.
+        env = {**self.env, 'CLOUDROOM_DATABASE_URL': 'postgresql://synthetic.invalid/history'}
+        env.pop('CLOUDROOM_LOCAL_HISTORY')
+        result = subprocess.run([str(BINARY)], env=env, capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('set CLOUDROOM_API_URL, or CLOUDROOM_LOCAL_HISTORY=1', result.stderr)
+        self.assertNotIn('postgresql://', result.stderr)
+        self.assertEqual(list(self.state.iterdir()), [])
+
     def test_non_loopback_http_requires_permission_before_storage_or_binding(self):
         binary = BINARY
         remote = ['0.0.0.0:0', '[::]:0', '192.0.2.10:0', '10.0.0.10:0', '[2001:db8::10]:0']

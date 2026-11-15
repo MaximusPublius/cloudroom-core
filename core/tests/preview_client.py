@@ -427,6 +427,21 @@ class MacJobTests(unittest.TestCase):
         # The marks that let the helper end everything the command starts (end).
         self.assertIn('(deny mach-lookup (global-name "helper.read-only") (global-name "helper.read-only.job"))', profile)
 
+    def test_cleanup_never_claims_success_during_unobserved_pid_churn(self):
+        # A fork-and-exit chain can evade every per-PID probe. New PIDs still invalidate a clean scan.
+        pids = iter(range(1000, 1100))
+        with mock.patch.object(preview, 'sandbox_checks', return_value=(lambda: [next(pids)], lambda *_: False)), \
+                mock.patch.object(preview.time, 'monotonic', side_effect=range(100)), \
+                mock.patch.object(preview.os, 'kill') as kill:
+            self.assertFalse(preview.end('synthetic', seconds=25))
+            kill.assert_not_called()
+
+    def test_cleanup_accepts_stable_unmarked_processes(self):
+        with mock.patch.object(preview, 'sandbox_checks', return_value=(lambda: [1000], lambda *_: False)), \
+                mock.patch.object(preview.os, 'kill') as kill:
+            self.assertTrue(preview.end('synthetic'))
+            kill.assert_not_called()
+
     @unittest.skipIf(os.name == 'nt', 'Mac access runs on macOS and Linux')
     def test_read_only_command_leaves_nothing_running(self):
         # Security fix: a process a Read-only command started kept running after the command, its thread and sandbox, and

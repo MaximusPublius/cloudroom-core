@@ -201,6 +201,29 @@ In the [Cloudroom app](https://www.cloudroom.dev/download), open **Settings → 
 
 ## Upgrade
 
+### Fork installations on 0.1.24
+
+The fork refresh changes the history backend. A 0.1.24 installation with only
+`CLOUDROOM_DATABASE_URL` cannot start this release until its owner chooses a
+history destination. Core refuses to silently fall back to local-only history.
+Choose a compatible HTTPS server with `CLOUDROOM_API_URL`, or explicitly choose
+`CLOUDROOM_LOCAL_HISTORY=1` and arrange backups of `CLOUDROOM_STATE_DIR`.
+
+Preserve the existing environment file, journal directory, agent homes and old
+PostgreSQL database before an upgrade. This tree has no automatic import of
+history that exists only in PostgreSQL. Local journal replay tests cover legacy
+records, paused queues and close handling; they do not establish recovery of a
+particular installation's remote-only history. Rehearse with copies on a
+disposable VM and verify session IDs, native history, workspaces and queued work
+before applying the upgrade to a real machine. The updater backs up executable
+files and verifies sessions; it is not a database migration or a history backup.
+
+The install script still selects upstream release assets, including when run
+from this fork. To deploy the fork's reconciled fixes, build this revision and
+package its installer files with a matching update manifest. A source refresh PR
+does not publish a fork release or switch an existing deployment.
+
+
 Pick a `core-v` version from the [releases](https://github.com/davidondrej/cloudroom/releases), then:
 
 ```sh

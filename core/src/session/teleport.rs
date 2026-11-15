@@ -141,6 +141,13 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 fn validate(manifest: &Manifest) -> Result<()> {
     if !valid_id(&manifest.request_id)
         || !valid_id(&manifest.native_id)
@@ -184,10 +191,8 @@ fn validate(manifest: &Manifest) -> Result<()> {
                     || !entry.path.starts_with("rollout-")
                     || !entry.path.ends_with(".jsonl")))
             || entry.size > 4 * 1024 * 1024 * 1024
-            || (!(entry.sha256.is_empty()
-                && matches!(entry.kind.as_str(), "project" | "attachment"))
-                && (entry.sha256.len() != 64
-                    || !entry.sha256.bytes().all(|c| c.is_ascii_hexdigit())))
+            || !(valid_sha256(&entry.sha256)
+                || entry.sha256.is_empty() && matches!(entry.kind.as_str(), "project" | "attachment"))
             || entry
                 .origin
                 .as_ref()
@@ -208,11 +213,10 @@ fn validate(manifest: &Manifest) -> Result<()> {
 
 /// A closed session gave its conversation back (Teleport to Local).
 fn native_in_use(local: &super::Local, native_id: &str) -> bool {
-    local.sessions.values().any(|s| {
-        s.native_id.as_deref() == Some(native_id)
-            && s.state != SessionState::Closed
-            && s.close_request.is_none()
-    })
+    local
+        .sessions
+        .values()
+        .any(|s| s.native_id.as_deref() == Some(native_id) && s.state != SessionState::Closed)
 }
 
 impl Manager {
@@ -523,8 +527,7 @@ impl Manager {
             .get(index)
             .ok_or(Error::NotFound)?
             .clone();
-        if sha256.len() != 64
-            || !sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        if !valid_sha256(&sha256)
             || (!entry.sha256.is_empty() && entry.sha256 != sha256)
             || transfer
                 .digests
@@ -916,5 +919,56 @@ impl Manager {
             error: None,
         })
         .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_sessions_keep_native_history_until_close_settles() {
+        let dir =
+            std::env::temp_dir().join(format!("cloudroom-teleport-close-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut local = super::super::Local::open(&dir).unwrap();
+        local
+            .append("session", "state", json!({"state":"closing"}), None)
+            .unwrap();
+        let session = local.sessions.get_mut("session").unwrap();
+        session.native_id = Some("native".into());
+        session.close_request = Some("close".into());
+        assert!(native_in_use(&local, "native"));
+        local
+            .append("session", "state", json!({"state":"closed"}), None)
+            .unwrap();
+        assert!(!native_in_use(&local, "native"));
+        drop(local);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_uppercase_manifest_checksums() {
+        assert!(valid_sha256(&"a".repeat(64)));
+        assert!(!valid_sha256(&"A".repeat(64)));
+        let manifest: Manifest = serde_json::from_value(json!({
+            "request_id":"transfer",
+            "harness":"codex",
+            "native_id":"native",
+            "model":"model",
+            "provider":null,
+            "reasoning":null,
+            "service_tier":null,
+            "command_guard_enabled":null,
+            "workspace":"workspace",
+            "workspace_name":"workspace",
+            "files":[{"path":"history.jsonl","size":1,"sha256":"A".repeat(64),"kind":"native","executable":false,"symlink":false,"origin":null}],
+            "handoff":"continue",
+            "queued":[]
+        })).unwrap();
+        assert!(matches!(
+            validate(&manifest),
+            Err(Error::Conflict("invalid teleport file"))
+        ));
     }
 }

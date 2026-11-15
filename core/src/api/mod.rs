@@ -1456,20 +1456,37 @@ async fn attach(
     body: Body,
 ) -> Result<impl IntoResponse> {
     key(&query.request_id)?;
-    // A part is read before any reply, so a retried last part gets its receipt instead of a reset connection.
-    let (body, part) = match query.total {
-        Some(_) => (
-            Body::empty(),
-            Some(
-                axum::body::to_bytes(body, PART_BYTES)
-                    .await
-                    .map_err(|_| session::Error::Conflict("upload part exceeds 8 MiB"))?,
-            ),
-        ),
-        None => (body, None),
-    };
+    // Read before replying, including a retry of the last chunk after its receipt was saved.
+    let bytes = axum::body::to_bytes(
+        body,
+        if query.total.is_some() {
+            PART_BYTES
+        } else {
+            101 << 20
+        },
+    )
+    .await
+    .map_err(|_| session::Error::Conflict("attachment upload failed"))?;
+    let part = json!({"offset":query.offset,"size":bytes.len(),"sha256":attachment_sha256(&bytes)});
     if let Some(receipt) = manager.receipt(&id, &query.request_id) {
-        if receipt.command != "attach" {
+        let same_content = match (query.offset, query.total) {
+            (None, None) => {
+                receipt.input["size"] == bytes.len()
+                    && receipt.input["sha256"] == attachment_sha256(&bytes)
+            }
+            (Some(_), Some(total)) => {
+                receipt.input["size"] == total
+                    && receipt.input["upload_parts"]
+                        .as_array()
+                        .is_some_and(|parts| parts.contains(&part))
+            }
+            _ => false,
+        };
+        if receipt.command != "attach"
+            || receipt.input["name"] != query.name
+            || receipt.input["kind"] != query.kind
+            || !same_content
+        {
             return Err(session::Error::Conflict(
                 "request_id already has different content",
             ));
@@ -1498,9 +1515,9 @@ async fn attach(
         ));
     }
     let key = format!("{id}/{}", query.request_id);
-    let body = match (query.offset, query.total, part) {
-        (None, None, _) => body,
-        (Some(offset), Some(total), Some(part)) => {
+    let (bytes, upload_parts) = match (query.offset, query.total) {
+        (None, None) => (bytes.to_vec(), json!([])),
+        (Some(offset), Some(total)) => {
             let limit = if query.kind == "image" {
                 10 << 20
             } else {
@@ -1513,8 +1530,8 @@ async fn attach(
                     "file exceeds the 100 MiB limit"
                 }));
             }
-            match attach_part(&key, offset, total, &part).map_err(session::Error::Conflict)? {
-                (_, Some(whole)) => Body::from(whole),
+            match attach_part(&key, offset, total, &bytes).map_err(session::Error::Conflict)? {
+                (_, Some(whole)) => whole,
                 (received, None) => {
                     return Ok((StatusCode::ACCEPTED, Json(json!({ "received": received }))));
                 }
@@ -1526,14 +1543,15 @@ async fn attach(
             ));
         }
     };
-    let written = manager
+    let sha256 = attachment_sha256(&bytes);
+    let mut written = manager
         .workspaces
         .attach(
             &workspace,
             &query.request_id,
             &query.name,
             &query.kind,
-            body,
+            Body::from(bytes),
             &manager.storage,
         )
         .await
@@ -1554,6 +1572,8 @@ async fn attach(
                 _ => "attachment upload failed",
             })
         })?;
+    written["sha256"] = json!(sha256);
+    written["upload_parts"] = upload_parts;
     let receipt = manager.command(&id, query.request_id, "attach", written)?;
     PARTS.lock().unwrap().remove(&key);
     Ok(accepted(&manager, &id, receipt))
@@ -1561,7 +1581,16 @@ async fn attach(
 
 /// Attachments arriving in parts, by session and request: (total size, bytes so far, last part). Some sandbox
 /// proxies drop requests over about 8 MB, so clients send large files in 4 MiB parts. Unfinished uploads expire.
-type Partial = (usize, Vec<u8>, Instant);
+type Partial = (usize, Vec<u8>, Instant, Vec<Value>);
+type CompletedAttachment = (Vec<u8>, Value);
+
+fn attachment_sha256(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 static PARTS: LazyLock<Mutex<HashMap<String, Partial>>> = LazyLock::new(Default::default);
 const PART_BYTES: usize = 8 << 20;
 
@@ -1572,22 +1601,35 @@ fn attach_part(
     offset: usize,
     total: usize,
     part: &[u8],
-) -> std::result::Result<(usize, Option<Vec<u8>>), &'static str> {
+) -> std::result::Result<(usize, Option<CompletedAttachment>), &'static str> {
     let mut parts = PARTS.lock().unwrap();
-    parts.retain(|_, (_, _, at)| at.elapsed() < Duration::from_secs(600));
+    parts.retain(|_, (_, _, at, _)| at.elapsed() < Duration::from_secs(600));
     if offset == 0 && !parts.contains_key(key) {
         if parts.len() >= 8 {
             return Err("too many uploads in progress; try again");
         }
-        parts.insert(key.to_owned(), (total, Vec::new(), Instant::now()));
+        parts.insert(
+            key.to_owned(),
+            (total, Vec::new(), Instant::now(), Vec::new()),
+        );
     }
-    let (size, bytes, at) = parts.get_mut(key).ok_or("upload part out of order")?;
+    let (size, bytes, at, chunks) = parts.get_mut(key).ok_or("upload part out of order")?;
     if *size != total {
         return Err("upload size changed");
     }
+    let chunk = json!({"offset":offset,"size":part.len(),"sha256":attachment_sha256(part)});
+    if !chunks.contains(&chunk) && chunks.len() >= 1024 {
+        return Err("too many upload parts");
+    }
     append_part(bytes, offset, part, total)?;
+    if !chunks.contains(&chunk) {
+        chunks.push(chunk);
+    }
     *at = Instant::now();
-    Ok((bytes.len(), (bytes.len() == total).then(|| bytes.clone())))
+    Ok((
+        bytes.len(),
+        (bytes.len() == total).then(|| (bytes.clone(), json!(chunks))),
+    ))
 }
 
 /// Appends one part of an upload that arrives in pieces. A repeated part is ignored, so retrying after a lost

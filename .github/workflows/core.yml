@@ -1,11 +1,7 @@
 name: Core
 
 on:
-  push:
-    branches: [main]
-    paths: ['core/**', '.github/workflows/core.yml']
-  pull_request:
-    paths: ['core/**', '.github/workflows/core.yml']
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -49,6 +45,7 @@ jobs:
           python3 tests/preview_client.py
           node --test integrations/bb/client.test.ts
           python3 tests/install.py
+          python3 tests/update.py
           python3 tests/core_fixture.py
           python3 tests/pi_http.py
           python3 tests/workspaces.py

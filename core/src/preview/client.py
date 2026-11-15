@@ -814,8 +814,8 @@ def marked(mark, allowed=None):
 
 def end(mark, allowed=None, seconds=5):
     """Ends every process marked() would find, each as soon as it is found. One may start another and end before its own
-    check, so the list is taken again until 20 lists in a row show none alive; after the first, only processes new to the
-    list, and those killed but not gone yet, need a check. SIGKILL, since it only read and a handler could start more. A
+    check, so 20 stable lists in a row must show none alive. PID churn resets the count even when every marked
+    process ended before its check; only processes new to the list, and those killed but not gone yet, need a check. SIGKILL, since it only read and a handler could start more. A
     PID is killed right after its check, and macOS hands out new PIDs in order, so it is still that process's. True once
     none is left; False if some still run after `seconds`, or if this Mac can't tell."""
     try:
@@ -829,8 +829,10 @@ def end(mark, allowed=None, seconds=5):
                     with contextlib.suppress(OSError):
                         os.kill(pid, signal.SIGKILL)
                     found.add(pid)
-            previous, alive, clean = set(pids), found, 0 if found else clean + 1
-            if found and time.monotonic() > deadline:
+            current = set(pids)
+            clean = clean + 1 if not found and current == previous else 0
+            previous, alive = current, found
+            if time.monotonic() > deadline:
                 return False
         return True
     except OSError:
