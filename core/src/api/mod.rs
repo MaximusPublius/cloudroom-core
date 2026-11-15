@@ -1491,6 +1491,18 @@ async fn attach(
                 "request_id already has different content",
             ));
         }
+        // A client restarting the whole upload must send every chunk before it sees a completed receipt.
+        // Returning it for a matching prefix would leave a changed suffix unchecked.
+        if let (Some(offset), Some(total)) = (query.offset, query.total) {
+            let received = offset
+                .checked_add(bytes.len())
+                .ok_or(session::Error::Conflict(
+                    "request_id already has different content",
+                ))?;
+            if received < total {
+                return Ok((StatusCode::ACCEPTED, Json(json!({"received":received}))));
+            }
+        }
         return Ok(accepted(&manager, &id, receipt));
     }
     let session = manager.session(&id).await?;
@@ -1648,6 +1660,8 @@ pub(crate) fn append_part(
         buffer.extend_from_slice(part);
     } else if end > buffer.len() {
         return Err("upload part out of order");
+    } else if buffer[offset..end] != *part {
+        return Err("request_id already has different content");
     }
     Ok(())
 }

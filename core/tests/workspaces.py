@@ -129,7 +129,8 @@ class WorkspaceTests(unittest.TestCase):
             saved = part(2*size)['receipt']['input']
             self.assertEqual(Path(saved['path']).read_bytes(),big)
             self.assertEqual(part(2*size)['receipt']['input'],saved)
-            self.assertEqual(part(0)['receipt']['input'],saved)
+            self.assertEqual(part(0),{'received':size})
+            self.assertEqual(part(size),{'received':2*size})
             changed = bytearray(big[2*size:]); changed[0] ^= 1
             self.assertEqual(upload(kind,'parts','big.bin',changed,expected=409,
                 parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
@@ -137,7 +138,20 @@ class WorkspaceTests(unittest.TestCase):
                 parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
             self.service.stop(); self.start()
             self.assertEqual(part(2*size)['receipt']['input'],saved)
+            # After a restart a matching prefix still cannot acknowledge an unchecked changed suffix.
+            self.assertEqual(part(0),{'received':size})
+            self.assertEqual(part(size),{'received':2*size})
+            self.assertEqual(upload(kind,'parts','big.bin',changed,expected=409,
+                parts=f'&offset={2*size}&total={len(big)}')['code'],'request_conflict')
             self.assertEqual(Path(saved['path']).read_bytes(),big)
+            # A changed retry must not be ignored or recorded as an accepted chunk fingerprint.
+            self.assertEqual(upload(kind,'overlap','small.bin',b'AAAA',parts='&offset=0&total=8'),{'received':4})
+            self.assertEqual(upload(kind,'overlap','small.bin',b'BBBB',expected=409,
+                parts='&offset=0&total=8')['code'],'request_conflict')
+            small = upload(kind,'overlap','small.bin',b'CCCC',parts='&offset=4&total=8')['receipt']['input']
+            self.assertEqual(Path(small['path']).read_bytes(),b'AAAACCCC')
+            self.assertEqual(upload(kind,'overlap','small.bin',b'BBBB',expected=409,
+                parts='&offset=0&total=8')['code'],'request_conflict')
             self.assertEqual(upload(kind,'parts-large','big.bin',b'x',expected=409,parts=f'&offset=0&total={100*1024**2+1}')['code'],'attachment_too_large')
             for media,limit in [('image',10*1024**2),('file',100*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
