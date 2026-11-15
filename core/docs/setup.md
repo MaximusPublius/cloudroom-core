@@ -201,6 +201,15 @@ In the [Cloudroom app](https://www.cloudroom.dev/download), open **Settings → 
 
 ## Upgrade
 
+### Managed provisioning
+
+The private JSON passed to `install/configure.py` must include an explicit
+`apiUrl` for the compatible HTTPS history server. A missing or invalid destination
+is rejected before any settings are created. Retries preserve the existing
+history destination and reject a different one. This managed setup path does not
+implicitly choose local-only storage; the fresh self-hosted install script and
+manual setup above support explicit local history.
+
 ### Fork installations on 0.1.24
 
 The fork refresh changes the history backend. A 0.1.24 installation with only

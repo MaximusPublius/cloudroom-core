@@ -23,7 +23,8 @@ class InstallerTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.directory = self.root / 'config'
         self.data = dict(userId='self-hosted-é', coreToken='safe-token-' * 4,
-                         databaseUrl='postgresql://ordinary_user:ordinary%40password@localhost/history', release='test')
+                         databaseUrl='postgresql://ordinary_user:ordinary%40password@localhost/history', release='test',
+                         apiUrl='https://history.example.invalid')
         self.calls = []
         environment = patch.dict(os.environ)
         environment.start(); self.addCleanup(environment.stop)
@@ -50,6 +51,7 @@ class InstallerTests(unittest.TestCase):
         values = dict(line.split('=', 1) for line in path.read_text().splitlines())
         self.assertEqual(json.loads(values['CLOUDROOM_STORE']), self.data['userId'])
         self.assertEqual(json.loads(values['CLOUDROOM_DATABASE_URL']), self.data['databaseUrl'])
+        self.assertEqual(json.loads(values['CLOUDROOM_API_URL']), self.data['apiUrl'])
         self.assertEqual(json.loads(values['CLOUDROOM_LISTEN']), '127.0.0.1:9840')
         self.assertNotIn('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP', values)
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -100,11 +102,36 @@ class InstallerTests(unittest.TestCase):
         for field, value in [('userId', ''), ('coreToken', 'weak'), ('coreToken', 'x' * 32 + ' '),
                              ('databaseUrl', 'https://localhost/history'), ('databaseUrl', 'postgres://localhost:bad/db'),
                              ('databaseUrl', 'postgres://localhost/db#fragment'), ('release', 'other'),
-                             ('userId', 'bad\nCLOUDROOM_TOKEN=bad')]:
+                             ('userId', 'bad\nCLOUDROOM_TOKEN=bad'),
+                             ('apiUrl', None), ('apiUrl', ''), ('apiUrl', 'http://example.invalid'),
+                             ('apiUrl', 'https:///missing-host'), ('apiUrl', 'https://example.invalid:bad'),
+                             ('apiUrl', 'https://example.invalid/'), ('apiUrl', 'https://user@example.invalid'),
+                             ('apiUrl', 'https://example.invalid?query'), ('apiUrl', 'https://é.invalid')]:
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 installer.configure({**self.data, field: value}, self.directory)
             self.assertFalse(self.directory.exists())
         self.assertEqual(self.calls, [])
+
+    def test_missing_history_destination_fails_before_writes_and_valid_retry_recovers(self):
+        missing = {k: v for k, v in self.data.items() if k != 'apiUrl'}
+        with self.assertRaisesRegex(ValueError, 'apiUrl'):
+            installer.configure(missing, self.directory)
+        self.assertFalse(self.directory.exists())
+        self.assertFalse(installer.CODE_ROOT.exists())
+        self.assertEqual(self.calls, [])
+        installer.configure(self.data, self.directory)
+        values = dict(line.split('=', 1) for line in (self.directory / 'core.env').read_text().splitlines())
+        self.assertEqual(json.loads(values['CLOUDROOM_API_URL']), self.data['apiUrl'])
+        self.assertNotIn('CLOUDROOM_LOCAL_HISTORY', values)
+
+    def test_retries_never_switch_history_destination(self):
+        installer.configure(self.data, self.directory)
+        path = self.directory / 'core.env'
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'differs'):
+            installer.configure({**self.data, 'apiUrl': 'https://different.example.invalid'}, self.directory)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(self.calls), 1)
 
     def test_configuration_symlink_is_rejected(self):
         target = self.root / 'target'; target.mkdir()

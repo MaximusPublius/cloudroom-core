@@ -52,13 +52,17 @@ def installed_version():
 def configure(data, directory=Path('/etc/cloudroom')):
     if os.geteuid() != 0:
         raise ValueError('Run as the provisioning administrator')
-    # apiUrl (ADR 0232) is where a new Core saves history; older setup requests don't send it.
+    # Managed provisioning requires an explicit HTTPS history destination (ADR 0232).
     if not isinstance(data, dict) or set(data) - {'apiUrl'} != {'userId', 'coreToken', 'databaseUrl', 'release'}:
         raise ValueError('Unexpected setup fields')
     api = data.get('apiUrl')
-    if api is not None and (not isinstance(api, str) or not api.startswith('https://') or api.endswith('/')
-                            or any(ord(c) <= 32 or ord(c) == 127 or c in '?#@' for c in api)):
+    if (not isinstance(api, str) or not api.startswith('https://') or api.endswith('/')
+            or any(not 33 <= ord(c) < 127 or c in '?#@' for c in api)):
         raise ValueError('apiUrl must be an https:// URL without a trailing slash')
+    history = urlsplit(api)
+    if not history.hostname:
+        raise ValueError('apiUrl must name a history server')
+    _ = history.port  # Reject malformed ports before writing protected configuration.
     owner, token, database, release = (data[k] for k in ('userId', 'coreToken', 'databaseUrl', 'release'))
     if not all(isinstance(v, str) for v in (owner, token, database, release)):
         raise ValueError('Setup fields must be strings')
@@ -84,7 +88,8 @@ def configure(data, directory=Path('/etc/cloudroom')):
     if path.exists():
         previous = dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
         if any(previous.get(k) != json.dumps(v, ensure_ascii=False) for k, v in {
-            'CLOUDROOM_STORE': owner, 'CLOUDROOM_TOKEN': token, 'CLOUDROOM_DATABASE_URL': database
+            'CLOUDROOM_STORE': owner, 'CLOUDROOM_TOKEN': token, 'CLOUDROOM_DATABASE_URL': database,
+            'CLOUDROOM_API_URL': api,
         }.items()):
             raise ValueError('Existing configuration differs; no changes made')
     else:
@@ -93,7 +98,7 @@ def configure(data, directory=Path('/etc/cloudroom')):
             'CLOUDROOM_LISTEN': os.environ.get('CLOUDROOM_LISTEN', '127.0.0.1:9840'), 'CLOUDROOM_ACCOUNT_HOME': agent.pw_dir,
             'CLOUDROOM_STATE_DIR': str(Path(service.pw_dir) / 'history'),
             'CLOUDROOM_STORAGE_POLICY': str(directory / 'storage.json'),
-            **({'CLOUDROOM_API_URL': api} if api else {}),
+            'CLOUDROOM_API_URL': api,
         }
         if os.environ.get('CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP') == '1':
             settings['CLOUDROOM_ALLOW_NON_LOOPBACK_HTTP'] = '1'
